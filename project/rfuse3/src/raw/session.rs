@@ -428,6 +428,8 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
             FUSE_RENAME2 => worker_rename2,
             FUSE_LSEEK => worker_lseek,
             FUSE_COPY_FILE_RANGE => worker_copy_file_range,
+            FUSE_POLL => worker_poll,
+            FUSE_BATCH_FORGET => worker_batch_forget,
             _ => {
                 match opcode_result {
                     #[cfg(feature = "file-lock")]
@@ -440,6 +442,21 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
                         debug!(worker=%worker_idx, unique=item.unique, "worker handling SETLK/SETLKW");
                         let is_blocking = item.opcode == fuse_opcode::FUSE_SETLKW as u32;
                         worker_setlk(ctx, item, is_blocking).await;
+                    }
+                    #[cfg(target_os = "macos")]
+                    Ok(fuse_opcode::FUSE_SETVOLNAME) => {
+                        debug!(worker=%worker_idx, unique=item.unique, "worker handling SETVOLNAME");
+                        worker_setvolname(ctx, item).await;
+                    }
+                    #[cfg(target_os = "macos")]
+                    Ok(fuse_opcode::FUSE_GETXTIMES) => {
+                        debug!(worker=%worker_idx, unique=item.unique, "worker handling GETXTIMES");
+                        worker_getxtimes(ctx, item).await;
+                    }
+                    #[cfg(target_os = "macos")]
+                    Ok(fuse_opcode::FUSE_EXCHANGE) => {
+                        debug!(worker=%worker_idx, unique=item.unique, "worker handling EXCHANGE");
+                        worker_exchange(ctx, item).await;
                     }
                     Ok(_) => {
                         debug!(worker=%worker_idx, unique=item.unique, opcode=item.opcode, "opcode not yet handled in worker");
@@ -3507,6 +3524,399 @@ async fn worker_setlk<FS: Filesystem + Send + Sync + 'static>(
     });
 }
 
+async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &Arc<DispatchCtx<FS>>,
+    item: WorkItem,
+) {
+    let poll_in = match get_bincode_config().deserialize::<fuse_poll_in>(&item.data) {
+        Err(err) => {
+            debug!(
+                unique = item.unique,
+                "deserialize fuse_poll_in failed {}", err
+            );
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: libc::EINVAL,
+                unique: item.unique,
+            };
+            let data = get_bincode_config()
+                .serialize(&out_header)
+                .expect("serialize out_header");
+            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(v) => v,
+    };
+
+    let fs = ctx.fs.clone();
+    let resp_sender = ctx.resp.clone();
+
+    spawn(debug_span!("fuse_poll_worker"), async move {
+        debug!(
+            unique = item.unique,
+            inode = item.in_header.nodeid,
+            fh = poll_in.fh,
+            kh = poll_in.kh,
+            flags = poll_in.flags,
+            "poll (worker)"
+        );
+
+        let notify = Notify::new(resp_sender.clone());
+        let reply_poll = match fs
+            .poll(
+                Request {
+                    unique: item.unique,
+                    uid: item.in_header.uid,
+                    gid: item.in_header.gid,
+                    pid: item.in_header.pid,
+                },
+                item.in_header.nodeid,
+                poll_in.fh,
+                if poll_in.kh == 0 {
+                    None
+                } else {
+                    Some(poll_in.kh)
+                },
+                poll_in.flags,
+                poll_in.events,
+                &notify,
+            )
+            .await
+        {
+            Err(err) => {
+                let out_header = fuse_out_header {
+                    len: FUSE_OUT_HEADER_SIZE as u32,
+                    error: err.into(),
+                    unique: item.unique,
+                };
+                let data = get_bincode_config()
+                    .serialize(&out_header)
+                    .expect("serialize out_header");
+                let _ = resp_sender.unbounded_send(Either::Left(data));
+                return;
+            }
+            Ok(r) => r,
+        };
+
+        let poll_out = fuse_poll_out {
+            revents: reply_poll.revents,
+            _padding: 0,
+        };
+
+        let out_header = fuse_out_header {
+            len: (FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE) as u32,
+            error: 0,
+            unique: item.unique,
+        };
+
+        let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE);
+        get_bincode_config()
+            .serialize_into(&mut data, &out_header)
+            .expect("serialize header");
+        get_bincode_config()
+            .serialize_into(&mut data, &poll_out)
+            .expect("serialize poll_out");
+        let _ = resp_sender.unbounded_send(Either::Left(data));
+    });
+}
+
+async fn worker_batch_forget<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &Arc<DispatchCtx<FS>>,
+    item: WorkItem,
+) {
+    let batch_forget_in = match get_bincode_config().deserialize::<fuse_batch_forget_in>(&item.data)
+    {
+        Err(err) => {
+            debug!(
+                unique = item.unique,
+                "deserialize fuse_batch_forget_in failed {}", err
+            );
+            // batch_forget has no reply
+            return;
+        }
+        Ok(v) => v,
+    };
+
+    let mut data = &item.data[FUSE_BATCH_FORGET_IN_SIZE..];
+    let mut inodes = Vec::with_capacity(batch_forget_in.count as usize);
+
+    for _ in 0..batch_forget_in.count {
+        if data.len() < FUSE_FORGET_ONE_SIZE {
+            debug!(unique = item.unique, "batch_forget data too short");
+            return;
+        }
+
+        let forget_one = match get_bincode_config()
+            .deserialize::<fuse_forget_one>(&data[..FUSE_FORGET_ONE_SIZE])
+        {
+            Err(err) => {
+                debug!(
+                    unique = item.unique,
+                    "deserialize fuse_forget_one failed {}", err
+                );
+                return;
+            }
+            Ok(v) => v,
+        };
+
+        inodes.push((forget_one.nodeid, forget_one._nlookup));
+        data = &data[FUSE_FORGET_ONE_SIZE..];
+    }
+
+    let fs = ctx.fs.clone();
+
+    spawn(debug_span!("fuse_batch_forget_worker"), async move {
+        debug!(
+            unique = item.unique,
+            count = batch_forget_in.count,
+            "batch_forget (worker)"
+        );
+
+        fs.batch_forget(
+            Request {
+                unique: item.unique,
+                uid: item.in_header.uid,
+                gid: item.in_header.gid,
+                pid: item.in_header.pid,
+            },
+            &inodes,
+        )
+        .await;
+        // batch_forget has no reply
+    });
+}
+
+#[cfg(target_os = "macos")]
+async fn worker_setvolname<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &Arc<DispatchCtx<FS>>,
+    item: WorkItem,
+) {
+    let name = match get_first_null_position(&item.data) {
+        None => {
+            debug!(unique = item.unique, "setvolname body has no null");
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: libc::EINVAL,
+                unique: item.unique,
+            };
+            let data = get_bincode_config()
+                .serialize(&out_header)
+                .expect("serialize out_header");
+            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            return;
+        }
+        Some(idx) => OsString::from_vec(item.data[..idx].to_vec()),
+    };
+
+    let fs = ctx.fs.clone();
+    let resp_sender = ctx.resp.clone();
+
+    spawn(debug_span!("fuse_setvolname_worker"), async move {
+        debug!(unique = item.unique, ?name, "setvolname (worker)");
+
+        let resp_value = if let Err(err) = fs
+            .setvolname(
+                Request {
+                    unique: item.unique,
+                    uid: item.in_header.uid,
+                    gid: item.in_header.gid,
+                    pid: item.in_header.pid,
+                },
+                &name,
+            )
+            .await
+        {
+            err.into()
+        } else {
+            0
+        };
+
+        let out_header = fuse_out_header {
+            len: FUSE_OUT_HEADER_SIZE as u32,
+            error: resp_value,
+            unique: item.unique,
+        };
+        let data = get_bincode_config()
+            .serialize(&out_header)
+            .expect("serialize out_header");
+        let _ = resp_sender.unbounded_send(Either::Left(data));
+    });
+}
+
+#[cfg(target_os = "macos")]
+async fn worker_getxtimes<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &Arc<DispatchCtx<FS>>,
+    item: WorkItem,
+) {
+    let fs = ctx.fs.clone();
+    let resp_sender = ctx.resp.clone();
+
+    spawn(debug_span!("fuse_getxtimes_worker"), async move {
+        debug!(
+            unique = item.unique,
+            inode = item.in_header.nodeid,
+            "getxtimes (worker)"
+        );
+
+        let reply_xtimes = match fs
+            .getxtimes(
+                Request {
+                    unique: item.unique,
+                    uid: item.in_header.uid,
+                    gid: item.in_header.gid,
+                    pid: item.in_header.pid,
+                },
+                item.in_header.nodeid,
+            )
+            .await
+        {
+            Err(err) => {
+                let out_header = fuse_out_header {
+                    len: FUSE_OUT_HEADER_SIZE as u32,
+                    error: err.into(),
+                    unique: item.unique,
+                };
+                let data = get_bincode_config()
+                    .serialize(&out_header)
+                    .expect("serialize out_header");
+                let _ = resp_sender.unbounded_send(Either::Left(data));
+                return;
+            }
+            Ok(r) => r,
+        };
+
+        let xtimes_out = fuse_getxtimes_out {
+            bkuptime: reply_xtimes.bkuptime,
+            crtime: reply_xtimes.crtime,
+            bkuptimensec: reply_xtimes.bkuptimensec,
+            crtimensec: reply_xtimes.crtimensec,
+        };
+
+        let out_header = fuse_out_header {
+            len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXTIMES_OUT_SIZE) as u32,
+            error: 0,
+            unique: item.unique,
+        };
+
+        let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXTIMES_OUT_SIZE);
+        get_bincode_config()
+            .serialize_into(&mut data, &out_header)
+            .expect("serialize header");
+        get_bincode_config()
+            .serialize_into(&mut data, &xtimes_out)
+            .expect("serialize xtimes_out");
+        let _ = resp_sender.unbounded_send(Either::Left(data));
+    });
+}
+
+#[cfg(target_os = "macos")]
+async fn worker_exchange<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &Arc<DispatchCtx<FS>>,
+    item: WorkItem,
+) {
+    let exchange_in = match get_bincode_config().deserialize::<fuse_exchange_in>(&item.data) {
+        Err(err) => {
+            debug!(
+                unique = item.unique,
+                "deserialize fuse_exchange_in failed {}", err
+            );
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: libc::EINVAL,
+                unique: item.unique,
+            };
+            let data = get_bincode_config()
+                .serialize(&out_header)
+                .expect("serialize out_header");
+            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(v) => v,
+    };
+
+    let mut data = &item.data[FUSE_EXCHANGE_IN_SIZE..];
+    let (oldname, first_null_index) = match get_first_null_position(data) {
+        None => {
+            debug!(unique = item.unique, "exchange oldname has no null");
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: libc::EINVAL,
+                unique: item.unique,
+            };
+            let data = get_bincode_config()
+                .serialize(&out_header)
+                .expect("serialize out_header");
+            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            return;
+        }
+        Some(index) => (OsString::from_vec(data[..index].to_vec()), index),
+    };
+
+    data = &data[first_null_index + 1..];
+    let newname = match get_first_null_position(data) {
+        None => {
+            debug!(unique = item.unique, "exchange newname has no null");
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: libc::EINVAL,
+                unique: item.unique,
+            };
+            let data = get_bincode_config()
+                .serialize(&out_header)
+                .expect("serialize out_header");
+            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            return;
+        }
+        Some(index) => OsString::from_vec(data[..index].to_vec()),
+    };
+
+    let fs = ctx.fs.clone();
+    let resp_sender = ctx.resp.clone();
+
+    spawn(debug_span!("fuse_exchange_worker"), async move {
+        debug!(
+            unique = item.unique,
+            olddir = item.in_header.nodeid,
+            newdir = exchange_in.newdir,
+            ?oldname,
+            ?newname,
+            options = exchange_in.options,
+            "exchange (worker)"
+        );
+
+        let resp_value = if let Err(err) = fs
+            .exchange(
+                Request {
+                    unique: item.unique,
+                    uid: item.in_header.uid,
+                    gid: item.in_header.gid,
+                    pid: item.in_header.pid,
+                },
+                item.in_header.nodeid,
+                &oldname,
+                exchange_in.newdir,
+                &newname,
+                exchange_in.options,
+            )
+            .await
+        {
+            err.into()
+        } else {
+            0
+        };
+
+        let out_header = fuse_out_header {
+            len: FUSE_OUT_HEADER_SIZE as u32,
+            error: resp_value,
+            unique: item.unique,
+        };
+        let data = get_bincode_config()
+            .serialize(&out_header)
+            .expect("serialize out_header");
+        let _ = resp_sender.unbounded_send(Either::Left(data));
+    });
+}
+
 enum ReadResult {
     Destroy,
     Request {
@@ -4116,57 +4526,39 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
 
                     fuse_opcode::FUSE_SETATTR => {
-                        if !workers_active {
-                            self.handle_setattr(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_setattr(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_READLINK => {
-                        if !workers_active {
-                            self.handle_readlink(request, in_header, &fs).await;
-                        }
+                        self.handle_readlink(request, in_header, &fs).await;
                     }
 
                     fuse_opcode::FUSE_SYMLINK => {
-                        if !workers_active {
-                            self.handle_symlink(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_symlink(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_MKNOD => {
-                        if !workers_active {
-                            self.handle_mknod(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_mknod(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_MKDIR => {
-                        if !workers_active {
-                            self.handle_mkdir(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_mkdir(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_UNLINK => {
-                        if !workers_active {
-                            self.handle_unlink(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_unlink(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_RMDIR => {
-                        if !workers_active {
-                            self.handle_rmdir(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_rmdir(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_RENAME => {
-                        if !workers_active {
-                            self.handle_rename(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_rename(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_LINK => {
-                        if !workers_active {
-                            self.handle_link(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_link(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_OPEN => {
@@ -4188,61 +4580,43 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
 
                     fuse_opcode::FUSE_STATFS => {
-                        if !workers_active {
-                            self.handle_statfs(request, in_header, &fs).await;
-                        }
+                        self.handle_statfs(request, in_header, &fs).await;
                     }
 
                     fuse_opcode::FUSE_RELEASE => {
-                        if !workers_active {
-                            self.handle_release(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_release(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_FSYNC => {
-                        if !workers_active {
-                            self.handle_fsync(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_fsync(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_SETXATTR => {
-                        if !workers_active {
-                            self.handle_setxattr(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_setxattr(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_GETXATTR => {
-                        if !workers_active {
-                            self.handle_getxattr(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_getxattr(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_LISTXATTR => {
-                        if !workers_active {
-                            self.handle_listxattr(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_listxattr(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_REMOVEXATTR => {
-                        if !workers_active {
-                            self.handle_removexattr(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_removexattr(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_FLUSH => {
-                        if !workers_active {
-                            self.handle_flush(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_flush(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_OPENDIR => {
-                        if !workers_active {
-                            self.handle_opendir(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_opendir(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_READDIR => {
@@ -4252,50 +4626,38 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
 
                     fuse_opcode::FUSE_RELEASEDIR => {
-                        if !workers_active {
-                            self.handle_releasedir(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_releasedir(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_FSYNCDIR => {
-                        if !workers_active {
-                            self.handle_fsyncdir(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_fsyncdir(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     #[cfg(feature = "file-lock")]
                     fuse_opcode::FUSE_GETLK => {
-                        if !workers_active {
-                            self.handle_getlk(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_getlk(request, in_header, data_ref, &fs).await;
                     }
 
                     #[cfg(feature = "file-lock")]
                     fuse_opcode::FUSE_SETLK | fuse_opcode::FUSE_SETLKW => {
-                        if !workers_active {
-                            self.handle_setlk(
-                                request,
-                                in_header,
-                                data_ref,
-                                opcode == fuse_opcode::FUSE_SETLKW,
-                                &fs,
-                            )
-                            .await;
-                        }
+                        self.handle_setlk(
+                            request,
+                            in_header,
+                            data_ref,
+                            opcode == fuse_opcode::FUSE_SETLKW,
+                            &fs,
+                        )
+                        .await;
                     }
 
                     fuse_opcode::FUSE_ACCESS => {
-                        if !workers_active {
-                            self.handle_access(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_access(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_CREATE => {
-                        if !workers_active {
-                            self.handle_create(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_create(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_INTERRUPT => {
@@ -4303,9 +4665,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
 
                     fuse_opcode::FUSE_BMAP => {
-                        if !workers_active {
-                            self.handle_bmap(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_bmap(request, in_header, data_ref, &fs).await;
                     }
 
                     /*fuse_opcode::FUSE_IOCTL => {
@@ -4342,36 +4702,26 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
 
                     fuse_opcode::FUSE_FALLOCATE => {
-                        if !workers_active {
-                            self.handle_fallocate(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_fallocate(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_READDIRPLUS => {
-                        if !workers_active {
-                            self.handle_readdirplus(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_readdirplus(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     fuse_opcode::FUSE_RENAME2 => {
-                        if !workers_active {
-                            self.handle_rename2(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_rename2(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_LSEEK => {
-                        if !workers_active {
-                            self.handle_lseek(request, in_header, data_ref, &fs).await;
-                        }
+                        self.handle_lseek(request, in_header, data_ref, &fs).await;
                     }
 
                     fuse_opcode::FUSE_COPY_FILE_RANGE => {
-                        if !workers_active {
-                            self.handle_copy_file_range(request, in_header, data_ref, &fs)
-                                .await;
-                        }
+                        self.handle_copy_file_range(request, in_header, data_ref, &fs)
+                            .await;
                     }
 
                     #[cfg(target_os = "macos")]
