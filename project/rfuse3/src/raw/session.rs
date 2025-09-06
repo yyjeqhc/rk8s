@@ -302,6 +302,36 @@ impl Drop for InflightGuard {
     }
 }
 
+/// used for dispatching the request to the right worker handler
+macro_rules! dispatch_to_worker {
+    (
+        match $target:expr, {
+            ctx => $ctx:expr,
+            worker_idx => $worker_idx:expr,
+            item => $item:expr,
+
+            $( $op:ident => $handler:ident, )*
+
+            _ => { $($other_logic:tt)* }
+        }
+    ) => {
+        match $target {
+            $(
+                Ok(fuse_opcode::$op) => {
+                    debug!(
+                        worker = %$worker_idx,
+                        unique = $item.unique,
+                        "worker handling {}",
+                        stringify!($op).replace("FUSE_", "")
+                    );
+                    $handler($ctx, $item).await;
+                },
+            )*
+            _ => { $($other_logic)* }
+        }
+    };
+}
+
 #[derive(Debug)]
 struct DispatchCtx<FS: Filesystem + Send + Sync + 'static> {
     fs: Arc<FS>,
@@ -358,160 +388,67 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
     item: WorkItem,
 ) {
     use crate::raw::abi::fuse_opcode;
-    match fuse_opcode::try_from(item.opcode) {
-        Ok(fuse_opcode::FUSE_LOOKUP) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling LOOKUP");
-            worker_lookup(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_GETATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling GETATTR");
-            worker_getattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_OPEN) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling OPEN");
-            worker_open(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_READ) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling READ");
-            worker_read(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_WRITE) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling WRITE");
-            worker_write(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_READDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling READDIR");
-            worker_readdir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_SETATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling SETATTR");
-            worker_setattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_READLINK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling READLINK");
-            worker_readlink(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_SYMLINK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling SYMLINK");
-            worker_symlink(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_MKNOD) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling MKNOD");
-            worker_mknod(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_MKDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling MKDIR");
-            worker_mkdir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_UNLINK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling UNLINK");
-            worker_unlink(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_RMDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling RMDIR");
-            worker_rmdir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_RENAME) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling RENAME");
-            worker_rename(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_LINK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling LINK");
-            worker_link(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_STATFS) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling STATFS");
-            worker_statfs(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_RELEASE) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling RELEASE");
-            worker_release(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_FSYNC) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling FSYNC");
-            worker_fsync(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_SETXATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling SETXATTR");
-            worker_setxattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_GETXATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling GETXATTR");
-            worker_getxattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_LISTXATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling LISTXATTR");
-            worker_listxattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_REMOVEXATTR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling REMOVEXATTR");
-            worker_removexattr(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_FLUSH) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling FLUSH");
-            worker_flush(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_OPENDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling OPENDIR");
-            worker_opendir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_RELEASEDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling RELEASEDIR");
-            worker_releasedir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_FSYNCDIR) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling FSYNCDIR");
-            worker_fsyncdir(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_ACCESS) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling ACCESS");
-            worker_access(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_CREATE) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling CREATE");
-            worker_create(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_BMAP) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling BMAP");
-            worker_bmap(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_FALLOCATE) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling FALLOCATE");
-            worker_fallocate(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_READDIRPLUS) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling READDIRPLUS");
-            worker_readdirplus(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_RENAME2) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling RENAME2");
-            worker_rename2(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_LSEEK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling LSEEK");
-            worker_lseek(ctx, item).await;
-        }
-        Ok(fuse_opcode::FUSE_COPY_FILE_RANGE) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling COPY_FILE_RANGE");
-            worker_copy_file_range(ctx, item).await;
-        }
-        #[cfg(feature = "file-lock")]
-        #[cfg(feature = "file-lock")]
-        Ok(fuse_opcode::FUSE_GETLK) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling GETLK");
-            worker_getlk(ctx, item).await;
-        }
-        #[cfg(feature = "file-lock")]
-        Ok(fuse_opcode::FUSE_SETLK | fuse_opcode::FUSE_SETLKW) => {
-            debug!(worker=%worker_idx, unique=item.unique, "worker handling SETLK/SETLKW");
-            let is_blocking = item.opcode == fuse_opcode::FUSE_SETLKW as u32;
-            worker_setlk(ctx, item, is_blocking).await;
-        }
-        Ok(_) => {
-            debug!(worker=%worker_idx, unique=item.unique, opcode=item.opcode, "opcode not yet handled in worker");
-        }
-        Err(err) => {
-            debug!(worker=%worker_idx, unique=item.unique, raw=item.opcode, "unknown opcode {}", err.0);
+    let opcode_result = fuse_opcode::try_from(item.opcode);
+    dispatch_to_worker! {
+        match opcode_result, {
+            ctx => ctx,
+            worker_idx => worker_idx,
+            item => item,
+            FUSE_LOOKUP   => worker_lookup,
+            FUSE_GETATTR  => worker_getattr,
+            FUSE_OPEN     => worker_open,
+            FUSE_READ     => worker_read,
+            FUSE_WRITE    => worker_write,
+            FUSE_READDIR  => worker_readdir,
+            FUSE_SETATTR  => worker_setattr,
+            FUSE_READLINK => worker_readlink,
+            FUSE_SYMLINK  => worker_symlink,
+            FUSE_MKNOD    => worker_mknod,
+            FUSE_MKDIR    => worker_mkdir,
+            FUSE_UNLINK   => worker_unlink,
+            FUSE_RMDIR    => worker_rmdir,
+            FUSE_RENAME   => worker_rename,
+            FUSE_LINK     => worker_link,
+            FUSE_STATFS   => worker_statfs,
+            FUSE_RELEASE  => worker_release,
+            FUSE_FSYNC    => worker_fsync,
+            FUSE_SETXATTR => worker_setxattr,
+            FUSE_GETXATTR => worker_getxattr,
+            FUSE_LISTXATTR => worker_listxattr,
+            FUSE_REMOVEXATTR => worker_removexattr,
+            FUSE_FLUSH    => worker_flush,
+            FUSE_OPENDIR => worker_opendir,
+            FUSE_RELEASEDIR => worker_releasedir,
+            FUSE_FSYNCDIR => worker_fsyncdir,
+            FUSE_ACCESS  => worker_access,
+            FUSE_CREATE  => worker_create,
+            FUSE_BMAP    => worker_bmap,
+            FUSE_FALLOCATE => worker_fallocate,
+            FUSE_READDIRPLUS => worker_readdirplus,
+            FUSE_RENAME2 => worker_rename2,
+            FUSE_LSEEK => worker_lseek,
+            FUSE_COPY_FILE_RANGE => worker_copy_file_range,
+            _ => {
+                match opcode_result {
+                    #[cfg(feature = "file-lock")]
+                    Ok(fuse_opcode::FUSE_GETLK) => {
+                        debug!(worker=%worker_idx, unique=item.unique, "worker handling GETLK");
+                        worker_getlk(ctx, item).await;
+                    }
+                    #[cfg(feature = "file-lock")]
+                    Ok(fuse_opcode::FUSE_SETLK | fuse_opcode::FUSE_SETLKW) => {
+                        debug!(worker=%worker_idx, unique=item.unique, "worker handling SETLK/SETLKW");
+                        let is_blocking = item.opcode == fuse_opcode::FUSE_SETLKW as u32;
+                        worker_setlk(ctx, item, is_blocking).await;
+                    }
+                    Ok(_) => {
+                        debug!(worker=%worker_idx, unique=item.unique, opcode=item.opcode, "opcode not yet handled in worker");
+                    }
+                    Err(err) => {
+                        debug!(worker=%worker_idx, unique=item.unique, raw=item.opcode, "unknown opcode {}", err.0);
+                    }
+                }
+            }
         }
     }
 }
