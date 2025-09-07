@@ -258,15 +258,18 @@ pub struct Session<FS: Filesystem + Send + Sync + 'static> {
 }
 
 #[derive(Debug)]
+/// Represents a work item to be processed by a worker thread in the worker pool
 pub(crate) struct WorkItem {
     pub(crate) unique: u64,
     opcode: u32,
     pub(crate) in_header: InHeaderLite,
-    data: Vec<u8>, // body (excludes fixed-size fuse_in_header)
+    /// Body data (excludes fixed-size fuse_in_header)
+    data: Vec<u8>,
     _inflight_guard: InflightGuard,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Lightweight version of fuse_in_header containing essential fields
 pub(crate) struct InHeaderLite {
     pub(crate) nodeid: u64,
     pub(crate) uid: u32,
@@ -274,16 +277,19 @@ pub(crate) struct InHeaderLite {
     pub(crate) pid: u32,
 }
 
-/// 简单轮询 worker 池（每个 worker 一个有界 channel，调度时 round-robin）。
 #[derive(Debug)]
 struct Workers<FS: Filesystem + Send + Sync + 'static> {
-    senders: Vec<Sender<WorkItem>>, // 各 worker 输入队列
-    next: AtomicUsize,              // round robin 计数
+    /// Input queues for each worker
+    senders: Vec<Sender<WorkItem>>,
+    /// Round-robin counter for load balancing
+    next: AtomicUsize,
     #[allow(dead_code)]
-    handles: Vec<JoinHandle<()>>, // 持有句柄防止被丢弃
+    handles: Vec<JoinHandle<()>>,
     _ctx: Arc<DispatchCtx<FS>>,
 }
 #[derive(Debug)]
+/// RAII guard that tracks the number of in-flight requests
+/// Increments counter on creation and decrements on drop
 pub struct InflightGuard {
     inflight: Arc<AtomicUsize>,
     notify: Arc<async_notify::Notify>,
@@ -2761,7 +2767,7 @@ async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
 ) {
     let poll_in = match get_bincode_config().deserialize::<fuse_poll_in>(&item.data) {
         Err(err) => {
-            debug!(
+            error!(
                 unique = item.unique,
                 "deserialize fuse_poll_in failed {}", err
             );
@@ -2792,7 +2798,7 @@ async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
                 Request::from(&item),
                 item.in_header.nodeid,
                 poll_in.fh,
-                if poll_in.kh == 0 {
+                if poll_in.flags & FUSE_POLL_SCHEDULE_NOTIFY == 0 {
                     None
                 } else {
                     Some(poll_in.kh)
@@ -2811,10 +2817,7 @@ async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
             Ok(r) => r,
         };
 
-        let poll_out = fuse_poll_out {
-            revents: reply_poll.revents,
-            _padding: 0,
-        };
+        let poll_out: fuse_poll_out = reply_poll.into();
 
         let out_header = fuse_out_header {
             len: (FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE) as u32,
