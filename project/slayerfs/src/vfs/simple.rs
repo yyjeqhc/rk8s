@@ -8,14 +8,14 @@ use crate::meta::MetaStore;
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 
 /// 一个最小的 VFS 对象，持有块存储与元数据存储。
-pub struct SimpleVfs<S: BlockStore, M: MetaStore> {
+pub struct SimpleVFS<S: BlockStore, M: MetaStore> {
     layout: ChunkLayout,
     store: S,
     meta: M,
 }
 
 #[allow(unused)]
-impl<S: BlockStore, M: MetaStore> SimpleVfs<S, M> {
+impl<S: BlockStore, M: MetaStore> SimpleVFS<S, M> {
     pub fn new(layout: ChunkLayout, store: S, meta: M) -> Self {
         Self {
             layout,
@@ -77,16 +77,16 @@ mod tests {
     use crate::meta::create_meta_store_from_url;
 
     #[tokio::test]
-    async fn test_simple_vfs_write_read() {
+    async fn test_simple_VFS_write_read() {
         let layout = ChunkLayout::default();
         let tmp = tempfile::tempdir().unwrap();
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let mut vfs = SimpleVfs::new(layout, store, meta);
+        let mut VFS = SimpleVFS::new(layout, store, meta);
 
-        let ino = vfs.create("test_file.txt".to_string()).await.unwrap();
+        let ino = VFS.create("test_file.txt".to_string()).await.unwrap();
         let chunk_id = 1i64;
         let half = (layout.block_size / 2) as usize;
         let len = layout.block_size as usize + half;
@@ -94,10 +94,10 @@ mod tests {
         for (i, b) in data.iter_mut().enumerate().take(len) {
             *b = (i % 251) as u8;
         }
-        vfs.pwrite_chunk(ino, chunk_id, half as u64, &data)
+        VFS.pwrite_chunk(ino, chunk_id, half as u64, &data)
             .await
             .unwrap();
-        let out = vfs.pread_chunk(ino, chunk_id, half as u64, len).await;
+        let out = VFS.pread_chunk(ino, chunk_id, half as u64, len).await;
         assert_eq!(out, data);
     }
 }

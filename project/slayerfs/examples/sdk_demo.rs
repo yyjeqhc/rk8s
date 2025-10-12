@@ -1,4 +1,4 @@
-// Example program: demonstrate vfs::sdk_v2::ClientV2 usage without FUSE
+// Example program: demonstrate VFS::sdk_v2::ClientV2 usage without FUSE
 
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::vfs::sdk::LocalClient;

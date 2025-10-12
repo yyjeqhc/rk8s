@@ -10,7 +10,7 @@ use rfuse3::MountOptions;
 
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
-use crate::vfs::fs::Vfs;
+use crate::vfs::fs::VFS;
 
 /// Build default mount options for SlayerFS.
 #[allow(dead_code)]
@@ -25,7 +25,7 @@ fn default_mount_options() -> MountOptions {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub async fn mount_vfs_unprivileged<S, M>(
-    fs: Vfs<S, M>,
+    fs: VFS<S, M>,
     mount_point: impl AsRef<Path>,
 ) -> std::io::Result<rfuse3::raw::MountHandle>
 where

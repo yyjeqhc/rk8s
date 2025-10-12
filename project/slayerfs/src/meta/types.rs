@@ -3,9 +3,9 @@
 //! This module defines strong-typed wrappers and operation parameters for the new MetaStore trait.
 //! It reuses existing FileAttr, DirEntry from the old store where appropriate.
 
+use crate::vfs::fs::FileType;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-
 /// Inode number (strong type wrapper)
 ///
 /// Provides type safety to prevent mixing inode numbers with other i64 values.
@@ -50,7 +50,7 @@ impl From<Inode> for i64 {
 pub struct CreateParams {
     pub parent: Inode,
     pub name: String,
-    pub kind: crate::vfs::fs::FileType,
+    pub kind: FileType,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -61,7 +61,7 @@ impl CreateParams {
         Self {
             parent,
             name,
-            kind: crate::vfs::fs::FileType::Dir,
+            kind: FileType::Dir,
             mode: 0o755,
             uid,
             gid,
@@ -72,7 +72,7 @@ impl CreateParams {
         Self {
             parent,
             name,
-            kind: crate::vfs::fs::FileType::File,
+            kind: FileType::File,
             mode: 0o644,
             uid,
             gid,

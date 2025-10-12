@@ -8,7 +8,6 @@ use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 
 use crate::meta::Permission;
 use crate::meta::config::{Config, DatabaseType};
-use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
 use crate::vfs::fs::FileType;

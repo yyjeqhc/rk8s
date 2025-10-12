@@ -17,7 +17,7 @@ pub mod mount;
 
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
-use crate::vfs::fs::{FileType, Vfs, VfsError, VfsFileAttr, VfsFileType};
+use crate::vfs::fs::{FileType, VFS, VFSFileAttr, VFSFileType, VfsError};
 use bytes::Bytes;
 use futures_util::stream::{self, Stream};
 use rfuse3::Result as FuseResult;
@@ -34,84 +34,85 @@ use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
 // Legacy mount tests (commented out)
-// #[cfg(all(test, target_os = "linux"))]
-// mod mount_tests {
-//     use crate::cadapter::client::ObjectClient;
-//     use crate::cadapter::localfs::LocalFsBackend;
-//     use crate::chuck::chunk::ChunkLayout;
-//     use crate::chuck::store::ObjectBlockStore;
-//     use crate::fuse::mount::mount_vfs_unprivileged;
-//     use crate::meta::create_meta_store_from_url;
-//     use std::fs;
-//     use std::io::Write;
-//     use std::time::Duration as StdDuration;
+#[cfg(all(test, target_os = "linux"))]
+mod mount_tests {
+    use crate::cadapter::client::ObjectClient;
+    use crate::cadapter::localfs::LocalFsBackend;
+    use crate::chuck::chunk::ChunkLayout;
+    use crate::chuck::store::ObjectBlockStore;
+    use crate::fuse::mount::mount_vfs_unprivileged;
+    use crate::meta::create_meta_store_from_url;
+    use crate::vfs::fs::VFS;
+    use std::fs;
+    use std::io::Write;
+    use std::time::Duration as StdDuration;
 
-//     // Linux 下的基本挂载冒烟测试：受环境变量 SLAYERFS_FUSE_TEST 控制
-//     #[tokio::test]
-//     async fn smoke_mount_and_basic_ops() {
-//         if std::env::var("SLAYERFS_FUSE_TEST").ok().as_deref() != Some("1") {
-//             eprintln!("skip fuse mount test: set SLAYERFS_FUSE_TEST=1 to enable");
-//             return;
-//         }
+    // Linux 下的基本挂载冒烟测试：受环境变量 SLAYERFS_FUSE_TEST 控制
+    #[tokio::test]
+    async fn smoke_mount_and_basic_ops() {
+        if std::env::var("SLAYERFS_FUSE_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skip fuse mount test: set SLAYERFS_FUSE_TEST=1 to enable");
+            return;
+        }
 
-//         let layout = ChunkLayout::default();
-//         let tmp_data = tempfile::tempdir().expect("tmp data");
-//         let client = ObjectClient::new(LocalFsBackend::new(tmp_data.path()));
-//         let store = ObjectBlockStore::new(client);
+        let layout = ChunkLayout::default();
+        let tmp_data = tempfile::tempdir().expect("tmp data");
+        let client = ObjectClient::new(LocalFsBackend::new(tmp_data.path()));
+        let store = ObjectBlockStore::new(client);
 
-//         let meta = create_meta_store_from_url("sqlite::memory:")
-//             .await
-//             .expect("create meta store");
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .expect("create meta store");
 
-//         let fs = VFS::new(layout, store, meta).await.expect("create VFS");
+        let fs = VFS::new(layout, store, meta).await.expect("create VFS");
 
-//         // 准备挂载点
-//         let mnt = tempfile::tempdir().expect("tmp mount");
-//         let mnt_path = mnt.path().to_path_buf();
+        // 准备挂载点
+        let mnt = tempfile::tempdir().expect("tmp mount");
+        let mnt_path = mnt.path().to_path_buf();
 
-//         // 挂载（后台，直到卸载）
-//         let handle = match mount_vfs_unprivileged(fs, &mnt_path).await {
-//             Ok(h) => h,
-//             Err(e) => {
-//                 eprintln!("skip fuse test: mount failed: {e}");
-//                 return;
-//             }
-//         };
+        // 挂载（后台，直到卸载）
+        let handle = match mount_vfs_unprivileged(fs, &mnt_path).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("skip fuse test: mount failed: {e}");
+                return;
+            }
+        };
 
-//         // 给内核/守护线程一点时间完成 INIT
-//         tokio::time::sleep(StdDuration::from_millis(2000)).await;
+        // 给内核/守护线程一点时间完成 INIT
+        tokio::time::sleep(StdDuration::from_millis(2000)).await;
 
-//         // 目录/文件基本操作
-//         let dir = mnt_path.join("a");
-//         fs::create_dir(&dir).expect("mkdir");
-//         let file_path = dir.join("hello.txt");
-//         {
-//             let mut f = fs::File::create(&file_path).expect("create file");
-//             f.write_all(b"abc").expect("write");
-//             f.flush().expect("flush");
-//         }
-//         let content = fs::read(&file_path).expect("read back");
-//         assert_eq!(content, b"abc");
+        // 目录/文件基本操作
+        let dir = mnt_path.join("a");
+        fs::create_dir(&dir).expect("mkdir");
+        let file_path = dir.join("hello.txt");
+        {
+            let mut f = fs::File::create(&file_path).expect("create file");
+            f.write_all(b"abc").expect("write");
+            f.flush().expect("flush");
+        }
+        let content = fs::read(&file_path).expect("read back");
+        assert_eq!(content, b"abc");
 
-//         // 列目录
-//         let list = fs::read_dir(&dir)
-//             .expect("readdir")
-//             .filter_map(|e| e.ok())
-//             .map(|e| e.file_name())
-//             .collect::<Vec<_>>();
-//         assert!(list.iter().any(|n| n.to_string_lossy() == "hello.txt"));
+        // 列目录
+        let list = fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>();
+        assert!(list.iter().any(|n| n.to_string_lossy() == "hello.txt"));
 
-//         // 删除并卸载
-//         fs::remove_file(&file_path).expect("unlink");
+        // 删除并卸载
+        fs::remove_file(&file_path).expect("unlink");
 
-//         // 主动卸载并等待结束
-//         if let Err(e) = handle.unmount().await {
-//             eprintln!("unmount error: {e}");
-//         }
-//     }
-// }
+        // 主动卸载并等待结束
+        if let Err(e) = handle.unmount().await {
+            eprintln!("unmount error: {e}");
+        }
+    }
+}
 
-impl<S, M> Filesystem for Vfs<S, M>
+impl<S, M> Filesystem for VFS<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
     M: MetaStore + Send + Sync + 'static,
@@ -146,7 +147,7 @@ where
         let Some(vattr) = self.stat_ino(child_ino.0).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = VFS_to_fuse_attr(&vattr, &req);
         // generation 暂置 0；ttl 设为 1s，可调
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
@@ -233,7 +234,7 @@ where
         let Some(vattr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
             attr,
@@ -257,7 +258,7 @@ where
         let Some(vattr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
             attr,
@@ -304,7 +305,7 @@ where
         for (i, e) in entries.iter().enumerate() {
             all.push(DirectoryEntry {
                 inode: e.ino as u64,
-                kind: vfs_kind_to_fuse(e.kind),
+                kind: VFS_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
                 offset: (i as i64) + 3,
             });
@@ -347,7 +348,7 @@ where
         let mut all: Vec<DirectoryEntryPlus> = Vec::with_capacity(entries.len() + 2);
         // "."
         if let Some(attr) = self.stat_ino(ino as i64).await {
-            let fattr = vfs_to_fuse_attr(&attr, &req);
+            let fattr = VFS_to_fuse_attr(&attr, &req);
             all.push(DirectoryEntryPlus {
                 inode: ino,
                 generation: 0,
@@ -364,7 +365,7 @@ where
         // ".."
         let parent_ino = self.parent_of(ino as i64).unwrap_or(self.root_ino()) as u64;
         if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
-            let f = vfs_to_fuse_attr(&pattr, &req);
+            let f = VFS_to_fuse_attr(&pattr, &req);
             all.push(DirectoryEntryPlus {
                 inode: parent_ino,
                 generation: 0,
@@ -381,11 +382,11 @@ where
             let Some(cattr) = self.stat_ino(e.ino).await else {
                 continue;
             };
-            let fattr = vfs_to_fuse_attr(&cattr, &req);
+            let fattr = VFS_to_fuse_attr(&cattr, &req);
             all.push(DirectoryEntryPlus {
                 inode: e.ino as u64,
                 generation: 0,
-                kind: vfs_kind_to_fuse(e.kind),
+                kind: VFS_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
                 offset: (i as i64) + 3,
                 attr: fattr,
@@ -459,7 +460,7 @@ where
         let Some(vattr) = self.stat_ino(_ino).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
             attr,
@@ -498,7 +499,7 @@ where
         let Some(vattr) = self.stat_ino(ino).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyCreated {
             ttl: Duration::from_secs(1),
             attr,
@@ -708,14 +709,14 @@ where
 }
 
 // =============== helpers ===============
-fn vfs_kind_to_fuse(k: FileType) -> FuseFileType {
+fn VFS_kind_to_fuse(k: FileType) -> FuseFileType {
     match k {
         FileType::Dir => FuseFileType::Directory,
         FileType::File => FuseFileType::RegularFile,
     }
 }
 
-fn vfs_to_fuse_attr(v: &VfsFileAttr, req: &Request) -> rfuse3::raw::reply::FileAttr {
+fn VFS_to_fuse_attr(v: &VFSFileAttr, req: &Request) -> rfuse3::raw::reply::FileAttr {
     // 时间与权限占位：按 kind 赋默认权限；时间用当前时间
     let now = Timestamp::from(SystemTime::now());
     let perm = match v.kind {
@@ -733,7 +734,7 @@ fn vfs_to_fuse_attr(v: &VfsFileAttr, req: &Request) -> rfuse3::raw::reply::FileA
         ctime: now,
         #[cfg(target_os = "macos")]
         crtime: now,
-        kind: vfs_kind_to_fuse(v.kind),
+        kind: VFS_kind_to_fuse(v.kind),
         perm,
         nlink: 1,
         uid: req.uid,

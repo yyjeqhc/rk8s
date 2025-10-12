@@ -13,17 +13,17 @@ use crate::meta::config::{Config, DatabaseConfig, DatabaseType};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::store::DirEntry;
 use crate::meta::{MetaStore, create_meta_store_from_url};
-use crate::vfs::fs::{Vfs, VfsError};
+use crate::vfs::fs::{VFS, VfsError};
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct Client<S: BlockStore, M: MetaStore> {
-    vfs: Arc<Vfs<S, M>>,
+    vfs: Arc<VFS<S, M>>,
 }
 
 impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
-    /// Create a new client from a Vfs instance
-    pub fn new(vfs: Arc<Vfs<S, M>>) -> Self {
+    /// Create a new client from a vfs instance
+    pub fn new(vfs: Arc<VFS<S, M>>) -> Self {
         Self { vfs }
     }
 
@@ -115,9 +115,9 @@ impl LocalClient {
             .expect("Failed to create meta store");
 
         let vfs = Arc::new(
-            Vfs::new(layout, store, meta)
+            VFS::new(layout, store, meta)
                 .await
-                .expect("Failed to create VFS"),
+                .expect("Failed to create vfs"),
         );
         Client::new(vfs)
     }

@@ -26,14 +26,14 @@ impl From<EntryType> for FileType {
 }
 
 #[derive(Clone, Debug)]
-pub struct VfsFileAttr {
+pub struct VFSFileAttr {
     pub ino: i64,
     pub size: u64,
     pub kind: FileType,
 }
 
 #[derive(Clone, Debug)]
-pub struct VfsFileType {
+pub struct VFSFileType {
     pub name: String,
     pub ino: i64,
     pub kind: FileType,
@@ -41,7 +41,6 @@ pub struct VfsFileType {
 
 use crate::meta::store::{DirEntry, FileAttr, MetaError};
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
-use async_trait::async_trait;
 
 /// VFS operation errors
 #[derive(Debug, thiserror::Error)]
@@ -81,7 +80,7 @@ impl From<String> for VfsError {
 }
 
 /// Result type for VFS operations
-pub type VfsResult<T> = Result<T, VfsError>;
+pub type VFSResult<T> = Result<T, VfsError>;
 
 /// In-memory namespace node for path resolution
 ///
@@ -180,7 +179,7 @@ impl Namespace {
     }
 }
 
-pub struct Vfs<S: BlockStore, M: MetaStore> {
+pub struct VFS<S: BlockStore, M: MetaStore> {
     /// Chunk layout configuration
     layout: ChunkLayout,
     /// Block storage for chunk data
@@ -195,12 +194,10 @@ pub struct Vfs<S: BlockStore, M: MetaStore> {
     root: Inode,
 }
 
-impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
-    /// Create a new VFS V2 instance
-    ///
+impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// This will initialize the metadata store and load the directory tree
     /// from persistent storage into the in-memory namespace cache.
-    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> VfsResult<Self> {
+    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> VFSResult<Self> {
         // Initialize metadata store
         meta.initialize().await?;
 
@@ -210,7 +207,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
         // Chunk ID base offset to avoid conflicts
         let base = 1_000_000_000i64;
 
-        let vfs = Self {
+        let VFS = Self {
             layout,
             store: tokio::sync::Mutex::new(store),
             meta,
@@ -220,16 +217,16 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
         };
 
         // Load existing directory tree
-        vfs.load_tree_from_meta().await?;
+        VFS.load_tree_from_meta().await?;
 
-        Ok(vfs)
+        Ok(VFS)
     }
 
     /// Load directory tree from MetaStore into namespace cache
     ///
     /// This is called during VFS initialization to rebuild the in-memory
     /// namespace from persistent storage.
-    async fn load_tree_from_meta(&self) -> VfsResult<()> {
+    async fn load_tree_from_meta(&self) -> VFSResult<()> {
         let mut queue = vec![("/".to_string(), self.root)];
 
         while let Some((path, ino)) = queue.pop() {
@@ -288,7 +285,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
     ///
     /// For "/foo/bar", returns ("/foo", parent_ino, "bar")
     /// For "/foo", returns ("/", root_ino, "foo")
-    fn parse_path(&self, path: &str) -> VfsResult<(String, Inode, String)> {
+    fn parse_path(&self, path: &str) -> VFSResult<(String, Inode, String)> {
         if path.is_empty() || !path.starts_with('/') {
             return Err(VfsError::InvalidPath(path.to_string()));
         }
@@ -345,7 +342,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
     }
 
     /// Write data to chunks
-    async fn write_chunks(&self, ino: Inode, offset: u64, data: &[u8]) -> VfsResult<usize> {
+    async fn write_chunks(&self, ino: Inode, offset: u64, data: &[u8]) -> VFSResult<usize> {
         let spans = split_file_range_into_chunks(self.layout, offset, data.len());
         let mut total_written = 0;
         let mut data_offset = 0;
@@ -366,7 +363,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
     }
 
     /// Read data from chunks
-    async fn read_chunks(&self, ino: Inode, offset: u64, len: usize) -> VfsResult<Vec<u8>> {
+    async fn read_chunks(&self, ino: Inode, offset: u64, len: usize) -> VFSResult<Vec<u8>> {
         let spans = split_file_range_into_chunks(self.layout, offset, len);
         let mut result = Vec::with_capacity(len);
 
@@ -395,10 +392,10 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
     }
 
     /// Get file attributes by inode (async version for FUSE)
-    pub async fn stat_ino(&self, ino: i64) -> Option<VfsFileAttr> {
+    pub async fn stat_ino(&self, ino: i64) -> Option<VFSFileAttr> {
         let inode = Inode(ino);
         let attr = self.meta.getattr(inode).await.ok()?;
-        Some(VfsFileAttr {
+        Some(VFSFileAttr {
             ino: attr.ino,
             size: attr.size,
             kind: attr.kind,
@@ -464,12 +461,12 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
     }
 
     /// List directory entries by inode
-    pub async fn readdir_ino(&self, ino: i64) -> Result<Vec<VfsFileType>, VfsError> {
+    pub async fn readdir_ino(&self, ino: i64) -> Result<Vec<VFSFileType>, VfsError> {
         let inode = Inode(ino);
         let entries = self.meta.readdir(inode).await?;
         Ok(entries
             .into_iter()
-            .map(|e| VfsFileType {
+            .map(|e| VFSFileType {
                 name: e.name,
                 ino: e.ino,
                 kind: e.kind,
@@ -1104,7 +1101,7 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = Vfs::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta).await.unwrap();
 
         fs.mkdir_p("/a/b").await.expect("mkdir_p");
         fs.create_file("/a/b/hello.txt").await.expect("create");
@@ -1142,7 +1139,7 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = Vfs::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta).await.unwrap();
 
         fs.mkdir_p("/a/b").await.unwrap();
         fs.create_file("/a/b/t.txt").await.unwrap();

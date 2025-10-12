@@ -9,7 +9,7 @@ use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
 use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
 use slayerfs::meta::database_store::DatabaseMetaStore;
-use slayerfs::vfs::fs::Vfs;
+use slayerfs::vfs::fs::VFS;
 use slayerfs::vfs::sdk::Client;
 use std::error::Error;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create VFS V2
     let vfs = Arc::new(
-        Vfs::new(layout, block_store, meta_store)
+        VFS::new(layout, block_store, meta_store)
             .await
             .expect("create VFS"),
     );
