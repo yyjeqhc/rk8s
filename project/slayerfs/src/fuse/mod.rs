@@ -13,7 +13,9 @@
 //! The module also includes platform-specific tests for mounting and basic operations,  
 //! and provides utilities for mapping VFS metadata to FUSE attributes.
 pub mod adapter;
+pub mod adapter_v2;
 pub mod mount;
+pub mod mount_v2;
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
 use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType, VFS};
