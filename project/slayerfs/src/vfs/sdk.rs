@@ -72,7 +72,10 @@ impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
 
     /// Get file attributes
     pub async fn stat(&self, path: &str) -> Result<crate::meta::store::FileAttr, VfsError> {
-        self.vfs.stat(path).await.ok_or_else(|| VfsError::PathNotFound(path.to_string()))
+        self.vfs
+            .stat(path)
+            .await
+            .ok_or_else(|| VfsError::PathNotFound(path.to_string()))
     }
 
     /// Truncate file to specified size
