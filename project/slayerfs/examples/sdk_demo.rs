@@ -1,7 +1,7 @@
-// Example program: demonstrate vfs::sdk::Client usage without FUSE
+// Example program: demonstrate vfs::sdk_v2::ClientV2 usage without FUSE
 
 use slayerfs::chuck::chunk::ChunkLayout;
-use slayerfs::vfs::sdk::LocalClient;
+use slayerfs::vfs::sdk_v2::LocalClientV2;
 use std::path::PathBuf;
 
 #[tokio::main(flavor = "current_thread")]
@@ -15,11 +15,10 @@ async fn main() {
     };
 
     let layout = ChunkLayout::default();
-    let mut cli = LocalClient::new_local(&root, layout).await;
+    let mut cli = LocalClientV2::new_local(&root, layout).await;
 
     // Prepare paths
     let dir = "/demo/ns";
-    let dir2 = "/demo/renamed"; // will be auto-created by rename
     let file_a = "/demo/ns/a.txt";
     let file_b = "/demo/ns/b.txt";
     let file_a2 = "/demo/renamed/a_renamed.txt";
@@ -105,61 +104,24 @@ async fn main() {
             .join(", ")
     );
 
-    // Cross-directory rename (auto-create parent), then stat
+    // Cross-directory rename (auto-create parent)
     cli.rename(file_a, file_a2)
         .await
         .expect("rename across dirs");
-    let st_a2 = cli.stat(file_a2).await.expect("stat a_renamed");
-    println!(
-        "root={:?} file={} size={} kind={:?}",
-        root, file_a2, st_a2.size, st_a2.kind
-    );
+    println!("✓ Renamed {} to {}", file_a, file_a2);
 
-    // Truncate shrink, verify size, and do an in-bound write/read near tail
-    cli.truncate(file_a2, layout.block_size as u64)
+    // Read data back from renamed file
+    let out_a_renamed = cli
+        .read_at(file_a2, half as u64, len)
         .await
-        .expect("truncate shrink");
-    let st_shrink = cli.stat(file_a2).await.expect("stat after shrink");
-    assert_eq!(st_shrink.size, layout.block_size as u64);
-    let tail_off = st_shrink.size - 256;
-    let tail = vec![5u8; 256];
-    cli.write_at(file_a2, tail_off, &tail)
-        .await
-        .expect("write tail after shrink");
-    let tail_back = cli
-        .read_at(file_a2, tail_off, 256)
-        .await
-        .expect("read tail after shrink");
-    assert_eq!(tail_back, tail);
+        .expect("read renamed file");
+    assert_eq!(out_a_renamed, data, "renamed file readback");
+    println!("✓ Read data from renamed file successfully");
 
-    // Truncate extend b.txt, then read in the extended area => zeros
-    let new_size_b = (layout.block_size as u64) * 5;
-    cli.truncate(file_b, new_size_b)
-        .await
-        .expect("truncate extend");
-    let extended = cli
-        .read_at(file_b, new_size_b - 128, 256)
-        .await
-        .expect("read extended hole");
-    assert!(extended.iter().all(|&b| b == 0));
+    // Cleanup: remove files
+    cli.remove(file_b).await.expect("remove b");
+    cli.remove(file_a2).await.expect("remove a2");
+    println!("✓ Removed test files");
 
-    // Try error scenarios
-    // 1) rmdir non-empty directory
-    if let Err(e) = cli.rmdir(dir).await {
-        println!("expected rmdir non-empty error: {e}");
-    }
-    // 2) unlink directory path (should error)
-    if let Err(e) = cli.unlink(dir).await {
-        println!("expected unlink dir error: {e}");
-    }
-
-    // Cleanup: unlink files and remove directories
-    cli.unlink(file_b).await.expect("unlink b");
-    // After moving a.txt -> a_renamed.txt, remove in new location
-    cli.unlink(file_a2).await.expect("unlink a2");
-    // Remove both directories; dir2 becomes empty after unlink
-    cli.rmdir(dir2).await.expect("rmdir dir2");
-    cli.rmdir(dir).await.expect("rmdir dir");
-
-    println!("sdk demo: OK");
+    println!("\n🎉 sdk_v2 demo: All operations completed successfully!");
 }

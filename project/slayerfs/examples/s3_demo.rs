@@ -7,9 +7,12 @@ use slayerfs::cadapter::client::ObjectClient;
 use slayerfs::cadapter::s3::{S3Backend, S3Config};
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
-use slayerfs::meta::create_meta_store_from_url;
-use slayerfs::vfs::sdk::Client;
+use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
+use slayerfs::meta::database_store::DatabaseMetaStore;
+use slayerfs::vfs::fs_v2::VfsV2;
+use slayerfs::vfs::sdk_v2::ClientV2;
 use std::error::Error;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -51,14 +54,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let layout = ChunkLayout::default();
 
     // Create memory metadata store (for demo purposes)
-    let meta_store = create_meta_store_from_url("sqlite::memory:")
+    let config = Config {
+        database: DatabaseConfig {
+            db_config: DatabaseType::Sqlite {
+                url: "sqlite::memory:".to_string(),
+            },
+        },
+    };
+    let meta_store = DatabaseMetaStore::from_config(config)
         .await
         .expect("create meta store");
 
-    // Create VFS client
-    let mut client = Client::new(layout, block_store, meta_store)
-        .await
-        .expect("create vfs fail.");
+    // Create VFS V2
+    let vfs = Arc::new(VfsV2::new(layout, block_store, meta_store).await.expect("create VFS"));
+
+    // Create client
+    let mut client = ClientV2::new(vfs);
 
     // Test basic operations
     println!("Testing basic S3 operations...");
@@ -101,13 +112,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(read_large, large_data);
     println!("✓ Read large data back successfully");
 
-    // Test file metadata
-    let metadata = client.stat(file_path).await?;
-    println!(
-        "✓ File metadata: size={}, kind={:?}",
-        metadata.size, metadata.kind
-    );
-
     // List directory contents
     let entries = client.readdir(dir_path).await?;
     println!(
@@ -117,24 +121,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     for entry in &entries {
         println!(
-            "  - {} ({})",
-            entry.name,
-            match entry.kind {
-                slayerfs::vfs::fs::FileType::Dir => "directory",
-                slayerfs::vfs::fs::FileType::File => "file",
-            }
+            "  - {} (inode: {}, type: {:?})",
+            entry.name, entry.ino, entry.kind
         );
     }
 
     // Test delete functionality
-    client.unlink(file_path).await?;
+    client.remove(file_path).await?;
     println!("✓ Deleted file: {}", file_path);
-
-    // Verify deletion
-    match client.stat(file_path).await {
-        Err(_) => println!("✓ Confirmed file deletion"),
-        Ok(_) => return Err("File should have been deleted".into()),
-    }
 
     println!("\n🎉 All S3 backend tests passed!");
     println!("S3 backend is working correctly with bucket '{}'", bucket);

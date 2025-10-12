@@ -206,6 +206,41 @@ pub trait FileSystemV2: Send + Sync {
     /// Lookup a name in a directory
     async fn lookup(&self, parent: Inode, name: &str) -> VfsResult<Inode>;
 
+    // === Inode-based modification operations (for FUSE) ===
+
+    /// Create a directory by parent inode and name
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn mkdir_ino(&self, parent: Inode, name: &str, mode: u32, uid: u32, gid: u32) 
+        -> VfsResult<Inode>;
+
+    /// Create a file by parent inode and name
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn create_ino(&self, parent: Inode, name: &str, mode: u32, uid: u32, gid: u32) 
+        -> VfsResult<Inode>;
+
+    /// Delete a file by parent inode and name
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn unlink_ino(&self, parent: Inode, name: &str) -> VfsResult<()>;
+
+    /// Delete a directory by parent inode and name
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn rmdir_ino(&self, parent: Inode, name: &str) -> VfsResult<()>;
+
+    /// Rename by inode references
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn rename_ino(&self, old_parent: Inode, old_name: &str, 
+                        new_parent: Inode, new_name: &str) -> VfsResult<()>;
+
+    /// Truncate a file by inode
+    ///
+    /// This is a convenience method for FUSE that internally uses path-based operations.
+    async fn truncate_ino(&self, ino: Inode, size: u64) -> VfsResult<()>;
+
     // === Utility operations ===
 
     /// Get root inode
@@ -682,6 +717,85 @@ impl<S: BlockStore + Send + Sync, M: MetaStoreV2> FileSystemV2 for VfsV2<S, M> {
     async fn lookup(&self, parent: Inode, name: &str) -> VfsResult<Inode> {
         let ino = self.meta.lookup(parent, name).await?;
         Ok(ino)
+    }
+
+    // === Inode-based modification operations ===
+
+    async fn mkdir_ino(&self, parent: Inode, name: &str, mode: u32, uid: u32, gid: u32) 
+        -> VfsResult<Inode> 
+    {
+        let parent_path = self.path_of(parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent.0)))?;
+        let full_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.mkdir(&full_path, mode, uid, gid).await
+    }
+
+    async fn create_ino(&self, parent: Inode, name: &str, mode: u32, uid: u32, gid: u32) 
+        -> VfsResult<Inode> 
+    {
+        let parent_path = self.path_of(parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent.0)))?;
+        let full_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.create(&full_path, mode, uid, gid).await
+    }
+
+    async fn unlink_ino(&self, parent: Inode, name: &str) -> VfsResult<()> {
+        let parent_path = self.path_of(parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent.0)))?;
+        let full_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.unlink(&full_path).await
+    }
+
+    async fn rmdir_ino(&self, parent: Inode, name: &str) -> VfsResult<()> {
+        let parent_path = self.path_of(parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent.0)))?;
+        let full_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.rmdir(&full_path).await
+    }
+
+    async fn rename_ino(&self, old_parent: Inode, old_name: &str, 
+                        new_parent: Inode, new_name: &str) -> VfsResult<()> 
+    {
+        let old_parent_path = self.path_of(old_parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", old_parent.0)))?;
+        let old_path = if old_parent_path == "/" {
+            format!("/{}", old_name)
+        } else {
+            format!("{}/{}", old_parent_path, old_name)
+        };
+
+        let new_parent_path = self.path_of(new_parent)
+            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", new_parent.0)))?;
+        let new_path = if new_parent_path == "/" {
+            format!("/{}", new_name)
+        } else {
+            format!("{}/{}", new_parent_path, new_name)
+        };
+
+        self.rename(&old_path, &new_path).await
+    }
+
+    async fn truncate_ino(&self, ino: Inode, size: u64) -> VfsResult<()> {
+        // Use setattr to change file size
+        let mask = SetAttrMask::size(size);
+        self.meta.setattr(ino, mask).await?;
+        Ok(())
     }
 
     fn root_ino(&self) -> Inode {

@@ -158,7 +158,7 @@ where
 
         // Only support truncate for now
         if let Some(size) = set_attr.size {
-            self.vfs.truncate(ino, size).await.map_err(|_| libc::EIO)?;
+            self.vfs.truncate_ino(ino, size).await.map_err(|_| libc::EIO)?;
         }
 
         let attr = self.vfs.getattr(ino).await.map_err(|_| libc::ENOENT)?;
@@ -173,13 +173,15 @@ where
         _req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
-        let name = name.to_str().ok_or(libc::EINVAL)?;
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
         let parent_ino = Inode(parent as i64);
 
-        let child_ino = self.vfs.mkdir(parent_ino, name).await.map_err(|_| libc::EIO)?;
+        let child_ino = self.vfs.mkdir_ino(parent_ino, name_str, mode, self.uid, self.gid)
+            .await
+            .map_err(|_| libc::EIO)?;
         let attr = self.vfs.getattr(child_ino).await.map_err(|_| libc::ENOENT)?;
 
         Ok(ReplyEntry {
@@ -194,13 +196,15 @@ where
         _req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _flags: u32,
     ) -> FuseResult<ReplyCreated> {
-        let name = name.to_str().ok_or(libc::EINVAL)?;
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
         let parent_ino = Inode(parent as i64);
 
-        let child_ino = self.vfs.create(parent_ino, name).await.map_err(|_| libc::EIO)?;
+        let child_ino = self.vfs.create_ino(parent_ino, name_str, mode, self.uid, self.gid)
+            .await
+            .map_err(|_| libc::EIO)?;
         let attr = self.vfs.getattr(child_ino).await.map_err(|_| libc::ENOENT)?;
 
         Ok(ReplyCreated {
@@ -213,17 +217,21 @@ where
     }
 
     async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
-        let name = name.to_str().ok_or(libc::EINVAL)?;
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
         let parent_ino = Inode(parent as i64);
 
-        self.vfs.unlink(parent_ino, name).await.map_err(|_| libc::EIO)
+        self.vfs.unlink_ino(parent_ino, name_str)
+            .await
+            .map_err(|_| libc::EIO.into())
     }
 
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
-        let name = name.to_str().ok_or(libc::EINVAL)?;
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
         let parent_ino = Inode(parent as i64);
 
-        self.vfs.rmdir(parent_ino, name).await.map_err(|_| libc::EIO)
+        self.vfs.rmdir_ino(parent_ino, name_str)
+            .await
+            .map_err(|_| libc::EIO.into())
     }
 
     async fn rename(
@@ -234,15 +242,15 @@ where
         parent: u64,
         name: &OsStr,
     ) -> FuseResult<()> {
-        let origin_name = origin_name.to_str().ok_or(libc::EINVAL)?;
-        let new_name = name.to_str().ok_or(libc::EINVAL)?;
+        let origin_name_str = origin_name.to_str().ok_or(libc::EINVAL)?;
+        let new_name_str = name.to_str().ok_or(libc::EINVAL)?;
         let origin_parent_ino = Inode(origin_parent as i64);
         let new_parent_ino = Inode(parent as i64);
 
         self.vfs
-            .rename(origin_parent_ino, origin_name, new_parent_ino, new_name)
+            .rename_ino(origin_parent_ino, origin_name_str, new_parent_ino, new_name_str)
             .await
-            .map_err(|_| libc::EIO)
+            .map_err(|_| libc::EIO.into())
     }
 
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
@@ -268,7 +276,7 @@ where
 
         let data = self
             .vfs
-            .read(ino, offset, size as usize)
+            .read_ino(ino, offset, size as usize)
             .await
             .map_err(|_| libc::EIO)?;
 
@@ -291,7 +299,7 @@ where
 
         let written = self
             .vfs
-            .write(ino, offset, data)
+            .write_ino(ino, offset, data)
             .await
             .map_err(|_| libc::EIO)?;
 
@@ -313,14 +321,22 @@ where
     }
 
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
+        eprintln!("[FUSE] opendir called for inode {}", inode);
         // Verify directory exists
         let ino = Inode(inode as i64);
-        let _ = self.vfs.getattr(ino).await.map_err(|_| libc::ENOENT)?;
-
-        Ok(ReplyOpen {
-            fh: 0,
-            flags: 0,
-        })
+        match self.vfs.getattr(ino).await {
+            Ok(attr) => {
+                eprintln!("[FUSE] opendir: inode {} found, type: {:?}", inode, attr.kind);
+                Ok(ReplyOpen {
+                    fh: 0,
+                    flags: 0,
+                })
+            }
+            Err(e) => {
+                eprintln!("[FUSE] opendir: inode {} not found: {:?}", inode, e);
+                Err(libc::ENOENT.into())
+            }
+        }
     }
 
     async fn readdir<'a>(
@@ -330,50 +346,162 @@ where
         _fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
+        eprintln!("========================================");
+        eprintln!("[FUSE] readdir CALLED! inode={}, offset={}", inode, offset);
+        eprintln!("========================================");
         let ino = Inode(inode as i64);
 
-        let entries = self.vfs.readdir(ino).await.map_err(|_| libc::ENOTDIR)?;
+        // Read directory entries from VFS
+        let entries = match self.vfs.readdir_ino(ino).await {
+            Ok(entries) => {
+                eprintln!("[FUSE] readdir_ino succeeded, got {} entries", entries.len());
+                entries
+            }
+            Err(e) => {
+                eprintln!("[FUSE] readdir_ino failed for inode {}: {:?}", inode, e);
+                return Err(libc::EIO.into());
+            }
+        };
 
         let mut all_entries = Vec::with_capacity(entries.len() + 2);
 
-        // Add "." entry
-        all_entries.push(DirectoryEntry {
-            inode: inode,
-            kind: FuseFileType::Directory,
-            name: OsString::from("."),
-            offset: 1,
-        });
-
-        // Add ".." entry (for simplicity, use root for parent)
-        all_entries.push(DirectoryEntry {
-            inode: 1,
-            kind: FuseFileType::Directory,
-            name: OsString::from(".."),
-            offset: 2,
-        });
-
-        // Add actual entries
-        for (i, entry) in entries.iter().enumerate() {
+        // Add "." entry (offset 1)
+        if offset <= 0 {
             all_entries.push(DirectoryEntry {
-                inode: entry.ino as u64,
-                kind: vfs_kind_to_fuse(entry.kind),
-                name: OsString::from(&entry.name),
-                offset: (i as i64) + 3,
+                inode: inode,
+                kind: FuseFileType::Directory,
+                name: OsString::from("."),
+                offset: 1,
             });
         }
 
-        // Filter by offset
-        let start = if offset <= 0 { 0 } else { offset as usize };
-        let slice = if start >= all_entries.len() {
-            Vec::new()
-        } else {
-            all_entries[start..].to_vec()
-        };
+        // Add ".." entry (offset 2)
+        if offset <= 1 {
+            all_entries.push(DirectoryEntry {
+                inode: 1,
+                kind: FuseFileType::Directory,
+                name: OsString::from(".."),
+                offset: 2,
+            });
+        }
 
-        let stream = stream::iter(slice.into_iter().map(Ok));
+        // Add actual entries (offset 3+)
+        for (i, entry) in entries.iter().enumerate() {
+            let entry_offset = (i as i64) + 3;
+            if offset < entry_offset {
+                all_entries.push(DirectoryEntry {
+                    inode: entry.ino as u64,
+                    kind: vfs_kind_to_fuse(entry.kind),
+                    name: OsString::from(&entry.name),
+                    offset: entry_offset,
+                });
+            }
+        }
+
+        eprintln!("[FUSE] readdir returning {} entries (offset {})", all_entries.len(), offset);
+        let stream = stream::iter(all_entries.into_iter().map(Ok));
         let boxed: Self::DirEntryStream<'a> = Box::pin(stream);
 
         Ok(ReplyDirectory { entries: boxed })
+    }
+
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        parent: u64,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
+        eprintln!("========================================");
+        eprintln!("[FUSE] readdirplus CALLED! parent={}, offset={}", parent, offset);
+        eprintln!("========================================");
+        
+        let parent_ino = Inode(parent as i64);
+
+        // Read directory entries from VFS
+        let entries = match self.vfs.readdir_ino(parent_ino).await {
+            Ok(entries) => {
+                eprintln!("[FUSE] readdirplus: got {} entries", entries.len());
+                entries
+            }
+            Err(e) => {
+                eprintln!("[FUSE] readdirplus failed: {:?}", e);
+                return Err(libc::EIO.into());
+            }
+        };
+
+        let mut all_entries = Vec::with_capacity(entries.len() + 2);
+
+        // Add "." entry (offset 1)
+        if offset <= 0 {
+            let dot_attr = match self.vfs.getattr(parent_ino).await {
+                Ok(attr) => self.to_fuse_attr(attr),
+                Err(_) => {
+                    return Err(libc::EIO.into());
+                }
+            };
+            all_entries.push(DirectoryEntryPlus {
+                inode: parent,
+                generation: 0,
+                kind: FuseFileType::Directory,
+                name: OsString::from("."),
+                offset: 1,
+                attr: dot_attr,
+                entry_ttl: std::time::Duration::from_secs(1),
+                attr_ttl: std::time::Duration::from_secs(1),
+            });
+        }
+
+        // Add ".." entry (offset 2) - for simplicity, use root
+        if offset <= 1 {
+            let dotdot_ino = Inode(1);
+            let dotdot_attr = match self.vfs.getattr(dotdot_ino).await {
+                Ok(attr) => self.to_fuse_attr(attr),
+                Err(_) => {
+                    return Err(libc::EIO.into());
+                }
+            };
+            all_entries.push(DirectoryEntryPlus {
+                inode: 1,
+                generation: 0,
+                kind: FuseFileType::Directory,
+                name: OsString::from(".."),
+                offset: 2,
+                attr: dotdot_attr,
+                entry_ttl: std::time::Duration::from_secs(1),
+                attr_ttl: std::time::Duration::from_secs(1),
+            });
+        }
+
+        // Add actual entries (offset 3+)
+        for (i, entry) in entries.iter().enumerate() {
+            let entry_offset = (i as i64) + 3;
+            if offset < entry_offset as u64 {
+                let entry_ino = Inode(entry.ino);
+                let attr = match self.vfs.getattr(entry_ino).await {
+                    Ok(attr) => self.to_fuse_attr(attr),
+                    Err(_) => continue, // Skip entries we can't get attrs for
+                };
+                
+                all_entries.push(DirectoryEntryPlus {
+                    inode: entry.ino as u64,
+                    generation: 0,
+                    kind: vfs_kind_to_fuse(entry.kind),
+                    name: OsString::from(&entry.name),
+                    offset: entry_offset,
+                    attr,
+                    entry_ttl: std::time::Duration::from_secs(1),
+                    attr_ttl: std::time::Duration::from_secs(1),
+                });
+            }
+        }
+
+        eprintln!("[FUSE] readdirplus returning {} entries", all_entries.len());
+        let stream = stream::iter(all_entries.into_iter().map(Ok));
+        let boxed: Self::DirEntryPlusStream<'a> = Box::pin(stream);
+
+        Ok(ReplyDirectoryPlus { entries: boxed })
     }
 
     async fn releasedir(

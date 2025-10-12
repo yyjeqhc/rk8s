@@ -23,6 +23,7 @@ pub mod fs_v2;
 mod fs_v2_tests;
 pub mod handles;
 pub mod sdk;
+pub mod sdk_v2;
 pub mod simple;
 
 // Module implementation TODOs remain.
