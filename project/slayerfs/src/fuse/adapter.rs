@@ -10,7 +10,7 @@ use crate::meta::store::FileAttr as VfsFileAttr;
 use crate::meta::store::MetaStore;
 use crate::meta::types::Inode;
 use crate::vfs::fs::FileType as VfsFileType;
-use crate::vfs::fs::{FileSystem, Vfs};
+use crate::vfs::fs::Vfs;
 use bytes::Bytes;
 use futures_util::Stream;
 use futures_util::stream;
@@ -105,12 +105,11 @@ where
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         let name = name.to_str().ok_or(libc::EINVAL)?;
-        let parent_ino = Inode(parent as i64);
 
         // Use path-based lookup for simplicity
         let child_ino = self
             .vfs
-            .lookup(parent_ino, name)
+            .lookup(parent as i64, name)
             .await
             .map_err(|_| libc::ENOENT)?;
         let attr = self
@@ -133,8 +132,11 @@ where
         _fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
-        let ino = Inode(inode as i64);
-        let attr = self.vfs.getattr(ino).await.map_err(|_| libc::ENOENT)?;
+        let attr = self
+            .vfs
+            .getattr(inode as i64)
+            .await
+            .map_err(|_| libc::ENOENT)?;
 
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
@@ -149,17 +151,19 @@ where
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
-        let ino = Inode(inode as i64);
-
         // Only support truncate for now
         if let Some(size) = set_attr.size {
             self.vfs
-                .truncate_ino(ino, size)
+                .truncate_ino(inode as i64, size)
                 .await
                 .map_err(|_| libc::EIO)?;
         }
 
-        let attr = self.vfs.getattr(ino).await.map_err(|_| libc::ENOENT)?;
+        let attr = self
+            .vfs
+            .getattr(inode as i64)
+            .await
+            .map_err(|_| libc::ENOENT)?;
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
             attr: self.to_fuse_attr(attr),
@@ -175,11 +179,10 @@ where
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let parent_ino = Inode(parent as i64);
 
         let child_ino = self
             .vfs
-            .mkdir_ino(parent_ino, name_str, mode, self.uid, self.gid)
+            .mkdir_ino(parent as i64, name_str, mode, self.uid, self.gid)
             .await
             .map_err(|_| libc::EIO)?;
         let attr = self
@@ -204,11 +207,10 @@ where
         _flags: u32,
     ) -> FuseResult<ReplyCreated> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let parent_ino = Inode(parent as i64);
 
         let child_ino = self
             .vfs
-            .create_ino(parent_ino, name_str, mode, self.uid, self.gid)
+            .create_ino(parent as i64, name_str, mode, self.uid, self.gid)
             .await
             .map_err(|_| libc::EIO)?;
         let attr = self
@@ -228,20 +230,18 @@ where
 
     async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let parent_ino = Inode(parent as i64);
 
         self.vfs
-            .unlink_ino(parent_ino, name_str)
+            .unlink_ino(parent as i64, name_str)
             .await
             .map_err(|_| libc::EIO.into())
     }
 
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let parent_ino = Inode(parent as i64);
 
         self.vfs
-            .rmdir_ino(parent_ino, name_str)
+            .rmdir_ino(parent as i64, name_str)
             .await
             .map_err(|_| libc::EIO.into())
     }
@@ -256,14 +256,12 @@ where
     ) -> FuseResult<()> {
         let origin_name_str = origin_name.to_str().ok_or(libc::EINVAL)?;
         let new_name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let origin_parent_ino = Inode(origin_parent as i64);
-        let new_parent_ino = Inode(parent as i64);
 
         self.vfs
             .rename_ino(
-                origin_parent_ino,
+                origin_parent as i64,
                 origin_name_str,
-                new_parent_ino,
+                parent as i64,
                 new_name_str,
             )
             .await
@@ -272,8 +270,11 @@ where
 
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
         // Verify file exists
-        let ino = Inode(inode as i64);
-        let _ = self.vfs.getattr(ino).await.map_err(|_| libc::ENOENT)?;
+        let _ = self
+            .vfs
+            .getattr(inode as i64)
+            .await
+            .map_err(|_| libc::ENOENT)?;
 
         Ok(ReplyOpen {
             fh: 0, // Stateless
@@ -289,11 +290,9 @@ where
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
-        let ino = Inode(inode as i64);
-
         let data = self
             .vfs
-            .read_ino(ino, offset, size as usize)
+            .read_ino(inode as i64, offset, size as usize)
             .await
             .map_err(|_| libc::EIO)?;
 
@@ -312,11 +311,9 @@ where
         _write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
-        let ino = Inode(inode as i64);
-
         let written = self
             .vfs
-            .write_ino(ino, offset, data)
+            .write_ino(inode as i64, offset, data)
             .await
             .map_err(|_| libc::EIO)?;
 
@@ -340,8 +337,7 @@ where
     async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FuseResult<ReplyOpen> {
         eprintln!("[FUSE] opendir called for inode {}", inode);
         // Verify directory exists
-        let ino = Inode(inode as i64);
-        match self.vfs.getattr(ino).await {
+        match self.vfs.getattr(inode as i64).await {
             Ok(attr) => {
                 eprintln!(
                     "[FUSE] opendir: inode {} found, type: {:?}",
@@ -366,10 +362,8 @@ where
         eprintln!("========================================");
         eprintln!("[FUSE] readdir CALLED! inode={}, offset={}", inode, offset);
         eprintln!("========================================");
-        let ino = Inode(inode as i64);
-
         // Read directory entries from VFS
-        let entries = match self.vfs.readdir_ino(ino).await {
+        let entries = match self.vfs.readdir_ino(inode as i64).await {
             Ok(entries) => {
                 eprintln!(
                     "[FUSE] readdir_ino succeeded, got {} entries",
@@ -444,10 +438,8 @@ where
         );
         eprintln!("========================================");
 
-        let parent_ino = Inode(parent as i64);
-
         // Read directory entries from VFS
-        let entries = match self.vfs.readdir_ino(parent_ino).await {
+        let entries = match self.vfs.readdir_ino(parent as i64).await {
             Ok(entries) => {
                 eprintln!("[FUSE] readdirplus: got {} entries", entries.len());
                 entries
@@ -462,7 +454,7 @@ where
 
         // Add "." entry (offset 1)
         if offset <= 0 {
-            let dot_attr = match self.vfs.getattr(parent_ino).await {
+            let dot_attr = match self.vfs.getattr(parent as i64).await {
                 Ok(attr) => self.to_fuse_attr(attr),
                 Err(_) => {
                     return Err(libc::EIO.into());
@@ -482,8 +474,7 @@ where
 
         // Add ".." entry (offset 2) - for simplicity, use root
         if offset <= 1 {
-            let dotdot_ino = Inode(1);
-            let dotdot_attr = match self.vfs.getattr(dotdot_ino).await {
+            let dotdot_attr = match self.vfs.getattr(1).await {
                 Ok(attr) => self.to_fuse_attr(attr),
                 Err(_) => {
                     return Err(libc::EIO.into());
@@ -505,8 +496,7 @@ where
         for (i, entry) in entries.iter().enumerate() {
             let entry_offset = (i as i64) + 3;
             if offset < entry_offset as u64 {
-                let entry_ino = Inode(entry.ino);
-                let attr = match self.vfs.getattr(entry_ino).await {
+                let attr = match self.vfs.getattr(entry.ino as i64).await {
                     Ok(attr) => self.to_fuse_attr(attr),
                     Err(_) => continue, // Skip entries we can't get attrs for
                 };

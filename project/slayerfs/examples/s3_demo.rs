@@ -9,8 +9,8 @@ use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
 use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
 use slayerfs::meta::database_store::DatabaseMetaStore;
-use slayerfs::vfs::fs_v2::VfsV2;
-use slayerfs::vfs::sdk_v2::ClientV2;
+use slayerfs::vfs::fs::Vfs;
+use slayerfs::vfs::sdk::Client;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -67,13 +67,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create VFS V2
     let vfs = Arc::new(
-        VfsV2::new(layout, block_store, meta_store)
+        Vfs::new(layout, block_store, meta_store)
             .await
             .expect("create VFS"),
     );
 
     // Create client
-    let mut client = ClientV2::new(vfs);
+    let mut client = Client::new(vfs);
 
     // Test basic operations
     println!("Testing basic S3 operations...");

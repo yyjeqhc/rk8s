@@ -1,7 +1,7 @@
 // Example program: demonstrate vfs::sdk_v2::ClientV2 usage without FUSE
 
 use slayerfs::chuck::chunk::ChunkLayout;
-use slayerfs::vfs::sdk_v2::LocalClientV2;
+use slayerfs::vfs::sdk::LocalClient;
 use std::path::PathBuf;
 
 #[tokio::main(flavor = "current_thread")]
@@ -15,7 +15,7 @@ async fn main() {
     };
 
     let layout = ChunkLayout::default();
-    let mut cli = LocalClientV2::new_local(&root, layout).await;
+    let mut cli = LocalClient::new_local(&root, layout).await;
 
     // Prepare paths
     let dir = "/demo/ns";

@@ -14,28 +14,28 @@
 //! and provides utilities for mapping VFS metadata to FUSE attributes.
 pub mod adapter;
 pub mod mount;
+
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
-use crate::vfs::fs::{Vfs, VfsFileAttr, VfsFileType};
+use crate::vfs::fs::{FileType, Vfs, VfsError, VfsFileAttr, VfsFileType};
 use bytes::Bytes;
+use futures_util::stream::{self, Stream};
 use rfuse3::Result as FuseResult;
+use rfuse3::raw::Filesystem;
 use rfuse3::raw::Request;
 use rfuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyCreated, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs, ReplyWrite,
 };
+use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
-use futures_util::stream::{self, Stream};
-use rfuse3::raw::Filesystem;
-use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
-
+// Legacy mount tests (commented out)
 // #[cfg(all(test, target_os = "linux"))]
 // mod mount_tests {
-//     use super::*;
 //     use crate::cadapter::client::ObjectClient;
 //     use crate::cadapter::localfs::LocalFsBackend;
 //     use crate::chuck::chunk::ChunkLayout;
@@ -143,7 +143,7 @@ where
         let Some(child_ino) = child else {
             return Err(libc::ENOENT.into());
         };
-        let Some(vattr) = self.stat_ino(child_ino).await else {
+        let Some(vattr) = self.stat_ino(child_ino.0).await else {
             return Err(libc::ENOENT.into());
         };
         let attr = vfs_to_fuse_attr(&vattr, &req);
@@ -161,7 +161,7 @@ where
         let Some(attr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if matches!(attr.kind, VfsFileType::Dir) {
+        if matches!(attr.kind, FileType::Dir) {
             return Err(libc::EISDIR.into());
         }
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -172,7 +172,7 @@ where
         let Some(attr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(attr.kind, VfsFileType::Dir) {
+        if !matches!(attr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -249,10 +249,9 @@ where
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
         if let Some(size) = set_attr.size {
-            let Some(path) = self.path_of(ino as i64) else {
-                return Err(libc::ENOENT.into());
-            };
-            self.truncate(&path, size).await.map_err(|_| libc::EIO)?;
+            self.truncate_ino(ino as i64, size)
+                .await
+                .map_err(|_| libc::EIO)?;
         }
         // 返回最新属性
         let Some(vattr) = self.stat_ino(ino as i64).await else {
@@ -274,14 +273,14 @@ where
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
         let entries = match self.readdir_ino(ino as i64).await {
-            None => {
+            Err(_) => {
                 if self.stat_ino(ino as i64).await.is_some() {
                     return Err(libc::ENOTDIR.into());
                 } else {
                     return Err(libc::ENOENT.into());
                 }
             }
-            Some(v) => v,
+            Ok(v) => v,
         };
 
         // 组装含 "." 与 ".." 的目录项，offset 为“上一个 entry 的偏移”，从 offset+1 开始输出
@@ -333,14 +332,14 @@ where
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         let entries = match self.readdir_ino(ino as i64).await {
-            None => {
+            Err(_) => {
                 if self.stat_ino(ino as i64).await.is_some() {
                     return Err(libc::ENOTDIR.into());
                 } else {
                     return Err(libc::ENOENT.into());
                 }
             }
-            Some(v) => v,
+            Ok(v) => v,
         };
 
         let ttl = Duration::from_secs(1);
@@ -441,7 +440,7 @@ where
         let Some(pattr) = self.stat_ino(parent as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
+        if !matches!(pattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         // 冲突检查
@@ -482,7 +481,7 @@ where
         let Some(pattr) = self.stat_ino(parent as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
+        if !matches!(pattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         let Some(mut p) = self.path_of(parent as i64) else {
@@ -492,8 +491,8 @@ where
             p.push('/');
         }
         p.push_str(&name);
-        let ino = self.create_file(&p).await.map_err(|e| match e.as_str() {
-            "is a directory" => libc::EISDIR,
+        let ino = self.create_file(&p).await.map_err(|e| match e {
+            VfsError::NotFile(_) => libc::EISDIR,
             _ => libc::EIO,
         })?;
         let Some(vattr) = self.stat_ino(ino).await else {
@@ -516,17 +515,17 @@ where
         let Some(pattr) = self.stat_ino(parent as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
+        if !matches!(pattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         // 目标必须存在且为文件
         let Some(child) = self.child_of(parent as i64, name.as_ref()) else {
             return Err(libc::ENOENT.into());
         };
-        let Some(cattr) = self.stat_ino(child).await else {
+        let Some(cattr) = self.stat_ino(child.0).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(cattr.kind, VfsFileType::File) {
+        if !matches!(cattr.kind, FileType::File) {
             return Err(libc::EISDIR.into());
         }
         let Some(mut p) = self.path_of(parent as i64) else {
@@ -537,9 +536,9 @@ where
         }
         p.push_str(&name);
         self.unlink(&p).await.map_err(|e| {
-            let code = match e.as_str() {
-                "not found" => libc::ENOENT,
-                "is a directory" => libc::EISDIR,
+            let code = match e {
+                VfsError::PathNotFound(_) => libc::ENOENT,
+                VfsError::NotFile(_) => libc::EISDIR,
                 _ => libc::EIO,
             };
             code.into()
@@ -552,17 +551,17 @@ where
         let Some(pattr) = self.stat_ino(parent as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
+        if !matches!(pattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         // 目标应为目录
         let Some(child) = self.child_of(parent as i64, name.as_ref()) else {
             return Err(libc::ENOENT.into());
         };
-        let Some(cattr) = self.stat_ino(child).await else {
+        let Some(cattr) = self.stat_ino(child.0).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(cattr.kind, VfsFileType::Dir) {
+        if !matches!(cattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
         let Some(mut p) = self.path_of(parent as i64) else {
@@ -573,9 +572,9 @@ where
         }
         p.push_str(&name);
         self.rmdir(&p).await.map_err(|e| {
-            let code = match e.as_str() {
-                "not found" => libc::ENOENT,
-                "directory not empty" => libc::ENOTEMPTY,
+            let code = match e {
+                VfsError::PathNotFound(_) => libc::ENOENT,
+                VfsError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
                 _ => libc::EIO,
             };
             code.into()
@@ -597,10 +596,10 @@ where
         let Some(src_ino) = self.child_of(parent as i64, name.as_ref()) else {
             return Err(libc::ENOENT.into());
         };
-        let Some(src_attr) = self.stat_ino(src_ino).await else {
+        let Some(src_attr) = self.stat_ino(src_ino.0).await else {
             return Err(libc::ENOENT.into());
         };
-        if matches!(src_attr.kind, VfsFileType::Dir) {
+        if matches!(src_attr.kind, FileType::Dir) {
             return Err(libc::EOPNOTSUPP.into());
         }
 
@@ -608,7 +607,7 @@ where
         let Some(pattr) = self.stat_ino(new_parent as i64).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
+        if !matches!(pattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
 
@@ -636,8 +635,8 @@ where
         }
         newp.push_str(&new_name);
         self.rename_file(&oldp, &newp).await.map_err(|e| {
-            let code = match e.as_str() {
-                "target exists" => libc::EEXIST,
+            let code = match e {
+                VfsError::AlreadyExists(_) => libc::EEXIST,
                 _ => libc::EIO,
             };
             code.into()
@@ -709,10 +708,10 @@ where
 }
 
 // =============== helpers ===============
-fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
+fn vfs_kind_to_fuse(k: FileType) -> FuseFileType {
     match k {
-        VfsFileType::Dir => FuseFileType::Directory,
-        VfsFileType::File => FuseFileType::RegularFile,
+        FileType::Dir => FuseFileType::Directory,
+        FileType::File => FuseFileType::RegularFile,
     }
 }
 
@@ -720,8 +719,8 @@ fn vfs_to_fuse_attr(v: &VfsFileAttr, req: &Request) -> rfuse3::raw::reply::FileA
     // 时间与权限占位：按 kind 赋默认权限；时间用当前时间
     let now = Timestamp::from(SystemTime::now());
     let perm = match v.kind {
-        VfsFileType::Dir => 0o755,
-        VfsFileType::File => 0o644,
+        FileType::Dir => 0o755,
+        FileType::File => 0o644,
     } as u16;
     // blocks 字段按 512B 块计算
     let blocks = v.size.div_ceil(512);

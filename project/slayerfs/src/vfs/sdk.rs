@@ -13,7 +13,7 @@ use crate::meta::config::{Config, DatabaseConfig, DatabaseType};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::store::DirEntry;
 use crate::meta::{MetaStore, create_meta_store_from_url};
-use crate::vfs::fs::{FileSystem, Vfs, VfsError};
+use crate::vfs::fs::{Vfs, VfsError};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
 
     /// Create a file
     pub async fn create(&mut self, path: &str) -> Result<(), VfsError> {
-        self.vfs.create(path, 0o644, 1000, 1000).await?;
+        self.vfs.create_file(path).await?;
         Ok(())
     }
 
@@ -67,7 +67,7 @@ impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
 
     /// Rename a file or directory
     pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), VfsError> {
-        self.vfs.rename(old_path, new_path).await
+        self.vfs.rename_file(old_path, new_path).await
     }
 }
 

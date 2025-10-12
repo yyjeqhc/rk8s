@@ -3,12 +3,12 @@ use slayerfs::cadapter::client::ObjectClient;
 use slayerfs::cadapter::localfs::LocalFsBackend;
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
-use slayerfs::fuse::mount_v2::mount_vfs_v2;
+use slayerfs::fuse::mount::mount_vfs_v2;
 use slayerfs::meta::config::{Config, DatabaseType};
 use slayerfs::meta::database_store::DatabaseMetaStore;
 use slayerfs::meta::etcd_store::EtcdMetaStore;
-use slayerfs::meta::store_v2::MetaStoreV2;
-use slayerfs::vfs::fs_v2::VfsV2;
+use slayerfs::meta::store::MetaStore;
+use slayerfs::vfs::fs::Vfs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mount_point = args.mount;
         let backend_storage = args.storage;
 
-        println!("=== SlayerFS Persistence Demo (VfsV2) ===");
+        println!("=== SlayerFS Persistence Demo (Vfs) ===");
         println!("📋 Config file: {}", config_file.display());
         println!("💾 Data storage: {}", backend_storage.display());
         println!("📂 Mount point: {}", mount_point.display());
@@ -229,7 +229,7 @@ async fn run_with_database_backend(
 
     println!("🔨 Creating VFS instance...");
     let vfs = Arc::new(
-        VfsV2::new(layout, store, meta)
+        Vfs::new(layout, store, meta)
             .await
             .expect("Failed to create VFS"),
     );
@@ -274,7 +274,7 @@ async fn run_with_etcd_backend(
 
     println!("🔨 Creating VFS instance...");
     let vfs = Arc::new(
-        VfsV2::new(layout, store, meta)
+        Vfs::new(layout, store, meta)
             .await
             .expect("Failed to create VFS"),
     );
@@ -311,7 +311,7 @@ fn print_storage_status(root_entries: &[slayerfs::meta::store::DirEntry]) {
 
 /// Mount filesystem and wait for signal
 async fn mount_and_wait<S, M>(
-    vfs: Arc<VfsV2<S, M>>,
+    vfs: Arc<Vfs<S, M>>,
     mount_point: &PathBuf,
     uid: u32,
     gid: u32,
@@ -321,7 +321,7 @@ async fn mount_and_wait<S, M>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: slayerfs::chuck::store::BlockStore + Send + Sync + 'static,
-    M: MetaStoreV2 + Send + Sync + 'static,
+    M: MetaStore + Send + Sync + 'static,
 {
     println!("🔗 Mounting filesystem...");
 

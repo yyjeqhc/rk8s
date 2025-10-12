@@ -2,10 +2,10 @@ use slayerfs::cadapter::client::ObjectClient;
 use slayerfs::cadapter::localfs::LocalFsBackend;
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
-use slayerfs::fuse::mount_v2::mount_vfs_v2;
+use slayerfs::fuse::mount::mount_vfs_v2;
 use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
 use slayerfs::meta::database_store::DatabaseMetaStore;
-use slayerfs::vfs::fs_v2::VfsV2;
+use slayerfs::vfs::fs::Vfs;
 use std::sync::Arc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -54,7 +54,7 @@ async fn main() {
         let meta = DatabaseMetaStore::from_config(config)
             .await
             .expect("create meta store");
-        let fs = Arc::new(VfsV2::new(layout, store, meta).await.expect("create VFS"));
+        let fs = Arc::new(Vfs::new(layout, store, meta).await.expect("create VFS"));
 
         // Get current user uid/gid
         let uid = unsafe { libc::getuid() };
