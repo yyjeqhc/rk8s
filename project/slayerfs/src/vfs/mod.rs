@@ -18,12 +18,8 @@
 pub mod cache;
 pub mod demo;
 pub mod fs;
-pub mod fs_v2;
-#[cfg(test)]
-mod fs_v2_tests;
 pub mod handles;
 pub mod sdk;
-pub mod sdk_v2;
 pub mod simple;
 
 // Module implementation TODOs remain.

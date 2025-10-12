@@ -5,101 +5,98 @@
 //! - 可插拔后端：复用 Fs 上的 BlockStore + MetaStore
 //! - 提供 LocalFs 的便捷构造
 
-use crate::chuck::chunk::ChunkLayout;
-use crate::chuck::store::BlockStore;
-use crate::meta::{MetaStore, create_meta_store_from_url};
-use crate::vfs::fs::{DirEntry, FileAttr, VFS};
-
-/// SDK 客户端（泛型后端）。
-pub struct Client<S: BlockStore, M: MetaStore> {
-    fs: VFS<S, M>,
-}
-
-#[allow(unused)]
-impl<S: BlockStore, M: MetaStore> Client<S, M> {
-    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> Result<Self, String> {
-        let fs = VFS::new(layout, store, meta).await?;
-        Ok(Self { fs })
-    }
-
-    pub async fn mkdir_p(&self, path: &str) -> Result<(), String> {
-        let _ = self.fs.mkdir_p(path).await?;
-        Ok(())
-    }
-
-    pub async fn create(&self, path: &str) -> Result<(), String> {
-        let _ = self.fs.create_file(path).await?;
-        Ok(())
-    }
-
-    pub async fn write_at(
-        &mut self,
-        path: &str,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<usize, String> {
-        self.fs.write(path, offset, data).await
-    }
-
-    pub async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, String> {
-        self.fs.read(path, offset, len).await
-    }
-
-    pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, String> {
-        self.fs
-            .readdir(path)
-            .await
-            .ok_or_else(|| "not a dir or not found".into())
-    }
-
-    pub async fn stat(&self, path: &str) -> Result<FileAttr, String> {
-        self.fs.stat(path).await.ok_or_else(|| "not found".into())
-    }
-
-    // ---- 新增：删除/重命名/截断 ----
-    pub async fn unlink(&self, path: &str) -> Result<(), String> {
-        self.fs.unlink(path).await
-    }
-
-    pub async fn rmdir(&self, path: &str) -> Result<(), String> {
-        self.fs.rmdir(path).await
-    }
-
-    pub async fn rename(&self, old: &str, new: &str) -> Result<(), String> {
-        self.fs.rename_file(old, new).await
-    }
-
-    pub async fn truncate(&self, path: &str, size: u64) -> Result<(), String> {
-        self.fs.truncate(path, size).await
-    }
-}
-
-// ============== 便捷构造（LocalFs 后端） ==============
-
 use crate::cadapter::client::ObjectClient;
 use crate::cadapter::localfs::LocalFsBackend;
-use crate::chuck::store::ObjectBlockStore;
+use crate::chuck::chunk::ChunkLayout;
+use crate::chuck::store::{BlockStore, ObjectBlockStore};
+use crate::meta::config::{Config, DatabaseConfig, DatabaseType};
+use crate::meta::database_store::DatabaseMetaStore;
+use crate::meta::store::DirEntry;
+use crate::meta::{MetaStore, create_meta_store_from_url};
+use crate::vfs::fs::{FileSystem, Vfs, VfsError};
 use std::path::Path;
 use std::sync::Arc;
 
-#[allow(dead_code)]
-pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, Arc<dyn MetaStore>>;
+pub struct Client<S: BlockStore, M: MetaStore> {
+    vfs: Arc<Vfs<S, M>>,
+}
 
-#[allow(dead_code)]
+impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
+    /// Create a new client from a Vfs instance
+    pub fn new(vfs: Arc<Vfs<S, M>>) -> Self {
+        Self { vfs }
+    }
+
+    /// Create a directory (including all parent directories)
+    pub async fn mkdir_p(&mut self, path: &str) -> Result<(), VfsError> {
+        self.vfs.mkdir_p(path).await?;
+        Ok(())
+    }
+
+    /// Create a file
+    pub async fn create(&mut self, path: &str) -> Result<(), VfsError> {
+        self.vfs.create(path, 0o644, 1000, 1000).await?;
+        Ok(())
+    }
+
+    /// Write data at a specific offset
+    pub async fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), VfsError> {
+        self.vfs.write(path, offset, data).await?;
+        Ok(())
+    }
+
+    /// Read data from a specific offset
+    pub async fn read_at(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, VfsError> {
+        self.vfs.read(path, offset, len).await
+    }
+
+    /// Remove a file
+    pub async fn remove(&mut self, path: &str) -> Result<(), VfsError> {
+        self.vfs.unlink(path).await
+    }
+
+    /// List directory contents
+    pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
+        self.vfs.readdir(path).await
+    }
+
+    /// Rename a file or directory
+    pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), VfsError> {
+        self.vfs.rename(old_path, new_path).await
+    }
+}
+
+/// Local filesystem client (convenience type)
+pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, DatabaseMetaStore>;
+
 impl LocalClient {
-    #[allow(dead_code)]
+    /// Create a new local client with in-memory SQLite backend
     pub async fn new_local<P: AsRef<Path>>(root: P, layout: ChunkLayout) -> Self {
         let client = ObjectClient::new(LocalFsBackend::new(root));
         let store = ObjectBlockStore::new(client);
 
-        let meta = create_meta_store_from_url("sqlite::memory:")
+        let config = Config {
+            database: DatabaseConfig {
+                db_config: DatabaseType::Sqlite {
+                    url: "sqlite::memory:".to_string(),
+                },
+            },
+        };
+        let meta = DatabaseMetaStore::from_config(config)
             .await
             .expect("Failed to create meta store");
 
-        let fs = VFS::new(layout, store, meta)
-            .await
-            .expect("Failed to create VFS");
-        Client { fs }
+        let vfs = Arc::new(
+            Vfs::new(layout, store, meta)
+                .await
+                .expect("Failed to create VFS"),
+        );
+        Client::new(vfs)
     }
 }
 

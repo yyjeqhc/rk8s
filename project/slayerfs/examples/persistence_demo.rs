@@ -102,7 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Check if config file exists
         if !config_file.exists() {
-            eprintln!("❌ Error: Config file {} does not exist", config_file.display());
+            eprintln!(
+                "❌ Error: Config file {} does not exist",
+                config_file.display()
+            );
             eprintln!();
             eprintln!("Please create a config file or use existing ones:");
             eprintln!("  sqlite.yml   # SQLite database backend");
@@ -232,7 +235,16 @@ async fn run_with_database_backend(
     );
     println!("✅ VFS instance created successfully");
 
-    mount_and_wait(vfs, mount_point, uid, gid, program_name, config_file, backend_storage).await
+    mount_and_wait(
+        vfs,
+        mount_point,
+        uid,
+        gid,
+        program_name,
+        config_file,
+        backend_storage,
+    )
+    .await
 }
 
 /// Run with EtcdMetaStore
@@ -268,7 +280,16 @@ async fn run_with_etcd_backend(
     );
     println!("✅ VFS instance created successfully");
 
-    mount_and_wait(vfs, mount_point, uid, gid, program_name, config_file, backend_storage).await
+    mount_and_wait(
+        vfs,
+        mount_point,
+        uid,
+        gid,
+        program_name,
+        config_file,
+        backend_storage,
+    )
+    .await
 }
 
 /// Print storage status
@@ -332,7 +353,10 @@ where
         .map_err(|e| format!("Failed to mount filesystem: {}", e))?;
 
     println!();
-    println!("✅ SlayerFS successfully mounted at: {}", mount_point.display());
+    println!(
+        "✅ SlayerFS successfully mounted at: {}",
+        mount_point.display()
+    );
     println!();
     println!("=== How to test the filesystem ===");
     println!("In another terminal, try:");
@@ -356,12 +380,24 @@ where
     println!();
     println!("=== Backend switching test ===");
     println!("You can test different backends by using different config files:");
-    println!("  {} --config sqlite.yml --mount {} --storage {}",
-        program_name, mount_point.display(), backend_storage.display());
-    println!("  {} --config etcd.yml --mount {} --storage {}",
-        program_name, mount_point.display(), backend_storage.display());
-    println!("  {} --config pg.yml --mount {} --storage {}",
-        program_name, mount_point.display(), backend_storage.display());
+    println!(
+        "  {} --config sqlite.yml --mount {} --storage {}",
+        program_name,
+        mount_point.display(),
+        backend_storage.display()
+    );
+    println!(
+        "  {} --config etcd.yml --mount {} --storage {}",
+        program_name,
+        mount_point.display(),
+        backend_storage.display()
+    );
+    println!(
+        "  {} --config pg.yml --mount {} --storage {}",
+        program_name,
+        mount_point.display(),
+        backend_storage.display()
+    );
     println!();
     println!("Press Ctrl+C to exit and unmount...");
 

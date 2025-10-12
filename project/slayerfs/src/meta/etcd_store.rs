@@ -2,6 +2,10 @@
 //!
 //! Uses Etcd/etcd as the backend for metadata storage
 
+use crate::meta::entities::etcd::*;
+use crate::meta::error::MetaErrorHelper;
+use crate::meta::types::{CreateParams, Inode, SetAttrMask};
+
 use crate::meta::Permission;
 use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::etcd::*;
@@ -515,215 +519,734 @@ impl EtcdMetaStore {
     }
 }
 
+// #[async_trait]
+// impl MetaStore for EtcdMetaStore {
+//     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
+//         if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
+//             let permission = file_meta.permission();
+//             return Ok(Some(FileAttr {
+//                 ino: file_meta.inode,
+//                 size: file_meta.size as u64,
+//                 kind: FileType::File,
+//                 mode: permission.mode,
+//                 uid: permission.uid,
+//                 gid: permission.gid,
+//                 atime: file_meta.access_time,
+//                 mtime: file_meta.modify_time,
+//                 ctime: file_meta.create_time,
+//                 nlink: file_meta.nlink as u32,
+//             }));
+//         }
+
+//         if let Ok(Some(access_meta)) = self.get_access_meta(ino).await {
+//             let permission = access_meta.permission();
+//             return Ok(Some(FileAttr {
+//                 ino: access_meta.inode,
+//                 size: 4096,
+//                 kind: FileType::Dir,
+//                 mode: permission.mode,
+//                 uid: permission.uid,
+//                 gid: permission.gid,
+//                 atime: access_meta.access_time,
+//                 mtime: access_meta.modify_time,
+//                 ctime: access_meta.create_time,
+//                 nlink: access_meta.nlink as u32,
+//             }));
+//         }
+
+//         Ok(None)
+//     }
+
+//     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
+//         let contents = match self.get_content_meta(parent).await? {
+//             Some(contents) => contents,
+//             None => return Ok(None),
+//         };
+
+//         for content in contents {
+//             if content.entry_name == name {
+//                 return Ok(Some(content.inode));
+//             }
+//         }
+
+//         Ok(None)
+//     }
+
+//     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
+//         if path == "/" {
+//             return Ok(Some((1, FileType::Dir)));
+//         }
+
+//         let parts: Vec<&str> = path
+//             .trim_matches('/')
+//             .split('/')
+//             .filter(|p| !p.is_empty())
+//             .collect();
+//         let mut current_inode = 1i64;
+
+//         for (index, part) in parts.iter().enumerate() {
+//             let contents = self.get_content_meta(current_inode).await?;
+
+//             let found_entry = match contents {
+//                 Some(entries) => entries.into_iter().find(|entry| entry.entry_name == *part),
+//                 None => return Ok(None),
+//             };
+
+//             match found_entry {
+//                 Some(entry) => match entry.entry_type {
+//                     EntryType::Directory => {
+//                         current_inode = entry.inode;
+//                     }
+//                     EntryType::File => {
+//                         if index == parts.len() - 1 {
+//                             return Ok(Some((entry.inode, FileType::File)));
+//                         } else {
+//                             return Ok(None);
+//                         }
+//                     }
+//                 },
+//                 None => return Ok(None),
+//             }
+//         }
+
+//         Ok(Some((current_inode, FileType::Dir)))
+//     }
+
+//     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
+//         let access_meta = self
+//             .get_access_meta(ino)
+//             .await?
+//             .ok_or(MetaError::NotFound(ino))?;
+
+//         let permission = access_meta.permission();
+//         if !permission.is_directory() {
+//             return Err(MetaError::NotDirectory(ino));
+//         }
+
+//         let contents = match self.get_content_meta(ino).await? {
+//             Some(contents) => contents,
+//             None => return Ok(Vec::new()),
+//         };
+
+//         let mut entries = Vec::new();
+//         for content in contents {
+//             let kind = match content.entry_type {
+//                 EntryType::File => FileType::File,
+//                 EntryType::Directory => FileType::Dir,
+//             };
+//             entries.push(DirEntry {
+//                 name: content.entry_name,
+//                 ino: content.inode,
+//                 kind,
+//             });
+//         }
+
+//         Ok(entries)
+//     }
+
+//     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
+//         self.create_directory(parent, name).await
+//     }
+
+//     async fn rmdir(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+//         Err(MetaError::Internal(
+//             "rmdir not implemented for Etcd".to_string(),
+//         ))
+//     }
+
+//     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
+//         self.create_file_internal(parent, name).await
+//     }
+
+//     async fn unlink(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+//         Err(MetaError::Internal(
+//             "unlink not implemented for Etcd".to_string(),
+//         ))
+//     }
+
+//     async fn rename(
+//         &self,
+//         _old_parent: i64,
+//         _old_name: &str,
+//         _new_parent: i64,
+//         _new_name: String,
+//     ) -> Result<(), MetaError> {
+//         Err(MetaError::Internal(
+//             "rename not implemented for Etcd".to_string(),
+//         ))
+//     }
+
+//     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
+//         let mut client = self.client.clone();
+//         let reverse_key = Self::etcd_reverse_key(ino);
+
+//         match client.get(reverse_key.clone(), None).await {
+//             Ok(resp) => {
+//                 if let Some(kv) = resp.kvs().first() {
+//                     let mut entry_info: EtcdEntryInfo = serde_json::from_slice(kv.value())
+//                         .map_err(|e| {
+//                             MetaError::Internal(format!("Failed to parse entry info: {}", e))
+//                         })?;
+
+//                     if !entry_info.is_file {
+//                         return Err(MetaError::Internal(
+//                             "Cannot set size for directory".to_string(),
+//                         ));
+//                     }
+
+//                     entry_info.size = Some(size as i64);
+//                     entry_info.modify_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+//                     let updated_json = serde_json::to_string(&entry_info).map_err(|e| {
+//                         MetaError::Internal(format!("Failed to serialize entry info: {}", e))
+//                     })?;
+
+//                     client
+//                         .put(reverse_key, updated_json, None)
+//                         .await
+//                         .map_err(|e| {
+//                             MetaError::Internal(format!(
+//                                 "Failed to update file size in Etcd: {}",
+//                                 e
+//                             ))
+//                         })?;
+
+//                     Ok(())
+//                 } else {
+//                     Err(MetaError::NotFound(ino))
+//                 }
+//             }
+//             Err(e) => Err(MetaError::Internal(format!(
+//                 "Failed to get file from Etcd: {}",
+//                 e
+//             ))),
+//         }
+//     }
+
+//     fn root_ino(&self) -> i64 {
+//         1
+//     }
+
+//     async fn initialize(&self) -> Result<(), MetaError> {
+//         Ok(())
+//     }
+// }
+
 #[async_trait]
 impl MetaStore for EtcdMetaStore {
-    async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
-        if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
-            let permission = file_meta.permission();
-            return Ok(Some(FileAttr {
-                ino: file_meta.inode,
-                size: file_meta.size as u64,
-                kind: FileType::File,
-                mode: permission.mode,
-                uid: permission.uid,
-                gid: permission.gid,
-                atime: file_meta.access_time,
-                mtime: file_meta.modify_time,
-                ctime: file_meta.create_time,
-                nlink: file_meta.nlink as u32,
-            }));
-        }
-
-        if let Ok(Some(access_meta)) = self.get_access_meta(ino).await {
-            let permission = access_meta.permission();
-            return Ok(Some(FileAttr {
-                ino: access_meta.inode,
+    async fn getattr(&self, ino: Inode) -> Result<FileAttr, MetaError> {
+        // Special case for root
+        if ino == Inode::ROOT {
+            let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            return Ok(FileAttr {
+                ino: 1,
                 size: 4096,
                 kind: FileType::Dir,
-                mode: permission.mode,
-                uid: permission.uid,
-                gid: permission.gid,
-                atime: access_meta.access_time,
-                mtime: access_meta.modify_time,
-                ctime: access_meta.create_time,
-                nlink: access_meta.nlink as u32,
-            }));
-        }
-
-        Ok(None)
-    }
-
-    async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
-        let contents = match self.get_content_meta(parent).await? {
-            Some(contents) => contents,
-            None => return Ok(None),
-        };
-
-        for content in contents {
-            if content.entry_name == name {
-                return Ok(Some(content.inode));
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
-        if path == "/" {
-            return Ok(Some((1, FileType::Dir)));
-        }
-
-        let parts: Vec<&str> = path
-            .trim_matches('/')
-            .split('/')
-            .filter(|p| !p.is_empty())
-            .collect();
-        let mut current_inode = 1i64;
-
-        for (index, part) in parts.iter().enumerate() {
-            let contents = self.get_content_meta(current_inode).await?;
-
-            let found_entry = match contents {
-                Some(entries) => entries.into_iter().find(|entry| entry.entry_name == *part),
-                None => return Ok(None),
-            };
-
-            match found_entry {
-                Some(entry) => match entry.entry_type {
-                    EntryType::Directory => {
-                        current_inode = entry.inode;
-                    }
-                    EntryType::File => {
-                        if index == parts.len() - 1 {
-                            return Ok(Some((entry.inode, FileType::File)));
-                        } else {
-                            return Ok(None);
-                        }
-                    }
-                },
-                None => return Ok(None),
-            }
-        }
-
-        Ok(Some((current_inode, FileType::Dir)))
-    }
-
-    async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
-        let access_meta = self
-            .get_access_meta(ino)
-            .await?
-            .ok_or(MetaError::NotFound(ino))?;
-
-        let permission = access_meta.permission();
-        if !permission.is_directory() {
-            return Err(MetaError::NotDirectory(ino));
-        }
-
-        let contents = match self.get_content_meta(ino).await? {
-            Some(contents) => contents,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut entries = Vec::new();
-        for content in contents {
-            let kind = match content.entry_type {
-                EntryType::File => FileType::File,
-                EntryType::Directory => FileType::Dir,
-            };
-            entries.push(DirEntry {
-                name: content.entry_name,
-                ino: content.inode,
-                kind,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                nlink: 2,
             });
         }
 
-        Ok(entries)
+        let reverse_key = Self::etcd_reverse_key(ino.as_i64());
+        let mut client = self.client.clone();
+
+        let resp = client
+            .get(reverse_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            let entry_info: EtcdEntryInfo = serde_json::from_slice(kv.value())?;
+            let permission = entry_info.permission();
+
+            if entry_info.is_file {
+                Ok(FileAttr {
+                    ino: ino.as_i64(),
+                    size: entry_info.size.unwrap_or(0) as u64,
+                    kind: FileType::File,
+                    mode: permission.mode,
+                    uid: permission.uid,
+                    gid: permission.gid,
+                    atime: entry_info.access_time,
+                    mtime: entry_info.modify_time,
+                    ctime: entry_info.create_time,
+                    nlink: entry_info.nlink as u32,
+                })
+            } else {
+                Ok(FileAttr {
+                    ino: ino.as_i64(),
+                    size: 4096,
+                    kind: FileType::Dir,
+                    mode: permission.mode,
+                    uid: permission.uid,
+                    gid: permission.gid,
+                    atime: entry_info.access_time,
+                    mtime: entry_info.modify_time,
+                    ctime: entry_info.create_time,
+                    nlink: entry_info.nlink as u32,
+                })
+            }
+        } else {
+            Err(MetaError::not_found(ino))
+        }
     }
 
-    async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
-        self.create_directory(parent, name).await
+    async fn lookup(&self, parent: Inode, name: &str) -> Result<Inode, MetaError> {
+        let forward_key = Self::etcd_forward_key(parent.as_i64(), name);
+        let mut client = self.client.clone();
+
+        let resp = client
+            .get(forward_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            let forward_entry: EtcdForwardEntry = serde_json::from_slice(kv.value())?;
+            Ok(Inode(forward_entry.inode))
+        } else {
+            Err(MetaError::not_found(parent))
+        }
     }
 
-    async fn rmdir(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
-        Err(MetaError::Internal(
-            "rmdir not implemented for Etcd".to_string(),
-        ))
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, MetaError> {
+        let children_key = Self::etcd_children_key(ino.as_i64());
+        let mut client = self.client.clone();
+
+        let resp = client
+            .get(children_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            let dir_children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+
+            if dir_children.children.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut entries = Vec::new();
+
+            for child_name in &dir_children.children {
+                let forward_key = Self::etcd_forward_key(ino.as_i64(), child_name);
+                if let Ok(forward_resp) = client.get(forward_key, None).await {
+                    if let Some(forward_kv) = forward_resp.kvs().first() {
+                        let forward_entry: EtcdForwardEntry =
+                            serde_json::from_slice(forward_kv.value())?;
+
+                        entries.push(DirEntry {
+                            ino: forward_entry.inode,
+                            name: child_name.clone(),
+                            kind: if forward_entry.is_file {
+                                FileType::File
+                            } else {
+                                FileType::Dir
+                            },
+                        });
+                    }
+                }
+            }
+
+            Ok(entries)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
-        self.create_file_internal(parent, name).await
+    async fn create(&self, params: CreateParams) -> Result<(Inode, FileAttr), MetaError> {
+        let mut client = self.client.clone();
+
+        // 1. Verify parent exists
+        let parent_children_key = Self::etcd_children_key(params.parent.as_i64());
+        let parent_resp = client
+            .get(parent_children_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if parent_resp.kvs().is_empty() {
+            return Err(MetaError::parent_not_found(params.parent));
+        }
+
+        // 2. Check for duplicate name
+        let forward_key = Self::etcd_forward_key(params.parent.as_i64(), &params.name);
+        let existing = client.get(forward_key.clone(), None).await;
+
+        if let Ok(resp) = existing {
+            if !resp.kvs().is_empty() {
+                return Err(MetaError::already_exists(params.parent, params.name));
+            }
+        }
+
+        // 3. Allocate new inode (using a simple counter approach)
+        // In production, you'd want a distributed counter
+        let ino = Inode(Utc::now().timestamp_millis());
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        // 4. Create entry info
+        let is_file = matches!(params.kind, FileType::File);
+        let permission = Permission::new(
+            if is_file {
+                params.mode
+            } else {
+                params.mode | 0o40000
+            },
+            params.uid,
+            params.gid,
+        );
+
+        let entry_info = EtcdEntryInfo {
+            is_file,
+            size: if is_file { Some(0) } else { None },
+            version: Some(1),
+            access_time: now,
+            modify_time: now,
+            create_time: now,
+            permission: permission.clone(),
+            nlink: if is_file { 1 } else { 2 },
+        };
+
+        // 5. Store reverse entry
+        let reverse_key = Self::etcd_reverse_key(ino.as_i64());
+        let entry_json = serde_json::to_string(&entry_info)?;
+        client
+            .put(reverse_key, entry_json, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 6. Store forward entry
+        let forward_entry = EtcdForwardEntry {
+            parent_inode: params.parent.as_i64(),
+            name: params.name.clone(),
+            inode: ino.as_i64(),
+            is_file,
+        };
+        let forward_json = serde_json::to_string(&forward_entry)?;
+        client
+            .put(forward_key, forward_json, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 7. Update parent's children list
+        let mut dir_children: EtcdDirChildren = if let Some(kv) = parent_resp.kvs().first() {
+            serde_json::from_slice(kv.value())?
+        } else {
+            EtcdDirChildren {
+                inode: params.parent.as_i64(),
+                children: HashSet::new(),
+            }
+        };
+
+        dir_children.children.insert(params.name.clone());
+        let children_json = serde_json::to_string(&dir_children)?;
+        client
+            .put(parent_children_key, children_json, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 8. Initialize children set for directories
+        if !is_file {
+            let children_key = Self::etcd_children_key(ino.as_i64());
+            let empty_children = EtcdDirChildren {
+                inode: ino.as_i64(),
+                children: HashSet::new(),
+            };
+            let empty_json = serde_json::to_string(&empty_children)?;
+            client
+                .put(children_key, empty_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+        }
+
+        // 9. Return attributes
+        let attr = FileAttr {
+            ino: ino.as_i64(),
+            size: if is_file { 0 } else { 4096 },
+            kind: params.kind,
+            mode: permission.mode,
+            uid: permission.uid,
+            gid: permission.gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            nlink: if is_file { 1 } else { 2 },
+        };
+
+        Ok((ino, attr))
     }
 
-    async fn unlink(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
-        Err(MetaError::Internal(
-            "unlink not implemented for Etcd".to_string(),
-        ))
+    async fn setattr(&self, ino: Inode, mask: SetAttrMask) -> Result<FileAttr, MetaError> {
+        if mask.is_empty() {
+            return self.getattr(ino).await;
+        }
+
+        let mut client = self.client.clone();
+        let reverse_key = Self::etcd_reverse_key(ino.as_i64());
+
+        // Get current entry
+        let resp = client
+            .get(reverse_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            let mut entry_info: EtcdEntryInfo = serde_json::from_slice(kv.value())?;
+
+            // Apply updates
+            if let Some(size) = mask.size {
+                entry_info.size = Some(size as i64);
+            }
+            if let Some(mode) = mask.mode {
+                entry_info.permission.mode = if entry_info.is_file {
+                    mode
+                } else {
+                    mode | 0o40000
+                };
+            }
+            if let Some(uid) = mask.uid {
+                entry_info.permission.uid = uid;
+            }
+            if let Some(gid) = mask.gid {
+                entry_info.permission.gid = gid;
+            }
+            if let Some(atime) = mask.atime {
+                entry_info.access_time = atime;
+            }
+            if let Some(mtime) = mask.mtime {
+                entry_info.modify_time = mtime;
+            }
+
+            // Store updated entry
+            let entry_json = serde_json::to_string(&entry_info)?;
+            client
+                .put(reverse_key, entry_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+            // Return updated attributes
+            self.getattr(ino).await
+        } else {
+            Err(MetaError::not_found(ino))
+        }
     }
 
     async fn rename(
         &self,
-        _old_parent: i64,
-        _old_name: &str,
-        _new_parent: i64,
-        _new_name: String,
+        old_parent: Inode,
+        old_name: &str,
+        new_parent: Inode,
+        new_name: String,
     ) -> Result<(), MetaError> {
-        Err(MetaError::Internal(
-            "rename not implemented for Etcd".to_string(),
-        ))
-    }
-
-    async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let mut client = self.client.clone();
-        let reverse_key = Self::etcd_reverse_key(ino);
 
-        match client.get(reverse_key.clone(), None).await {
-            Ok(resp) => {
-                if let Some(kv) = resp.kvs().first() {
-                    let mut entry_info: EtcdEntryInfo = serde_json::from_slice(kv.value())
-                        .map_err(|e| {
-                            MetaError::Internal(format!("Failed to parse entry info: {}", e))
-                        })?;
+        // 1. Get the inode of the entry to rename
+        let old_forward_key = Self::etcd_forward_key(old_parent.as_i64(), old_name);
+        let old_resp = client
+            .get(old_forward_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
 
-                    if !entry_info.is_file {
-                        return Err(MetaError::Internal(
-                            "Cannot set size for directory".to_string(),
-                        ));
-                    }
+        let forward_entry: EtcdForwardEntry = if let Some(kv) = old_resp.kvs().first() {
+            serde_json::from_slice(kv.value())?
+        } else {
+            return Err(MetaError::not_found(old_parent));
+        };
 
-                    entry_info.size = Some(size as i64);
-                    entry_info.modify_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        // 2. Verify new parent exists
+        let new_parent_key = Self::etcd_children_key(new_parent.as_i64());
+        let new_parent_resp = client
+            .get(new_parent_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
 
-                    let updated_json = serde_json::to_string(&entry_info).map_err(|e| {
-                        MetaError::Internal(format!("Failed to serialize entry info: {}", e))
-                    })?;
-
-                    client
-                        .put(reverse_key, updated_json, None)
-                        .await
-                        .map_err(|e| {
-                            MetaError::Internal(format!(
-                                "Failed to update file size in Etcd: {}",
-                                e
-                            ))
-                        })?;
-
-                    Ok(())
-                } else {
-                    Err(MetaError::NotFound(ino))
-                }
-            }
-            Err(e) => Err(MetaError::Internal(format!(
-                "Failed to get file from Etcd: {}",
-                e
-            ))),
+        if new_parent_resp.kvs().is_empty() {
+            return Err(MetaError::parent_not_found(new_parent));
         }
+
+        // 3. Remove from old parent's children
+        let old_parent_key = Self::etcd_children_key(old_parent.as_i64());
+        let old_parent_resp = client
+            .get(old_parent_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = old_parent_resp.kvs().first() {
+            let mut old_children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+            old_children.children.remove(old_name);
+            let children_json = serde_json::to_string(&old_children)?;
+            client
+                .put(old_parent_key, children_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+        }
+
+        // 4. Add to new parent's children
+        if let Some(kv) = new_parent_resp.kvs().first() {
+            let mut new_children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+            new_children.children.insert(new_name.clone());
+            let children_json = serde_json::to_string(&new_children)?;
+            client
+                .put(new_parent_key, children_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+        }
+
+        // 5. Delete old forward entry
+        client
+            .delete(old_forward_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 6. Create new forward entry
+        let new_forward_key = Self::etcd_forward_key(new_parent.as_i64(), &new_name);
+        let forward_json = serde_json::to_string(&forward_entry)?;
+        client
+            .put(new_forward_key, forward_json, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        Ok(())
     }
 
-    fn root_ino(&self) -> i64 {
-        1
+    async fn unlink(&self, parent: Inode, name: &str) -> Result<(), MetaError> {
+        let mut client = self.client.clone();
+
+        // 1. Get forward entry
+        let forward_key = Self::etcd_forward_key(parent.as_i64(), name);
+        let resp = client
+            .get(forward_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        let forward_entry: EtcdForwardEntry = if let Some(kv) = resp.kvs().first() {
+            serde_json::from_slice(kv.value())?
+        } else {
+            return Err(MetaError::not_found(parent));
+        };
+
+        // 2. Verify it's a file
+        if !forward_entry.is_file {
+            return Err(MetaError::Internal(
+                "Cannot unlink directory, use rmdir".into(),
+            ));
+        }
+
+        // 3. Remove from parent's children
+        let parent_children_key = Self::etcd_children_key(parent.as_i64());
+        let parent_resp = client
+            .get(parent_children_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = parent_resp.kvs().first() {
+            let mut children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+            children.children.remove(name);
+            let children_json = serde_json::to_string(&children)?;
+            client
+                .put(parent_children_key, children_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+        }
+
+        // 4. Delete forward entry
+        client
+            .delete(forward_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 5. Delete reverse entry (metadata)
+        let reverse_key = Self::etcd_reverse_key(forward_entry.inode);
+        client
+            .delete(reverse_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn rmdir(&self, parent: Inode, name: &str) -> Result<(), MetaError> {
+        let mut client = self.client.clone();
+
+        // 1. Get forward entry
+        let forward_key = Self::etcd_forward_key(parent.as_i64(), name);
+        let resp = client
+            .get(forward_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        let forward_entry: EtcdForwardEntry = if let Some(kv) = resp.kvs().first() {
+            serde_json::from_slice(kv.value())?
+        } else {
+            return Err(MetaError::not_found(parent));
+        };
+
+        // 2. Verify it's a directory
+        if forward_entry.is_file {
+            return Err(MetaError::not_directory(Inode(forward_entry.inode)));
+        }
+
+        // 3. Check if directory is empty
+        let children_key = Self::etcd_children_key(forward_entry.inode);
+        let children_resp = client
+            .get(children_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = children_resp.kvs().first() {
+            let children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+            if !children.children.is_empty() {
+                return Err(MetaError::directory_not_empty(Inode(forward_entry.inode)));
+            }
+        }
+
+        // 4. Remove from parent's children
+        let parent_children_key = Self::etcd_children_key(parent.as_i64());
+        let parent_resp = client
+            .get(parent_children_key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        if let Some(kv) = parent_resp.kvs().first() {
+            let mut parent_children: EtcdDirChildren = serde_json::from_slice(kv.value())?;
+            parent_children.children.remove(name);
+            let parent_json = serde_json::to_string(&parent_children)?;
+            client
+                .put(parent_children_key, parent_json, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+        }
+
+        // 5. Delete directory's children list
+        client
+            .delete(children_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 6. Delete forward entry
+        client
+            .delete(forward_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        // 7. Delete reverse entry
+        let reverse_key = Self::etcd_reverse_key(forward_entry.inode);
+        client
+            .delete(reverse_key, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd error: {}", e)))?;
+
+        Ok(())
     }
 
     async fn initialize(&self) -> Result<(), MetaError> {
+        // Already initialized in EtcdMetaStore::new()
         Ok(())
+    }
+
+    fn root_ino(&self) -> Inode {
+        Inode::ROOT
     }
 }

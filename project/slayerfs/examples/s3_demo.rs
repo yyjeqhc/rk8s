@@ -66,7 +66,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .expect("create meta store");
 
     // Create VFS V2
-    let vfs = Arc::new(VfsV2::new(layout, block_store, meta_store).await.expect("create VFS"));
+    let vfs = Arc::new(
+        VfsV2::new(layout, block_store, meta_store)
+            .await
+            .expect("create VFS"),
+    );
 
     // Create client
     let mut client = ClientV2::new(vfs);

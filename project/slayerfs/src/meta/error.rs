@@ -2,8 +2,8 @@
 //!
 //! This module extends the existing MetaError with errno conversion capability.
 
-use crate::meta::types::Inode;
 use crate::meta::store::MetaError;
+use crate::meta::types::Inode;
 
 /// Extension trait for MetaError to add errno conversion
 pub trait MetaErrorExt {

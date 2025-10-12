@@ -2,8 +2,6 @@
 //!
 //! Defines unified interface for filesystem metadata operations
 use crate::vfs::fs::FileType;
-use async_trait::async_trait;
-
 /// File attributes
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -72,38 +70,96 @@ pub enum MetaError {
     Config(String),
 }
 
-/// Metadata store abstract interface
+use crate::meta::types::{CreateParams, Inode, SetAttrMask};
+use async_trait::async_trait;
+
+/// MetaStore V2 trait
+///
+/// All operations are inode-based. Path resolution is handled by the VFS layer.
+/// Implementations must ensure atomicity and consistency.
 #[async_trait]
 #[auto_impl::auto_impl(&, Arc)]
-#[allow(dead_code)]
 pub trait MetaStore: Send + Sync {
-    async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
+    // ==================== Query Operations ====================
 
-    async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError>;
+    /// Get file attributes for a given inode
+    async fn getattr(&self, ino: Inode) -> Result<FileAttr, MetaError>;
 
-    async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError>;
+    /// Get attributes for multiple inodes (batch operation)
+    async fn getattr_batch(&self, inos: &[Inode]) -> Result<Vec<(Inode, FileAttr)>, MetaError> {
+        let mut results = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            if let Ok(attr) = self.getattr(ino).await {
+                results.push((ino, attr));
+            }
+        }
+        Ok(results)
+    }
 
-    async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError>;
+    /// Look up a directory entry by name
+    async fn lookup(&self, parent: Inode, name: &str) -> Result<Inode, MetaError>;
 
-    async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError>;
+    /// Read directory entries
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, MetaError>;
 
-    async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError>;
+    /// Read directory entries with attributes (optimization)
+    async fn readdirplus(&self, ino: Inode) -> Result<Vec<(DirEntry, FileAttr)>, MetaError> {
+        let entries = self.readdir(ino).await?;
+        let inos: Vec<Inode> = entries.iter().map(|e| Inode(e.ino)).collect();
+        let attrs = self.getattr_batch(&inos).await?;
 
-    async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError>;
+        let attr_map: std::collections::HashMap<Inode, FileAttr> = attrs.into_iter().collect();
 
-    async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError>;
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(attr) = attr_map.get(&Inode(entry.ino)) {
+                results.push((entry, attr.clone()));
+            }
+        }
 
+        Ok(results)
+    }
+
+    // ==================== Creation Operations ====================
+
+    /// Create a new file or directory
+    ///
+    /// This operation is atomic: either fully succeeds or fails with no side effects.
+    async fn create(&self, params: CreateParams) -> Result<(Inode, FileAttr), MetaError>;
+
+    // ==================== Modification Operations ====================
+
+    /// Update file attributes
+    ///
+    /// Only attributes specified in the mask are updated.
+    async fn setattr(&self, ino: Inode, mask: SetAttrMask) -> Result<FileAttr, MetaError>;
+
+    /// Rename/move a file or directory
+    ///
+    /// This operation is atomic.
     async fn rename(
         &self,
-        old_parent: i64,
+        old_parent: Inode,
         old_name: &str,
-        new_parent: i64,
+        new_parent: Inode,
         new_name: String,
     ) -> Result<(), MetaError>;
 
-    async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError>;
+    // ==================== Deletion Operations ====================
 
-    fn root_ino(&self) -> i64;
+    /// Remove a file
+    async fn unlink(&self, parent: Inode, name: &str) -> Result<(), MetaError>;
 
+    /// Remove a directory (must be empty)
+    async fn rmdir(&self, parent: Inode, name: &str) -> Result<(), MetaError>;
+
+    // ==================== System Operations ====================
+
+    /// Initialize the metadata store
     async fn initialize(&self) -> Result<(), MetaError>;
+
+    /// Get the root directory inode
+    fn root_ino(&self) -> Inode {
+        Inode::ROOT
+    }
 }

@@ -10,6 +10,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
+> **📢 Important**: SlayerFS V2 is now available with improved architecture and full FUSE support!  
+> See [MIGRATION_V2.md](MIGRATION_V2.md) for details. All examples have been migrated to V2.
 
 ## ✨ Project Overview
 
@@ -37,6 +39,33 @@ Components overview:
 - Rust: >= 1.75.0
 - Operating system: Linux (Ubuntu 20.04+, CentOS 8+)
 
+### V2 Examples (Recommended)
+
+**Mount with SQLite backend:**
+```bash
+cargo run --example mount_local -- --data /tmp/data --mount /tmp/mnt
+```
+
+**Persistence demo (supports SQLite/PostgreSQL/etcd):**
+```bash
+cargo run --example persistence_demo -- \
+  --config sqlite.yml \
+  --storage /tmp/storage \
+  --mount /tmp/mnt
+```
+
+**SDK usage:**
+```bash
+cargo run --example sdk_demo
+```
+
+**S3 demo:**
+```bash
+cargo run --example s3_demo
+```
+
+### Legacy V1 Demo (Deprecated)
+
 ```bash
 cargo run -q --bin sdk_demo -- /tmp/slayerfs-objroot
 ```
@@ -44,9 +73,23 @@ The demo will:
 - Create nested directories/files, perform cross-block/chunk writes and read verification
 - Do rename, truncate (shrink/extend), readdir and unlink/rmdir
 - Print expected error scenarios and finally output "sdk demo: OK"
+
+> **Note**: V1 API is deprecated. Please use V2 examples for new projects.
+
 ---
 
-## 🌟 Current Features (MVP)
+## 🌟 Features
+
+### V2 Features (Current)
+- ✅ **Inode-based VFS**: Clean separation between path and inode operations
+- ✅ **Full FUSE support**: Including `readdirplus` for modern `ls` commands  
+- ✅ **Multiple metadata backends**: SQLite, PostgreSQL, etcd
+- ✅ **Improved performance**: Optimized inode-based operations
+- ✅ **Better SDK**: Type-safe `ClientV2` and `LocalClientV2`
+
+See [MIGRATION_V2.md](MIGRATION_V2.md) for V2 API details.
+
+### V1 Features (Legacy - Deprecated)
 
 ### Path-based VFS
 - mkdir_p/create/read/write/readdir/stat/exists/unlink/rmdir/rename/truncate
@@ -67,9 +110,11 @@ More: see `doc/sdk.md` and inline rustdoc.
 
 ---
 
-## 📚 Docs
-- Design: `doc/arch.md`
-- SDK: `doc/sdk.md`
+## 📚 Documentation
+- **V2 Migration Guide**: [MIGRATION_V2.md](MIGRATION_V2.md) - Complete guide for V2 API
+- **Architecture**: [doc/arch.md](doc/arch.md) - System design and components
+- **Metadata**: [doc/meta.md](doc/meta.md) - MetaStore implementation details
+- **SDK Guide**: [doc/sdk.md](doc/sdk.md) - SDK usage and examples
 
 ---
 
