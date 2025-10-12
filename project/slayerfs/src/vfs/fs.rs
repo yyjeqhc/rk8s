@@ -946,7 +946,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
                 .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?
         };
 
-        self.unlink_ino(parent.0, &name).await;
+        self.unlink_ino(parent.0, &name).await?;
 
         Ok(())
     }
@@ -992,7 +992,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
                 .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?
         };
 
-        self.rmdir_ino(parent.0, &name).await;
+        self.rmdir_ino(parent.0, &name).await?;
 
         Ok(())
     }
@@ -1036,7 +1036,7 @@ impl<S: BlockStore, M: MetaStore> Vfs<S, M> {
         };
 
         self.rename_ino(old_parent.0, &old_name, new_dir_ino.0, &new_name)
-            .await;
+            .await?;
 
         Ok(())
     }

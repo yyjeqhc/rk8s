@@ -60,6 +60,26 @@ impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
         self.vfs.unlink(path).await
     }
 
+    /// Remove a file (alias for remove)
+    pub async fn unlink(&mut self, path: &str) -> Result<(), VfsError> {
+        self.vfs.unlink(path).await
+    }
+
+    /// Remove an empty directory
+    pub async fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        self.vfs.rmdir(path).await
+    }
+
+    /// Get file attributes
+    pub async fn stat(&self, path: &str) -> Result<crate::meta::store::FileAttr, VfsError> {
+        self.vfs.stat(path).await.ok_or_else(|| VfsError::PathNotFound(path.to_string()))
+    }
+
+    /// Truncate file to specified size
+    pub async fn truncate(&mut self, path: &str, size: u64) -> Result<(), VfsError> {
+        self.vfs.truncate(path, size).await
+    }
+
     /// List directory contents
     pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         self.vfs.readdir(path).await
@@ -141,7 +161,7 @@ mod tests {
     async fn test_sdk_local_ops_extras() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let cli = LocalClient::new_local(tmp.path(), layout).await;
+        let mut cli = LocalClient::new_local(tmp.path(), layout).await;
 
         cli.mkdir_p("/x/y").await.unwrap();
         cli.create("/x/y/a.txt").await.unwrap();

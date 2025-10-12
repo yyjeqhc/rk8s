@@ -32,17 +32,22 @@ fn default_mount_options() -> MountOptions {
 /// when the MountHandle is dropped.
 ///
 /// # Example
-/// ```no_run
-/// use slayerfs::vfs::fs_v2::Vfs;
-/// use slayerfs::fuse::mount_v2::mount_vfs_v2;
-/// use slayerfs::meta::store::database_store::DatabaseMetaStore;
+/// ```ignore
+/// use slayerfs::vfs::fs::Vfs;
+/// use slayerfs::fuse::mount::mount_vfs_v2;
+/// use slayerfs::meta::database_store::DatabaseMetaStore;
 /// use slayerfs::chuck::store::ObjectBlockStore;
+/// use slayerfs::cadapter::localfs::LocalFsBackend;
+/// use slayerfs::cadapter::client::ObjectClient;
+/// use slayerfs::chuck::chunk::ChunkLayout;
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let meta_store = DatabaseMetaStore::new("sqlite::memory:").await?;
-/// let block_store = ObjectBlockStore::new(/* ... */);
-/// let vfs = Arc::new(Vfs::new(block_store, meta_store));
+/// let client = ObjectClient::new(LocalFsBackend::new("/tmp/blocks"));
+/// let block_store = ObjectBlockStore::new(client);
+/// let layout = ChunkLayout::default();
+/// let vfs = Arc::new(Vfs::new(layout, block_store, meta_store).await?);
 ///
 /// let handle = mount_vfs_v2(
 ///     vfs,
@@ -87,18 +92,23 @@ where
 /// * `mount_options` - Custom FUSE mount options
 ///
 /// # Example
-/// ```no_run
-/// use slayerfs::vfs::fs_v2::Vfs;
-/// use slayerfs::fuse::mount_v2::mount_vfs_with_options;
-/// use slayerfs::meta::store::database_store::DatabaseMetaStore;
+/// ```ignore
+/// use slayerfs::vfs::fs::Vfs;
+/// use slayerfs::fuse::mount::mount_vfs_with_options;
+/// use slayerfs::meta::database_store::DatabaseMetaStore;
 /// use slayerfs::chuck::store::ObjectBlockStore;
+/// use slayerfs::cadapter::localfs::LocalFsBackend;
+/// use slayerfs::cadapter::client::ObjectClient;
+/// use slayerfs::chuck::chunk::ChunkLayout;
 /// use rfuse3::MountOptions;
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let meta_store = DatabaseMetaStore::new("sqlite::memory:").await?;
-/// let block_store = ObjectBlockStore::new(/* ... */);
-/// let vfs = Arc::new(Vfs::new(block_store, meta_store));
+/// let client = ObjectClient::new(LocalFsBackend::new("/tmp/blocks"));
+/// let block_store = ObjectBlockStore::new(client);
+/// let layout = ChunkLayout::default();
+/// let vfs = Arc::new(Vfs::new(layout, block_store, meta_store).await?);
 ///
 /// let mut opts = MountOptions::default();
 /// opts.fs_name("my_slayerfs");
