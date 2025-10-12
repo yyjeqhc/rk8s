@@ -33,6 +33,13 @@ pub mod types;
 pub mod error;
 pub mod store_v2;
 
+// Week 2: V2 implementations
+pub mod database_store_v2;
+pub mod etcd_store_v2;
+
+#[cfg(test)]
+mod store_v2_tests;
+
 // Primary exports
 pub use factory::create_meta_store_from_url;
 pub use permission::Permission;

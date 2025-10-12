@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Database-based metadata store
 pub struct DatabaseMetaStore {
-    db: DatabaseConnection,
-    _config: Config,
-    next_inode: AtomicU64,
+    pub(crate) db: DatabaseConnection,
+    pub(crate) _config: Config,
+    pub(crate) next_inode: AtomicU64,
 }
 
 impl DatabaseMetaStore {
@@ -311,7 +311,7 @@ impl DatabaseMetaStore {
     }
 
     /// Generate unique ID using atomic counter
-    fn generate_id(&self) -> i64 {
+    pub(crate) fn generate_id(&self) -> i64 {
         let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
         id as i64
     }

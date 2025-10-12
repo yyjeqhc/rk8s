@@ -18,23 +18,23 @@ use std::path::Path;
 
 /// Etcd-based metadata store
 pub struct EtcdMetaStore {
-    client: EtcdClient,
-    _config: Config,
+    pub(crate) client: EtcdClient,
+    pub(crate) _config: Config,
 }
 #[allow(dead_code)]
 impl EtcdMetaStore {
     /// Etcd helper method: generate forward index key (parent_inode, name)
-    fn etcd_forward_key(parent_inode: i64, name: &str) -> String {
+    pub(crate) fn etcd_forward_key(parent_inode: i64, name: &str) -> String {
         format!("f:{}:{}", parent_inode, name)
     }
 
     /// Etcd helper method: generate reverse index key for inode
-    fn etcd_reverse_key(ino: i64) -> String {
+    pub(crate) fn etcd_reverse_key(ino: i64) -> String {
         format!("r:{}", ino)
     }
 
     /// Etcd helper method: generate directory children key
-    fn etcd_children_key(inode: i64) -> String {
+    pub(crate) fn etcd_children_key(inode: i64) -> String {
         format!("c:{}", inode)
     }
 
