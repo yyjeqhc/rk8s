@@ -15,6 +15,7 @@ use async_trait::async_trait;
 /// All operations are inode-based. Path resolution is handled by the VFS layer.
 /// Implementations must ensure atomicity and consistency.
 #[async_trait]
+#[auto_impl::auto_impl(&, Arc)]
 pub trait MetaStoreV2: Send + Sync {
     // ==================== Query Operations ====================
 
