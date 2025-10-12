@@ -28,6 +28,11 @@ pub mod migrations;
 pub mod permission;
 pub mod store;
 
+// New V2 metadata interface (Week 1 implementation)
+pub mod types;
+pub mod error;
+pub mod store_v2;
+
 // Primary exports
 pub use factory::create_meta_store_from_url;
 pub use permission::Permission;
