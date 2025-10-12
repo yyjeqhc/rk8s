@@ -7,7 +7,6 @@ use crate::chuck::util::{ChunkSpan, split_file_range_into_chunks};
 use crate::chuck::writer::ChunkWriter;
 use crate::meta::MetaStore;
 use crate::meta::entities::content_meta::EntryType;
-use rfuse3::raw::Filesystem;
 use std::collections::HashMap;
 use std::sync::Mutex;
 

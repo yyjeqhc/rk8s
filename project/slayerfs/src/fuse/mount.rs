@@ -1,179 +1,52 @@
-//! FUSE mounting utilities for Vfs
+//! Mount helpers for starting/stopping FUSE
 //!
-//! This module provides helper functions to mount Vfs instances as FUSE filesystems.
-//! It supports unprivileged mounting on Linux using user namespaces.
+//! Notes:
+//! - Only supported on Unix-like systems. On Linux we support unprivileged mount via fusermount3.
+//! - These helpers are thin wrappers over rfuse3 raw Session APIs.
+
+use std::path::Path;
+
+use rfuse3::MountOptions;
 
 use crate::chuck::store::BlockStore;
-use crate::fuse::adapter::FuseAdapter;
-use crate::meta::store::MetaStore;
+use crate::meta::MetaStore;
 use crate::vfs::fs::Vfs;
-use rfuse3::MountOptions;
-use rfuse3::raw::MountHandle;
-use std::path::Path;
-use std::sync::Arc;
 
-/// Build default mount options for SlayerFS V2.
+/// Build default mount options for SlayerFS.
+#[allow(dead_code)]
 fn default_mount_options() -> MountOptions {
     let mut mo = MountOptions::default();
-    mo.fs_name("slayerfs_v2");
+    mo.fs_name("slayerfs");
+    // Keep defaults conservative: no allow_other, require empty mountpoint.
     mo
 }
 
-/// Mount a Vfs instance as a FUSE filesystem.
-///
-/// # Arguments
-/// * `vfs` - The VFS instance to mount
-/// * `mount_point` - Path to the mount point
-/// * `uid` - User ID for ownership
-/// * `gid` - Group ID for ownership
-///
-/// # Returns
-/// A MountHandle that keeps the filesystem mounted. The filesystem will be unmounted
-/// when the MountHandle is dropped.
-///
-/// # Example
-/// ```ignore
-/// use slayerfs::vfs::fs::Vfs;
-/// use slayerfs::fuse::mount::mount_vfs_v2;
-/// use slayerfs::meta::database_store::DatabaseMetaStore;
-/// use slayerfs::chuck::store::ObjectBlockStore;
-/// use slayerfs::cadapter::localfs::LocalFsBackend;
-/// use slayerfs::cadapter::client::ObjectClient;
-/// use slayerfs::chuck::chunk::ChunkLayout;
-/// use std::sync::Arc;
-///
-/// # async fn example() -> anyhow::Result<()> {
-/// let meta_store = DatabaseMetaStore::new("sqlite::memory:").await?;
-/// let client = ObjectClient::new(LocalFsBackend::new("/tmp/blocks"));
-/// let block_store = ObjectBlockStore::new(client);
-/// let layout = ChunkLayout::default();
-/// let vfs = Arc::new(Vfs::new(layout, block_store, meta_store).await?);
-///
-/// let handle = mount_vfs_v2(
-///     vfs,
-///     "/mnt/slayerfs",
-///     1000, // uid
-///     1000, // gid
-/// ).await?;
-///
-/// // Filesystem is now mounted and accessible
-/// // ...
-///
-/// // Filesystem unmounts when handle is dropped
-/// drop(handle);
-/// # Ok(())
-/// # }
-/// ```
+/// Mount a VFS instance to the given empty directory using unprivileged mode when available.
 #[cfg(target_os = "linux")]
-pub async fn mount_vfs_v2<S, M, P>(
-    vfs: Arc<Vfs<S, M>>,
-    mount_point: P,
-    uid: u32,
-    gid: u32,
-) -> std::io::Result<MountHandle>
+#[allow(dead_code)]
+pub async fn mount_vfs_unprivileged<S, M>(
+    fs: Vfs<S, M>,
+    mount_point: impl AsRef<Path>,
+) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,
     M: MetaStore + Send + Sync + 'static,
-    P: AsRef<Path>,
 {
-    let adapter = FuseAdapter::new(vfs, uid, gid);
     let opts = default_mount_options();
     let session = rfuse3::raw::Session::new(opts);
-    session.mount_with_unprivileged(adapter, mount_point).await
-}
-
-/// Mount a Vfs instance with custom mount options.
-///
-/// # Arguments
-/// * `vfs` - The VFS instance to mount
-/// * `mount_point` - Path to the mount point
-/// * `uid` - User ID for ownership
-/// * `gid` - Group ID for ownership
-/// * `mount_options` - Custom FUSE mount options
-///
-/// # Example
-/// ```ignore
-/// use slayerfs::vfs::fs::Vfs;
-/// use slayerfs::fuse::mount::mount_vfs_with_options;
-/// use slayerfs::meta::database_store::DatabaseMetaStore;
-/// use slayerfs::chuck::store::ObjectBlockStore;
-/// use slayerfs::cadapter::localfs::LocalFsBackend;
-/// use slayerfs::cadapter::client::ObjectClient;
-/// use slayerfs::chuck::chunk::ChunkLayout;
-/// use rfuse3::MountOptions;
-/// use std::sync::Arc;
-///
-/// # async fn example() -> anyhow::Result<()> {
-/// let meta_store = DatabaseMetaStore::new("sqlite::memory:").await?;
-/// let client = ObjectClient::new(LocalFsBackend::new("/tmp/blocks"));
-/// let block_store = ObjectBlockStore::new(client);
-/// let layout = ChunkLayout::default();
-/// let vfs = Arc::new(Vfs::new(layout, block_store, meta_store).await?);
-///
-/// let mut opts = MountOptions::default();
-/// opts.fs_name("my_slayerfs");
-/// opts.force_readdir_plus(true);
-///
-/// let handle = mount_vfs_with_options(
-///     vfs,
-///     "/mnt/slayerfs",
-///     1000,
-///     1000,
-///     opts,
-/// ).await?;
-/// # Ok(())
-/// # }
-/// ```
-#[cfg(target_os = "linux")]
-pub async fn mount_vfs_with_options<S, M, P>(
-    vfs: Arc<Vfs<S, M>>,
-    mount_point: P,
-    uid: u32,
-    gid: u32,
-    mount_options: MountOptions,
-) -> std::io::Result<MountHandle>
-where
-    S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + Send + Sync + 'static,
-    P: AsRef<Path>,
-{
-    let adapter = FuseAdapter::new(vfs, uid, gid);
-    let session = rfuse3::raw::Session::new(mount_options);
-    session.mount_with_unprivileged(adapter, mount_point).await
+    // Prefer unprivileged mount on Linux (requires fusermount3 in PATH)
+    session.mount_with_unprivileged(fs, mount_point).await
 }
 
 /// Fallback stub for non-Linux targets.
 #[cfg(not(target_os = "linux"))]
-pub async fn mount_vfs_v2<S, M, P>(
-    _vfs: Arc<Vfs<S, M>>,
-    _mount_point: P,
-    _uid: u32,
-    _gid: u32,
-) -> std::io::Result<MountHandle>
+pub async fn mount_vfs_unprivileged<S, M>(
+    _fs: VFS<S, M>,
+    _mount_point: impl AsRef<Path>,
+) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,
     M: MetaStore + Send + Sync + 'static,
-    P: AsRef<Path>,
-{
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "FUSE mount is only supported on Linux in this build",
-    ))
-}
-
-/// Fallback stub for non-Linux targets.
-#[cfg(not(target_os = "linux"))]
-pub async fn mount_vfs_with_options<S, M, P>(
-    _vfs: Arc<Vfs<S, M>>,
-    _mount_point: P,
-    _uid: u32,
-    _gid: u32,
-    _mount_options: MountOptions,
-) -> std::io::Result<MountHandle>
-where
-    S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + Send + Sync + 'static,
-    P: AsRef<Path>,
 {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

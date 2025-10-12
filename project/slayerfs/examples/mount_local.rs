@@ -2,11 +2,9 @@ use slayerfs::cadapter::client::ObjectClient;
 use slayerfs::cadapter::localfs::LocalFsBackend;
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
-use slayerfs::fuse::mount::mount_vfs_v2;
-use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
-use slayerfs::meta::database_store::DatabaseMetaStore;
+use slayerfs::fuse::mount::mount_vfs_unprivileged;
+use slayerfs::meta::create_meta_store_from_url;
 use slayerfs::vfs::fs::Vfs;
-use std::sync::Arc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -44,21 +42,10 @@ async fn main() {
         let store = ObjectBlockStore::new(client);
 
         // Create meta store using memory SQLite
-        let config = Config {
-            database: DatabaseConfig {
-                db_config: DatabaseType::Sqlite {
-                    url: "sqlite::memory:".to_string(),
-                },
-            },
-        };
-        let meta = DatabaseMetaStore::from_config(config)
+        let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .expect("create meta store");
-        let fs = Arc::new(Vfs::new(layout, store, meta).await.expect("create VFS"));
-
-        // Get current user uid/gid
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+        let fs = Vfs::new(layout, store, meta).await.expect("create VFS");
 
         // Ensure mount point exists
         if let Err(e) = std::fs::create_dir_all(&mount_point) {
@@ -66,9 +53,9 @@ async fn main() {
             std::process::exit(1);
         }
 
-        println!("Mounting SlayerFS V2 at {mount_point} (backend: {data_dir})...");
+        println!("Mounting SlayerFS at {mount_point} (backend: {data_dir})...");
         println!("Press Ctrl+C to unmount and exit.");
-        let handle = match mount_vfs_v2(fs, std::path::Path::new(&mount_point), uid, gid).await {
+        let handle = match mount_vfs_unprivileged(fs, std::path::Path::new(&mount_point)).await {
             Ok(h) => h,
             Err(e) => {
                 eprintln!(

@@ -28,11 +28,7 @@ impl<S: BlockStore, M: MetaStore> SimpleVfs<S, M> {
     pub async fn create(&mut self, filename: String) -> Result<i64, String> {
         let root_ino = self.meta.root_ino();
         let params = CreateParams::file(root_ino, filename, 0, 0);
-        let (ino, _attr) = self
-            .meta
-            .create(params)
-            .await
-            .map_err(|e| e.to_string())?;
+        let (ino, _attr) = self.meta.create(params).await.map_err(|e| e.to_string())?;
         Ok(ino.0)
     }
 
