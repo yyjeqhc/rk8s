@@ -5,6 +5,7 @@ use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
 use slayerfs::fuse::mount::mount_vfs_unprivileged;
 use slayerfs::meta::MetaStore;
+use slayerfs::meta::factory::MetaStoreFactory;
 use slayerfs::meta::types::Inode;
 use slayerfs::vfs::fs::VFS;
 use std::path::PathBuf;
@@ -110,7 +111,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // 使用工厂创建元数据存储
-        use slayerfs::meta::factory::MetaStoreFactory;
         let meta = MetaStoreFactory::create_from_config(config)
             .await
             .map_err(|e| format!("Failed to connect to MetaServer: {}", e))?;
