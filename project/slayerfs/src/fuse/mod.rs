@@ -137,15 +137,20 @@ where
     async fn destroy(&self, _req: Request) {}
 
     // 调用 VFS：由 parent inode + name -> child inode；若找到，后续封装 ReplyEntry（暂占位）
+    #[tracing::instrument(skip(self, req), fields(parent = %parent, name = ?name))]
     async fn lookup(&self, req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         let name_str = name.to_string_lossy();
         let child = self.child_of(parent as i64, name_str.as_ref()).await;
         let Some(child_ino) = child else {
+            tracing::debug!(parent = %parent, name = ?name, "lookup: not found");
             return Err(libc::ENOENT.into());
         };
         let Some(vattr) = self.stat_ino(child_ino.0).await else {
+            tracing::warn!(parent = %parent, name = ?name, child = child_ino.0, "lookup: child inode not found");
             return Err(libc::ENOENT.into());
         };
+        
+        tracing::debug!(parent = %parent, name = ?name, child = child_ino.0, "lookup: success");
         let attr = VFS_to_fuse_attr(&vattr, &req);
         // generation 暂置 0；ttl 设为 1s，可调
         Ok(ReplyEntry {
@@ -179,6 +184,7 @@ where
     }
 
     // 读文件：映射到 VFS::read（通过 inode 构造路径）
+    #[tracing::instrument(skip(self, _req), fields(ino = %ino, offset = %offset, size = %size))]
     async fn read(
         &self,
         _req: Request,
@@ -189,19 +195,26 @@ where
     ) -> FuseResult<ReplyData> {
         // Verify inode exists
         if self.stat_ino(ino as i64).await.is_none() {
+            tracing::warn!(ino = %ino, "read: inode not found");
             return Err(libc::ENOENT.into());
         };
 
         let data = self
             .read_ino(ino as i64, offset, size as usize)
             .await
-            .map_err(|_| libc::EIO)?;
+            .map_err(|e| {
+                tracing::error!(ino = %ino, offset = %offset, size = %size, error = %e, "read: failed");
+                libc::EIO
+            })?;
+        
+        tracing::debug!(ino = %ino, offset = %offset, requested = %size, actual = data.len(), "read: success");
         Ok(ReplyData {
             data: Bytes::from(data),
         })
     }
 
     // 写文件：直接使用 inode
+    #[tracing::instrument(skip(self, _req, data), fields(ino = %ino, offset = %offset, size = data.len()))]
     async fn write(
         &self,
         _req: Request,
@@ -215,11 +228,17 @@ where
         let n = self
             .write_ino(ino as i64, offset, data)
             .await
-            .map_err(|_| libc::EIO)? as u32;
+            .map_err(|e| {
+                tracing::error!(ino = %ino, offset = %offset, size = data.len(), error = %e, "write: failed");
+                libc::EIO
+            })? as u32;
+        
+        tracing::debug!(ino = %ino, offset = %offset, written = %n, "write: success");
         Ok(ReplyWrite { written: n })
     }
 
     // 调用 VFS 获取 inode 属性（若 fh 有效则可忽略 flags）
+    #[tracing::instrument(skip(self, req), fields(ino = %ino))]
     async fn getattr(
         &self,
         req: Request,
@@ -228,6 +247,7 @@ where
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
         let Some(vattr) = self.stat_ino(ino as i64).await else {
+            tracing::debug!(ino = %ino, "getattr: not found");
             return Err(libc::ENOENT.into());
         };
         let attr = VFS_to_fuse_attr(&vattr, &req);

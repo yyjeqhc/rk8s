@@ -50,11 +50,15 @@ impl MetaClient {
     // ==================== Query Operations ====================
 
     /// Get file attributes with caching
+    #[tracing::instrument(skip(self), fields(ino = %ino.as_i64()))]
     pub async fn getattr(&self, ino: Inode) -> Result<FileAttr, MetaError> {
         // Check cache first
         if let Some(attr) = self.cache.get_attr(ino) {
+            tracing::debug!(ino = ino.as_i64(), "getattr: cache hit");
             return Ok(attr);
         }
+
+        tracing::debug!(ino = ino.as_i64(), "getattr: cache miss, querying backend");
 
         // Cache miss, query backend
         let attr = self.store.getattr(ino).await?;
@@ -66,6 +70,7 @@ impl MetaClient {
     }
 
     /// Get attributes for multiple inodes (batch operation)
+    #[tracing::instrument(skip(self), fields(count = inos.len()))]
     pub async fn getattr_batch(&self, inos: &[Inode]) -> Result<Vec<(Inode, FileAttr)>, MetaError> {
         let mut results = Vec::with_capacity(inos.len());
         let mut cache_misses = Vec::new();
@@ -78,6 +83,14 @@ impl MetaClient {
                 cache_misses.push(ino);
             }
         }
+
+        tracing::debug!(
+            requested = inos.len(),
+            cache_hits = results.len(),
+            cache_misses = cache_misses.len(),
+            hit_rate = format!("{:.1}%", (results.len() as f64 / inos.len() as f64) * 100.0),
+            "getattr_batch: cache stats"
+        );
 
         // Batch query for cache misses
         if !cache_misses.is_empty() {
@@ -94,11 +107,15 @@ impl MetaClient {
     }
 
     /// Look up a directory entry by name with caching
+    #[tracing::instrument(skip(self), fields(parent = %parent.as_i64(), name = %name))]
     pub async fn lookup(&self, parent: Inode, name: &str) -> Result<Inode, MetaError> {
         // Check dentry cache
         if let Some(child) = self.cache.get_dentry(parent, name) {
+            tracing::debug!(parent = parent.as_i64(), name = %name, child = child.as_i64(), "lookup: dentry cache hit");
             return Ok(child);
         }
+
+        tracing::debug!(parent = parent.as_i64(), name = %name, "lookup: dentry cache miss");
 
         // Check negative cache
         let neg_key = format!("{}:{}", parent.0, name);

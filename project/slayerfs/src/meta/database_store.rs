@@ -382,6 +382,7 @@ impl DatabaseMetaStore {
 
 #[async_trait]
 impl MetaStore for DatabaseMetaStore {
+    #[tracing::instrument(skip(self), fields(ino = %ino.as_i64()))]
     async fn getattr(&self, ino: Inode) -> Result<FileAttr, MetaError> {
         // Try file_meta first
         if let Some(file) = FileMeta::find_by_id(ino.as_i64())
@@ -390,6 +391,7 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?
         {
             let permission = file.permission();
+            tracing::debug!(ino = ino.as_i64(), size = file.size, kind = "file", "getattr found file");
             return Ok(FileAttr {
                 ino: ino.as_i64(),
                 size: file.size as u64,
@@ -412,6 +414,7 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?
         {
             let permission = dir.permission();
+            tracing::debug!(ino = ino.as_i64(), kind = "directory", "getattr found directory");
             return Ok(FileAttr {
                 ino: ino.as_i64(),
                 size: 4096, // Directory size
@@ -427,9 +430,11 @@ impl MetaStore for DatabaseMetaStore {
             });
         }
 
+        tracing::warn!(ino = ino.as_i64(), "getattr: inode not found");
         Err(MetaError::not_found(ino))
     }
 
+    #[tracing::instrument(skip(self), fields(count = inos.len()))]
     async fn getattr_batch(&self, inos: &[Inode]) -> Result<Vec<(Inode, FileAttr)>, MetaError> {
         if inos.is_empty() {
             return Ok(Vec::new());
@@ -445,6 +450,8 @@ impl MetaStore for DatabaseMetaStore {
             .await
             .map_err(MetaError::Database)?;
 
+        tracing::debug!(files_found = files.len(), "batch query: files");
+        
         for file in files {
             let permission = file.permission();
             let attr = FileAttr {
@@ -470,6 +477,8 @@ impl MetaStore for DatabaseMetaStore {
             .await
             .map_err(MetaError::Database)?;
 
+        tracing::debug!(dirs_found = dirs.len(), "batch query: directories");
+
         for dir in dirs {
             let permission = dir.permission();
             let attr = FileAttr {
@@ -488,9 +497,17 @@ impl MetaStore for DatabaseMetaStore {
             results.push((Inode(dir.inode), attr));
         }
 
+        tracing::info!(
+            requested = inos.len(),
+            found = results.len(),
+            "getattr_batch completed"
+        );
+
+
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self), fields(parent = %parent.as_i64(), name = %name))]
     async fn lookup(&self, parent: Inode, name: &str) -> Result<Inode, MetaError> {
         let content = ContentMeta::find()
             .filter(content_meta::Column::ParentInode.eq(parent.as_i64()))
@@ -498,11 +515,16 @@ impl MetaStore for DatabaseMetaStore {
             .one(&self.db)
             .await
             .map_err(MetaError::Database)?
-            .ok_or_else(|| MetaError::not_found(parent))?;
+            .ok_or_else(|| {
+                tracing::debug!(parent = parent.as_i64(), name = %name, "lookup: entry not found");
+                MetaError::not_found(parent)
+            })?;
 
+        tracing::debug!(parent = parent.as_i64(), name = %name, ino = content.inode, "lookup: found");
         Ok(Inode(content.inode))
     }
 
+    #[tracing::instrument(skip(self), fields(ino = %ino.as_i64()))]
     async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, MetaError> {
         // Verify it's a directory
         if AccessMeta::find_by_id(ino.as_i64())
@@ -511,6 +533,7 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?
             .is_none()
         {
+            tracing::warn!(ino = ino.as_i64(), "readdir: not a directory");
             return Err(MetaError::not_directory(ino));
         }
 
@@ -520,6 +543,8 @@ impl MetaStore for DatabaseMetaStore {
             .await
             .map_err(MetaError::Database)?;
 
+        tracing::debug!(ino = ino.as_i64(), entries = contents.len(), "readdir: completed");
+        
         let entries = contents
             .into_iter()
             .map(|c| DirEntry {
@@ -587,6 +612,12 @@ impl MetaStore for DatabaseMetaStore {
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self), fields(
+        parent = %params.parent.as_i64(),
+        name = %params.name,
+        kind = ?params.kind,
+        mode = format!("{:o}", params.mode)
+    ))]
     async fn create(&self, params: CreateParams) -> Result<(Inode, FileAttr), MetaError> {
         // Start transaction
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
@@ -599,6 +630,7 @@ impl MetaStore for DatabaseMetaStore {
             .is_some();
 
         if !parent_exists {
+            tracing::warn!(parent = params.parent.as_i64(), "create: parent not found");
             return Err(MetaError::parent_not_found(params.parent));
         }
 
@@ -611,12 +643,15 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?;
 
         if existing.is_some() {
+            tracing::warn!(parent = params.parent.as_i64(), name = %params.name, "create: already exists");
             return Err(MetaError::already_exists(params.parent, params.name));
         }
 
         // 3. Allocate new inode
         let ino = Inode(self.generate_id().await?);
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        tracing::debug!(ino = ino.as_i64(), "create: allocated new inode");
 
         // 4. Create metadata based on type
         let permission = Permission::new(params.mode, params.uid, params.gid);
@@ -652,7 +687,7 @@ impl MetaStore for DatabaseMetaStore {
         let content = content_meta::ActiveModel {
             inode: Set(ino.as_i64()),
             parent_inode: Set(params.parent.as_i64()),
-            entry_name: Set(params.name),
+            entry_name: Set(params.name.clone()),
             entry_type: Set(match params.kind {
                 FileType::File => EntryType::File,
                 FileType::Dir => EntryType::Directory,
@@ -662,6 +697,14 @@ impl MetaStore for DatabaseMetaStore {
 
         // 6. Commit transaction
         txn.commit().await.map_err(MetaError::Database)?;
+
+        tracing::info!(
+            ino = ino.as_i64(),
+            parent = params.parent.as_i64(),
+            name = %params.name,
+            kind = ?params.kind,
+            "create: completed"
+        );
 
         // 7. Get and return attributes
         let attr = self.getattr(ino).await?;
