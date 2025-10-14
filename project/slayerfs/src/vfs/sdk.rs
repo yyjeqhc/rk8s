@@ -12,18 +12,18 @@ use crate::chuck::store::{BlockStore, ObjectBlockStore};
 use crate::meta::config::{Config, DatabaseConfig, DatabaseType};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::store::DirEntry;
-use crate::meta::{MetaStore, create_meta_store_from_url};
+use crate::meta::MetaStore;
 use crate::vfs::fs::{VFS, VfsError};
 use std::path::Path;
 use std::sync::Arc;
 
-pub struct Client<S: BlockStore, M: MetaStore> {
-    vfs: Arc<VFS<S, M>>,
+pub struct Client<S: BlockStore> {
+    vfs: Arc<VFS<S>>,
 }
 
-impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
+impl<S: BlockStore + Send + Sync> Client<S> {
     /// Create a new client from a vfs instance
-    pub fn new(vfs: Arc<VFS<S, M>>) -> Self {
+    pub fn new(vfs: Arc<VFS<S>>) -> Self {
         Self { vfs }
     }
 
@@ -95,7 +95,7 @@ impl<S: BlockStore + Send + Sync, M: MetaStore + Send + Sync> Client<S, M> {
 }
 
 /// Local filesystem client (convenience type)
-pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, DatabaseMetaStore>;
+pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>>;
 
 impl LocalClient {
     /// Create a new local client with in-memory SQLite backend

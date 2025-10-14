@@ -10,6 +10,7 @@
 use crate::meta::Permission;
 use crate::meta::entities::*;
 use crate::meta::error::MetaErrorHelper;
+use crate::meta::id_generator::{IdGenerator, PostgresIdGenerator, SqliteIdGenerator};
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 use crate::vfs::fs::FileType;
 use chrono::Utc;
@@ -20,13 +21,13 @@ use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
 use async_trait::async_trait;
 use log::info;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// Database-based metadata store
+/// Database-based metadata store (stateless)
 pub struct DatabaseMetaStore {
     pub(crate) db: DatabaseConnection,
     pub(crate) _config: Config,
-    pub(crate) next_inode: AtomicU64,
+    pub(crate) id_gen: Arc<dyn IdGenerator>,
 }
 
 impl DatabaseMetaStore {
@@ -43,11 +44,29 @@ impl DatabaseMetaStore {
         let db = Self::create_connection(&_config).await?;
         Self::init_schema(&db).await?;
 
-        let next_inode = AtomicU64::new(Self::init_next_inode(&db).await?);
+        // Create appropriate ID generator based on database type
+        let id_gen: Arc<dyn IdGenerator> = match &_config.database.db_config {
+            DatabaseType::Sqlite { .. } => {
+                let generator = SqliteIdGenerator::new(db.clone());
+                generator.initialize().await?;
+                Arc::new(generator)
+            }
+            DatabaseType::Postgres { .. } => {
+                let generator = PostgresIdGenerator::new(db.clone());
+                generator.initialize().await?;
+                Arc::new(generator)
+            }
+            DatabaseType::Etcd { .. } => {
+                return Err(MetaError::Config(
+                    "Etcd backend not supported by DatabaseMetaStore".to_string(),
+                ));
+            }
+        };
+
         let store = Self {
             db,
             _config,
-            next_inode,
+            id_gen,
         };
         store.init_root_directory().await?;
 
@@ -63,11 +82,29 @@ impl DatabaseMetaStore {
         let db = Self::create_connection(&_config).await?;
         Self::init_schema(&db).await?;
 
-        let next_inode = AtomicU64::new(Self::init_next_inode(&db).await?);
+        // Create appropriate ID generator based on database type
+        let id_gen: Arc<dyn IdGenerator> = match &_config.database.db_config {
+            DatabaseType::Sqlite { .. } => {
+                let generator = SqliteIdGenerator::new(db.clone());
+                generator.initialize().await?;
+                Arc::new(generator)
+            }
+            DatabaseType::Postgres { .. } => {
+                let generator = PostgresIdGenerator::new(db.clone());
+                generator.initialize().await?;
+                Arc::new(generator)
+            }
+            DatabaseType::Etcd { .. } => {
+                return Err(MetaError::Config(
+                    "Etcd backend not supported by DatabaseMetaStore".to_string(),
+                ));
+            }
+        };
+
         let store = Self {
             db,
             _config,
-            next_inode,
+            id_gen,
         };
         store.init_root_directory().await?;
 
@@ -75,41 +112,60 @@ impl DatabaseMetaStore {
         Ok(store)
     }
 
-    /// Initialize next inode counter from database
-    async fn init_next_inode(db: &DatabaseConnection) -> Result<u64, MetaError> {
-        let max_access = AccessMeta::find()
-            .order_by_desc(access_meta::Column::Inode)
-            .one(db)
-            .await
-            .map_err(MetaError::Database)?
-            .map(|r| r.inode as u64)
-            .unwrap_or(1);
-
-        let max_file = FileMeta::find()
-            .order_by_desc(file_meta::Column::Inode)
-            .one(db)
-            .await
-            .map_err(MetaError::Database)?
-            .map(|r| r.inode as u64)
-            .unwrap_or(1);
-
-        let next = max_access.max(max_file) + 1;
-        info!("Initialized next inode counter to: {}", next);
-        Ok(next)
-    }
-
     /// Create database connection
     async fn create_connection(config: &Config) -> Result<DatabaseConnection, MetaError> {
         match &config.database.db_config {
             DatabaseType::Sqlite { url } => {
                 info!("Connecting to SQLite: {}", url);
-                let opts = ConnectOptions::new(url.clone());
+                
+                // For SQLite, use serialized access with proper settings
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.max_connections(10)  // Allow multiple connections for better concurrency
+                    .min_connections(2)
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .acquire_timeout(std::time::Duration::from_secs(60))  // Longer acquire timeout
+                    .idle_timeout(std::time::Duration::from_secs(600))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .sqlx_logging(false);  // Disable verbose logging
+                
                 let db = Database::connect(opts).await?;
+                
+                // Enable WAL mode for better concurrency
+                db.execute(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "PRAGMA journal_mode=WAL;".to_string(),
+                ))
+                .await
+                .map_err(MetaError::Database)?;
+                
+                // Set busy timeout to 10 seconds
+                db.execute(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "PRAGMA busy_timeout=10000;".to_string(),
+                ))
+                .await
+                .map_err(MetaError::Database)?;
+                
+                // Enable synchronous=NORMAL for better performance with WAL
+                db.execute(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "PRAGMA synchronous=NORMAL;".to_string(),
+                ))
+                .await
+                .map_err(MetaError::Database)?;
+                
                 Ok(db)
             }
             DatabaseType::Postgres { url } => {
                 info!("Connecting to PostgreSQL: {}", url);
-                let opts = ConnectOptions::new(url.clone());
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.max_connections(100)
+                    .min_connections(5)
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .acquire_timeout(std::time::Duration::from_secs(30))
+                    .idle_timeout(std::time::Duration::from_secs(600))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .sqlx_logging(false);
                 let db = Database::connect(opts).await?;
                 Ok(db)
             }
@@ -230,7 +286,7 @@ impl DatabaseMetaStore {
             }
         }
 
-        let inode = self.generate_id();
+        let inode = self.generate_id().await?;
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let dir_permission = Permission::new(0o40755, 0, 0); // 目录权限：0o40000 (目录标志) + 0o755 (权限)
@@ -284,7 +340,7 @@ impl DatabaseMetaStore {
             }
         }
 
-        let inode = self.generate_id();
+        let inode = self.generate_id().await?;
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let file_permission = Permission::new(0o644, 0, 0);
@@ -318,10 +374,9 @@ impl DatabaseMetaStore {
         Ok(inode)
     }
 
-    /// Generate unique ID using atomic counter
-    pub(crate) fn generate_id(&self) -> i64 {
-        let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
-        id as i64
+    /// Generate unique ID using the injected ID generator
+    async fn generate_id(&self) -> Result<i64, MetaError> {
+        self.id_gen.next_id().await
     }
 }
 
@@ -346,6 +401,7 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: file.modify_time,
                 ctime: file.create_time,
                 nlink: file.nlink as u32,
+                version: 0, // TODO: Implement versioning in database schema
             });
         }
 
@@ -367,6 +423,7 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: dir.modify_time,
                 ctime: dir.create_time,
                 nlink: dir.nlink as u32,
+                version: 0, // TODO: Implement versioning in database schema
             });
         }
 
@@ -401,6 +458,7 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: file.modify_time,
                 ctime: file.create_time,
                 nlink: file.nlink as u32,
+                version: 0, // TODO: Implement versioning
             };
             results.push((Inode(file.inode), attr));
         }
@@ -425,6 +483,7 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: dir.modify_time,
                 ctime: dir.create_time,
                 nlink: dir.nlink as u32,
+                version: 0, // TODO: Implement versioning
             };
             results.push((Inode(dir.inode), attr));
         }
@@ -556,7 +615,7 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         // 3. Allocate new inode
-        let ino = Inode(self.generate_id());
+        let ino = Inode(self.generate_id().await?);
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // 4. Create metadata based on type

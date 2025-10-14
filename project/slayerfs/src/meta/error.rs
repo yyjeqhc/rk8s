@@ -21,6 +21,7 @@ impl MetaErrorExt for MetaError {
             MetaError::InvalidPath(_) => libc::EINVAL,
             MetaError::NotSupported(_) => libc::ENOTSUP,
             MetaError::NotImplemented => libc::ENOSYS,
+            MetaError::Conflict { .. } => libc::EAGAIN, // Retry suggested
             MetaError::Io(err) => err.raw_os_error().unwrap_or(libc::EIO),
             MetaError::Database(_) | MetaError::Serialization(_) | MetaError::Internal(_) => {
                 libc::EIO

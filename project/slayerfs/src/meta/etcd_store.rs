@@ -4,6 +4,7 @@
 
 use crate::meta::entities::etcd::*;
 use crate::meta::error::MetaErrorHelper;
+use crate::meta::id_generator::{EtcdIdGenerator, IdGenerator};
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 
 use crate::meta::Permission;
@@ -18,11 +19,13 @@ use log::{error, info};
 use serde_json;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
-/// Etcd-based metadata store
+/// Etcd-based metadata store (stateless)
 pub struct EtcdMetaStore {
     pub(crate) client: EtcdClient,
     pub(crate) _config: Config,
+    pub(crate) id_gen: Arc<dyn IdGenerator>,
 }
 #[allow(dead_code)]
 impl EtcdMetaStore {
@@ -50,7 +53,12 @@ impl EtcdMetaStore {
         info!("Backend path: {}", backend_path.display());
 
         let client = Self::create_client(&_config).await?;
-        let store = Self { client, _config };
+        
+        // Create ID generator
+        let id_gen = Arc::new(EtcdIdGenerator::new(client.clone()));
+        id_gen.initialize().await?;
+        
+        let store = Self { client, _config, id_gen };
         store.init_root_directory().await?;
 
         info!("EtcdMetaStore initialized successfully");
@@ -62,7 +70,12 @@ impl EtcdMetaStore {
         info!("Initializing EtcdMetaStore from config");
 
         let client = Self::create_client(&_config).await?;
-        let store = Self { client, _config };
+        
+        // Create ID generator
+        let id_gen = Arc::new(EtcdIdGenerator::new(client.clone()));
+        id_gen.initialize().await?;
+        
+        let store = Self { client, _config, id_gen };
         store.init_root_directory().await?;
 
         info!("EtcdMetaStore initialized successfully");
@@ -440,81 +453,9 @@ impl EtcdMetaStore {
         Ok(inode)
     }
 
-    /// Generate unique ID using Etcd atomic counter
-    /// Uses compare-and-swap to ensure atomicity in distributed environment
+    /// Generate unique ID using the injected ID generator
     async fn generate_id(&self) -> Result<i64, MetaError> {
-        let mut client = self.client.clone();
-        let counter_key = "slayerfs:next_inode_id";
-
-        // Retry loop for CAS operation
-        // TODO: think about how to keep in sync with remote
-        for retry in 0..10 {
-            match client.get(counter_key, None).await {
-                Ok(resp) => {
-                    let (current_id, mod_revision) = if let Some(kv) = resp.kvs().first() {
-                        let id = String::from_utf8_lossy(kv.value())
-                            .parse::<i64>()
-                            .unwrap_or(1);
-                        (id, kv.mod_revision())
-                    } else {
-                        // First time initialization
-                        if let Err(e) = client.put(counter_key, "2", None).await {
-                            error!("Failed to initialize ID counter: {}", e);
-                            return Err(MetaError::Config(format!(
-                                "Failed to initialize ID counter: {}",
-                                e
-                            )));
-                        }
-                        return Ok(2);
-                    };
-
-                    let next_id = current_id + 1;
-
-                    // Use transaction for atomic compare-and-swap
-                    use etcd_client::{Compare, CompareOp, Txn, TxnOp};
-
-                    let cmp = Compare::mod_revision(counter_key, CompareOp::Equal, mod_revision);
-                    let put_op = TxnOp::put(counter_key, next_id.to_string(), None);
-                    let txn = Txn::new().when([cmp]).and_then([put_op]);
-
-                    match client.txn(txn).await {
-                        Ok(txn_resp) => {
-                            if txn_resp.succeeded() {
-                                // CAS succeeded, return the new ID
-                                return Ok(next_id);
-                            } else {
-                                // CAS failed, retry
-                                if retry < 9 {
-                                    continue;
-                                } else {
-                                    return Err(MetaError::Config(
-                                        "Failed to generate ID after max retries".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to execute transaction: {}", e);
-                            return Err(MetaError::Config(format!(
-                                "Failed to execute ID generation transaction: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get ID counter: {}", e);
-                    return Err(MetaError::Config(format!(
-                        "Failed to get ID counter: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        Err(MetaError::Config(
-            "Failed to generate ID: max retries exceeded".to_string(),
-        ))
+        self.id_gen.next_id().await
     }
 }
 
@@ -535,6 +476,7 @@ impl MetaStore for EtcdMetaStore {
                 mtime: now,
                 ctime: now,
                 nlink: 2,
+                version: 0,
             });
         }
 
@@ -549,6 +491,7 @@ impl MetaStore for EtcdMetaStore {
         if let Some(kv) = resp.kvs().first() {
             let entry_info: EtcdEntryInfo = serde_json::from_slice(kv.value())?;
             let permission = entry_info.permission();
+            let version = entry_info.version.unwrap_or(0) as u64;
 
             if entry_info.is_file {
                 Ok(FileAttr {
@@ -562,6 +505,7 @@ impl MetaStore for EtcdMetaStore {
                     mtime: entry_info.modify_time,
                     ctime: entry_info.create_time,
                     nlink: entry_info.nlink as u32,
+                    version,
                 })
             } else {
                 Ok(FileAttr {
@@ -575,6 +519,7 @@ impl MetaStore for EtcdMetaStore {
                     mtime: entry_info.modify_time,
                     ctime: entry_info.create_time,
                     nlink: entry_info.nlink as u32,
+                    version,
                 })
             }
         } else {
@@ -667,9 +612,8 @@ impl MetaStore for EtcdMetaStore {
             }
         }
 
-        // 3. Allocate new inode (using a simple counter approach)
-        // In production, you'd want a distributed counter
-        let ino = Inode(Utc::now().timestamp_millis());
+        // 3. Allocate new inode using ID generator
+        let ino = Inode(self.generate_id().await?);
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // 4. Create entry info
@@ -759,6 +703,7 @@ impl MetaStore for EtcdMetaStore {
             mtime: now,
             ctime: now,
             nlink: if is_file { 1 } else { 2 },
+            version: 1, // Initial version
         };
 
         Ok((ino, attr))

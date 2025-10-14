@@ -9,7 +9,6 @@ use std::path::Path;
 use rfuse3::MountOptions;
 
 use crate::chuck::store::BlockStore;
-use crate::meta::MetaStore;
 use crate::vfs::fs::VFS;
 
 /// Build default mount options for SlayerFS.
@@ -24,13 +23,12 @@ fn default_mount_options() -> MountOptions {
 /// Mount a VFS instance to the given empty directory using unprivileged mode when available.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
-pub async fn mount_vfs_unprivileged<S, M>(
-    fs: VFS<S, M>,
+pub async fn mount_vfs_unprivileged<S>(
+    fs: VFS<S>,
     mount_point: impl AsRef<Path>,
 ) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + Send + Sync + 'static,
 {
     let opts = default_mount_options();
     let session = rfuse3::raw::Session::new(opts);
@@ -40,13 +38,12 @@ where
 
 /// Fallback stub for non-Linux targets.
 #[cfg(not(target_os = "linux"))]
-pub async fn mount_vfs_unprivileged<S, M>(
-    _fs: VFS<S, M>,
+pub async fn mount_vfs_unprivileged<S>(
+    _fs: VFS<S>,
     _mount_point: impl AsRef<Path>,
 ) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + Send + Sync + 'static,
 {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

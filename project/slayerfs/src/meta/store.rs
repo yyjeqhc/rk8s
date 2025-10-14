@@ -16,6 +16,8 @@ pub struct FileAttr {
     pub mtime: i64,
     pub ctime: i64,
     pub nlink: u32,
+    /// Version number for optimistic locking (0 means versioning not supported)
+    pub version: u64,
 }
 
 /// Directory entry
@@ -44,6 +46,9 @@ pub enum MetaError {
 
     #[error("Directory not empty: {0}")]
     DirectoryNotEmpty(i64),
+
+    #[error("Version conflict: expected {expected}, got {actual}")]
+    Conflict { expected: u64, actual: u64 },
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),

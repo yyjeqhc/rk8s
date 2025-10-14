@@ -112,10 +112,9 @@ mod mount_tests {
     }
 }
 
-impl<S, M> Filesystem for VFS<S, M>
+impl<S> Filesystem for VFS<S>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + Send + Sync + 'static,
 {
     // GAT：目录条目流（readdir）
     type DirEntryStream<'a>
@@ -140,7 +139,7 @@ where
     // 调用 VFS：由 parent inode + name -> child inode；若找到，后续封装 ReplyEntry（暂占位）
     async fn lookup(&self, req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         let name_str = name.to_string_lossy();
-        let child = self.child_of(parent as i64, name_str.as_ref());
+        let child = self.child_of(parent as i64, name_str.as_ref()).await;
         let Some(child_ino) = child else {
             return Err(libc::ENOENT.into());
         };
@@ -202,7 +201,7 @@ where
         })
     }
 
-    // 写文件：映射到 VFS::write（通过 inode 构造路径）
+    // 写文件：直接使用 inode
     async fn write(
         &self,
         _req: Request,
@@ -213,11 +212,8 @@ where
         _write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
-        let Some(path) = self.path_of(ino as i64) else {
-            return Err(libc::ENOENT.into());
-        };
         let n = self
-            .write(&path, offset, data)
+            .write_ino(ino as i64, offset, data)
             .await
             .map_err(|_| libc::EIO)? as u32;
         Ok(ReplyWrite { written: n })
@@ -433,7 +429,7 @@ where
         req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
         let name = name.to_string_lossy();
@@ -445,18 +441,13 @@ where
             return Err(libc::ENOTDIR.into());
         }
         // 冲突检查
-        if let Some(_child) = self.child_of(parent as i64, name.as_ref()) {
+        if let Some(_child) = self.child_of(parent as i64, name.as_ref()).await {
             return Err(libc::EEXIST.into());
         }
-        // 构造路径并创建
-        let Some(mut p) = self.path_of(parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        let _ino = self.mkdir_p(&p).await.map_err(|_| libc::EIO)?;
+        // 直接通过 inode 创建目录
+        let _ino = self.mkdir_ino(parent as i64, &name, mode, req.uid, req.gid)
+            .await
+            .map_err(|_| libc::EIO)?;
         let Some(vattr) = self.stat_ino(_ino).await else {
             return Err(libc::ENOENT.into());
         };
@@ -474,31 +465,41 @@ where
         req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _flags: u32,
     ) -> FuseResult<ReplyCreated> {
         let name = name.to_string_lossy();
+        log::debug!("FUSE create: parent={}, name={}", parent, name);
+        
         // 父检查
         let Some(pattr) = self.stat_ino(parent as i64).await else {
+            log::debug!("FUSE create: parent not found");
             return Err(libc::ENOENT.into());
         };
         if !matches!(pattr.kind, FileType::Dir) {
+            log::debug!("FUSE create: parent not a directory");
             return Err(libc::ENOTDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        let ino = self.create_file(&p).await.map_err(|e| match e {
-            VfsError::NotFile(_) => libc::EISDIR,
-            _ => libc::EIO,
-        })?;
+        
+        log::debug!("FUSE create: calling create_ino");
+        // 直接通过 inode 创建文件
+        let ino = self.create_ino(parent as i64, &name, mode, req.uid, req.gid)
+            .await
+            .map_err(|e| {
+                log::error!("FUSE create: create_ino failed: {:?}", e);
+                match e {
+                    VfsError::NotFile(_) => libc::EISDIR,
+                    _ => libc::EIO,
+                }
+            })?;
+        
+        log::debug!("FUSE create: create_ino returned ino={}", ino);
         let Some(vattr) = self.stat_ino(ino).await else {
+            log::debug!("FUSE create: stat_ino failed");
             return Err(libc::ENOENT.into());
         };
+        
+        log::debug!("FUSE create: success, returning");
         let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyCreated {
             ttl: Duration::from_secs(1),
@@ -520,7 +521,7 @@ where
             return Err(libc::ENOTDIR.into());
         }
         // 目标必须存在且为文件
-        let Some(child) = self.child_of(parent as i64, name.as_ref()) else {
+        let Some(child) = self.child_of(parent as i64, name.as_ref()).await else {
             return Err(libc::ENOENT.into());
         };
         let Some(cattr) = self.stat_ino(child.0).await else {
@@ -529,14 +530,8 @@ where
         if !matches!(cattr.kind, FileType::File) {
             return Err(libc::EISDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        self.unlink(&p).await.map_err(|e| {
+        // 直接通过 inode 删除
+        self.unlink_ino(parent as i64, &name).await.map_err(|e| {
             let code = match e {
                 VfsError::PathNotFound(_) => libc::ENOENT,
                 VfsError::NotFile(_) => libc::EISDIR,
@@ -556,7 +551,7 @@ where
             return Err(libc::ENOTDIR.into());
         }
         // 目标应为目录
-        let Some(child) = self.child_of(parent as i64, name.as_ref()) else {
+        let Some(child) = self.child_of(parent as i64, name.as_ref()).await else {
             return Err(libc::ENOENT.into());
         };
         let Some(cattr) = self.stat_ino(child.0).await else {
@@ -565,14 +560,8 @@ where
         if !matches!(cattr.kind, FileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        self.rmdir(&p).await.map_err(|e| {
+        // 直接通过 inode 删除
+        self.rmdir_ino(parent as i64, &name).await.map_err(|e| {
             let code = match e {
                 VfsError::PathNotFound(_) => libc::ENOENT,
                 VfsError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
@@ -594,7 +583,7 @@ where
         let name = name.to_string_lossy();
         let new_name = new_name.to_string_lossy();
         // 检查源存在
-        let Some(src_ino) = self.child_of(parent as i64, name.as_ref()) else {
+        let Some(src_ino) = self.child_of(parent as i64, name.as_ref()).await else {
             return Err(libc::ENOENT.into());
         };
         let Some(src_attr) = self.stat_ino(src_ino.0).await else {
@@ -615,33 +604,21 @@ where
         // 目标存在性检查
         if self
             .child_of(new_parent as i64, new_name.as_ref())
+            .await
             .is_some()
         {
             return Err(libc::EEXIST.into());
         }
 
-        // 拼接路径并执行
-        let Some(mut oldp) = self.path_of(parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if oldp != "/" {
-            oldp.push('/');
-        }
-        oldp.push_str(&name);
-        let Some(mut newp) = self.path_of(new_parent as i64) else {
-            return Err(libc::ENOENT.into());
-        };
-        if newp != "/" {
-            newp.push('/');
-        }
-        newp.push_str(&new_name);
-        self.rename_file(&oldp, &newp).await.map_err(|e| {
-            let code = match e {
-                VfsError::AlreadyExists(_) => libc::EEXIST,
-                _ => libc::EIO,
-            };
-            code.into()
-        })
+        // 直接使用 inode 执行重命名
+        self.rename_ino(
+            parent as i64,
+            &name,
+            new_parent as i64,
+            &new_name,
+        )
+        .await
+        .map_err(|_| libc::EIO.into())
     }
 
     // ===== 资源释放与同步：无状态实现，直接成功返回 =====

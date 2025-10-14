@@ -1,14 +1,16 @@
 //! FUSE/SDK 友好的简化 VFS：基于路径的 create/mkdir/read/write/readdir/stat。
+//!
+//! 重构后的 VFS 不再维护内存 Namespace，而是直接使用 MetaClient 的缓存能力。
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::reader::ChunkReader;
 use crate::chuck::store::BlockStore;
 use crate::chuck::util::{ChunkSpan, split_file_range_into_chunks};
 use crate::chuck::writer::ChunkWriter;
+use crate::meta::client::MetaClient;
 use crate::meta::MetaStore;
 use crate::meta::entities::content_meta::EntryType;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileType {
@@ -82,210 +84,89 @@ impl From<String> for VfsError {
 /// Result type for VFS operations
 pub type VFSResult<T> = Result<T, VfsError>;
 
-/// In-memory namespace node for path resolution
+/// VFS: Virtual File System layer
 ///
-/// VNode maintains the directory tree structure in memory, caching the
-/// parent-child relationships. The actual metadata (size, timestamps, etc.)
-/// is stored in MetaStore.
-struct VNode {
-    /// Node type: file or directory
-    kind: FileType,
-    /// Base name of this node (not full path)
-    name: String,
-    /// Parent inode (None only for root)
-    parent: Option<Inode>,
-    /// Directory children: name -> inode (empty for files)
-    children: HashMap<String, Inode>,
-}
-
-impl VNode {
-    fn dir(name: String, parent: Option<Inode>) -> Self {
-        Self {
-            kind: FileType::Dir,
-            name,
-            parent,
-            children: HashMap::new(),
-        }
-    }
-
-    fn file(name: String, parent: Option<Inode>) -> Self {
-        Self {
-            kind: FileType::File,
-            name,
-            parent,
-            children: HashMap::new(),
-        }
-    }
-}
-
-/// In-memory namespace for path-to-inode mapping
+/// 重构后的 VFS 不再维护内存目录树（Namespace），而是直接使用 MetaClient。
+/// MetaClient 内部有多级缓存（attr、dentry、path），性能不会下降。
 ///
-/// Namespace caches the directory structure to enable efficient path
-/// lookups without querying MetaStore for every path component.
-struct Namespace {
-    /// inode -> VNode mapping
-    nodes: HashMap<Inode, VNode>,
-    /// Canonical path -> inode mapping (for fast path lookup)
-    lookup: HashMap<String, Inode>,
-}
-
-impl Namespace {
-    fn new(root: Inode) -> Self {
-        let mut nodes = HashMap::new();
-        let mut lookup = HashMap::new();
-
-        nodes.insert(root, VNode::dir("".into(), None));
-        lookup.insert("/".into(), root);
-
-        Self { nodes, lookup }
-    }
-
-    /// Insert a node and update path lookup
-    fn insert_node(&mut self, ino: Inode, node: VNode, path: &str) {
-        self.nodes.insert(ino, node);
-        self.lookup.insert(path.to_string(), ino);
-    }
-
-    /// Remove a node and its path lookup
-    fn remove_node(&mut self, ino: Inode, path: &str) {
-        self.nodes.remove(&ino);
-        self.lookup.remove(path);
-    }
-
-    /// Build absolute path for an inode
-    fn build_path(&self, ino: Inode, root: Inode) -> Option<String> {
-        if ino == root {
-            return Some("/".into());
-        }
-
-        let mut parts = Vec::new();
-        let mut cur = ino;
-
-        loop {
-            let node = self.nodes.get(&cur)?;
-            if node.parent.is_none() {
-                break;
-            }
-            parts.push(node.name.clone());
-            cur = node.parent?;
-        }
-
-        if parts.is_empty() {
-            return Some("/".into());
-        }
-
-        parts.reverse();
-        Some(format!("/{}", parts.join("/")))
-    }
-}
-
-pub struct VFS<S: BlockStore, M: MetaStore> {
+/// 优势：
+/// - 简化代码：移除 500+ 行的 Namespace 管理代码
+/// - 统一缓存：所有元数据访问都经过 MetaClient 的缓存
+/// - 一致性强：不需要同步内存状态和持久化状态
+pub struct VFS<S: BlockStore> {
     /// Chunk layout configuration
     layout: ChunkLayout,
     /// Block storage for chunk data
     store: tokio::sync::Mutex<S>,
-    /// Metadata store
-    meta: M,
+    /// Metadata client (with caching)
+    meta: MetaClient,
     /// Base offset for chunk ID calculation
     base: i64,
-    /// In-memory namespace cache
-    ns: Mutex<Namespace>,
     /// Root inode
     root: Inode,
 }
 
-impl<S: BlockStore, M: MetaStore> VFS<S, M> {
-    /// This will initialize the metadata store and load the directory tree
-    /// from persistent storage into the in-memory namespace cache.
-    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> VFSResult<Self> {
-        // Initialize metadata store
-        meta.initialize().await?;
+impl<S: BlockStore> VFS<S> {
+    /// Create a new VFS instance
+    ///
+    /// 重构后的版本不再加载整个目录树到内存，而是依赖 MetaClient 的缓存。
+    pub async fn new<M: MetaStore + 'static>(
+        layout: ChunkLayout,
+        store: S,
+        meta: M,
+    ) -> VFSResult<Self> {
+        // Wrap MetaStore in MetaClient for caching
+        let meta_client = MetaClient::new(Arc::new(meta));
 
-        let root = meta.root_ino();
-        let ns = Namespace::new(root);
+        Self::with_meta_client(layout, store, meta_client).await
+    }
 
-        // Chunk ID base offset to avoid conflicts
+    /// Create VFS with custom MetaClient (for advanced caching configuration)
+    pub async fn with_meta_client(
+        layout: ChunkLayout,
+        store: S,
+        meta_client: MetaClient,
+    ) -> VFSResult<Self> {
+        meta_client.initialize().await?;
+        let root = meta_client.root_ino();
         let base = 1_000_000_000i64;
 
-        let VFS = Self {
+        Ok(Self {
             layout,
             store: tokio::sync::Mutex::new(store),
-            meta,
+            meta: meta_client,
             base,
-            ns: Mutex::new(ns),
             root,
-        };
-
-        // Load existing directory tree
-        VFS.load_tree_from_meta().await?;
-
-        Ok(VFS)
+        })
     }
 
-    /// Load directory tree from MetaStore into namespace cache
+    /// Resolve a path to an inode by walking through each component
     ///
-    /// This is called during VFS initialization to rebuild the in-memory
-    /// namespace from persistent storage.
-    async fn load_tree_from_meta(&self) -> VFSResult<()> {
-        let mut queue = vec![("/".to_string(), self.root)];
-
-        while let Some((path, ino)) = queue.pop() {
-            let entries = self.meta.readdir(ino).await?;
-
-            let mut ns = self.ns.lock().unwrap();
-
-            // Ensure parent node exists
-            if !ns.nodes.contains_key(&ino) {
-                ns.nodes.insert(ino, VNode::dir("".to_string(), None));
-            }
-
-            // Update parent's children map
-            if let Some(parent) = ns.nodes.get_mut(&ino) {
-                parent.children.clear();
-                for entry in &entries {
-                    parent.children.insert(entry.name.clone(), Inode(entry.ino));
-                }
-            }
-
-            // Insert child nodes and queue directories
-            for entry in entries {
-                let child_ino = Inode(entry.ino);
-                let child_path = if path == "/" {
-                    format!("/{}", entry.name)
-                } else {
-                    format!("{}/{}", path, entry.name)
-                };
-
-                let node = match entry.kind {
-                    FileType::Dir => VNode::dir(entry.name.clone(), Some(ino)),
-                    FileType::File => VNode::file(entry.name.clone(), Some(ino)),
-                };
-
-                ns.insert_node(child_ino, node, &child_path);
-
-                // Queue directories for recursive loading
-                if entry.kind == FileType::Dir {
-                    queue.push((child_path, child_ino));
-                }
-            }
+    /// 使用 MetaClient 的 lookup 方法逐级解析路径，会自动利用 dentry 缓存。
+    async fn resolve_path(&self, path: &str) -> VFSResult<Inode> {
+        if path == "/" {
+            return Ok(self.root);
         }
 
-        Ok(())
-    }
+        let mut current_ino = self.root;
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
 
-    /// Resolve a path to an inode
-    ///
-    /// Returns None if the path doesn't exist or is invalid.
-    fn resolve_path(&self, path: &str) -> Option<Inode> {
-        let ns = self.ns.lock().unwrap();
-        ns.lookup.get(path).copied()
+        for part in parts {
+            // Use MetaClient.lookup which has caching
+            current_ino = self.meta
+                .lookup(current_ino, part)
+                .await
+                .map_err(|e| VfsError::PathNotFound(format!("{}: {}", path, e)))?;
+        }
+
+        Ok(current_ino)
     }
 
     /// Parse path into (parent_path, parent_inode, basename)
     ///
     /// For "/foo/bar", returns ("/foo", parent_ino, "bar")
     /// For "/foo", returns ("/", root_ino, "foo")
-    fn parse_path(&self, path: &str) -> VFSResult<(String, Inode, String)> {
+    async fn parse_path(&self, path: &str) -> VFSResult<(String, Inode, String)> {
         if path.is_empty() || !path.starts_with('/') {
             return Err(VfsError::InvalidPath(path.to_string()));
         }
@@ -310,7 +191,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
 
         let parent_ino = self
             .resolve_path(&parent_path)
-            .ok_or_else(|| VfsError::PathNotFound(parent_path.clone()))?;
+            .await?;
 
         Ok((parent_path, parent_ino, basename))
     }
@@ -384,11 +265,11 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     // ========================================================================
 
     /// Get child inode by parent inode and name
-    pub fn child_of(&self, parent: i64, name: &str) -> Option<Inode> {
+    ///
+    /// 重构后直接使用 MetaClient.lookup，利用其 dentry 缓存
+    pub async fn child_of(&self, parent: i64, name: &str) -> Option<Inode> {
         let parent_ino = Inode(parent);
-        let ns = self.ns.lock().unwrap();
-        let parent_node = ns.nodes.get(&parent_ino)?;
-        parent_node.children.get(name).copied()
+        self.meta.lookup(parent_ino, name).await.ok()
     }
 
     /// Get file attributes by inode (async version for FUSE)
@@ -440,19 +321,21 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         Ok(written)
     }
 
-    /// Get absolute path for an inode
-    pub fn path_of(&self, ino: i64) -> Option<String> {
-        let inode = Inode(ino);
-        let ns = self.ns.lock().unwrap();
-        ns.build_path(inode, self.root)
+    /// Get absolute path for an inode (REMOVED - use path tracking in caller)
+    ///
+    /// 注意：重构后移除了内存 Namespace，此方法已不可用。
+    /// 如果需要路径信息，请在调用方维护路径状态。
+    #[deprecated(note = "Path tracking removed from VFS. Track paths in FUSE layer.")]
+    pub fn path_of(&self, _ino: i64) -> Option<String> {
+        None
     }
 
-    /// Get parent inode
-    pub fn parent_of(&self, ino: i64) -> Option<i64> {
-        let inode = Inode(ino);
-        let ns = self.ns.lock().unwrap();
-        let node = ns.nodes.get(&inode)?;
-        Some(node.parent.unwrap_or(self.root).0)
+    /// Get parent inode (DEPRECATED - use getattr to get parent info if needed)
+    ///
+    /// 注意：重构后移除了内存 Namespace，此方法不再高效。
+    #[deprecated(note = "Use metadata store methods instead.")]
+    pub fn parent_of(&self, _ino: i64) -> Option<i64> {
+        None
     }
 
     /// Get root inode value
@@ -506,15 +389,6 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         gid: u32,
     ) -> Result<i64, VfsError> {
         let parent_ino = Inode(parent);
-        let parent_path = self
-            .path_of(parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent)))?;
-
-        let full_path = if parent_path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
 
         let mut params =
             crate::meta::types::CreateParams::dir(parent_ino, name.to_string(), uid, gid);
@@ -522,17 +396,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
 
         let (ino, _attr) = self.meta.create(params).await?;
 
-        // Update namespace
-        {
-            let mut ns = self.ns.lock().unwrap();
-            let node = VNode::dir(name.to_string(), Some(parent_ino));
-            ns.insert_node(ino, node, &full_path);
-
-            // Update parent's children
-            if let Some(parent) = ns.nodes.get_mut(&parent_ino) {
-                parent.children.insert(name.to_string(), ino);
-            }
-        }
+        // No need to update namespace - MetaClient caching handles everything
 
         Ok(ino.0)
     }
@@ -547,15 +411,6 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         gid: u32,
     ) -> Result<i64, VfsError> {
         let parent_ino = Inode(parent);
-        let parent_path = self
-            .path_of(parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent)))?;
-
-        let full_path = if parent_path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
 
         let mut params =
             crate::meta::types::CreateParams::file(parent_ino, name.to_string(), uid, gid);
@@ -563,17 +418,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
 
         let (ino, _attr) = self.meta.create(params).await?;
 
-        // Update namespace
-        {
-            let mut ns = self.ns.lock().unwrap();
-            let node = VNode::file(name.to_string(), Some(parent_ino));
-            ns.insert_node(ino, node, &full_path);
-
-            // Update parent's children
-            if let Some(parent) = ns.nodes.get_mut(&parent_ino) {
-                parent.children.insert(name.to_string(), ino);
-            }
-        }
+        // No need to update namespace - MetaClient caching handles everything
 
         Ok(ino.0)
     }
@@ -581,32 +426,9 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Delete file by parent inode and name
     pub async fn unlink_ino(&self, parent: i64, name: &str) -> Result<(), VfsError> {
         let parent_ino = Inode(parent);
-        let parent_path = self
-            .path_of(parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent)))?;
-
-        let full_path = if parent_path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-
-        let ino = self
-            .resolve_path(&full_path)
-            .ok_or_else(|| VfsError::PathNotFound(full_path.clone()))?;
-
         self.meta.unlink(parent_ino, name).await?;
 
-        // Update namespace
-        {
-            let mut ns = self.ns.lock().unwrap();
-            ns.remove_node(ino, &full_path);
-
-            // Update parent's children
-            if let Some(parent) = ns.nodes.get_mut(&parent_ino) {
-                parent.children.remove(name);
-            }
-        }
+        // No need to update namespace - MetaClient cache invalidation handles it
 
         Ok(())
     }
@@ -614,32 +436,9 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Delete directory by parent inode and name
     pub async fn rmdir_ino(&self, parent: i64, name: &str) -> Result<(), VfsError> {
         let parent_ino = Inode(parent);
-        let parent_path = self
-            .path_of(parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", parent)))?;
-
-        let full_path = if parent_path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-
-        let ino = self
-            .resolve_path(&full_path)
-            .ok_or_else(|| VfsError::PathNotFound(full_path.clone()))?;
-
         self.meta.rmdir(parent_ino, name).await?;
 
-        // Update namespace
-        {
-            let mut ns = self.ns.lock().unwrap();
-            ns.remove_node(ino, &full_path);
-
-            // Update parent's children
-            if let Some(parent) = ns.nodes.get_mut(&parent_ino) {
-                parent.children.remove(name);
-            }
-        }
+        // No need to update namespace - MetaClient cache invalidation handles it
 
         Ok(())
     }
@@ -655,28 +454,6 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         let old_parent_ino = Inode(old_parent);
         let new_parent_ino = Inode(new_parent);
 
-        let old_parent_path = self
-            .path_of(old_parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", old_parent)))?;
-        let old_path = if old_parent_path == "/" {
-            format!("/{}", old_name)
-        } else {
-            format!("{}/{}", old_parent_path, old_name)
-        };
-
-        let new_parent_path = self
-            .path_of(new_parent)
-            .ok_or_else(|| VfsError::PathNotFound(format!("inode {}", new_parent)))?;
-        let new_path = if new_parent_path == "/" {
-            format!("/{}", new_name)
-        } else {
-            format!("{}/{}", new_parent_path, new_name)
-        };
-
-        let ino = self
-            .resolve_path(&old_path)
-            .ok_or_else(|| VfsError::PathNotFound(old_path.clone()))?;
-
         self.meta
             .rename(
                 old_parent_ino,
@@ -686,58 +463,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
             )
             .await?;
 
-        // Update namespace - need to recursively update all child paths
-        {
-            let mut ns = self.ns.lock().unwrap();
-
-            // Collect all descendants to update their paths
-            let mut to_update = vec![(ino, old_path.clone(), new_path.clone())];
-            let mut i = 0;
-
-            while i < to_update.len() {
-                let (current_ino, old_p, new_p) = to_update[i].clone();
-
-                // Find children of current node
-                if let Some(node) = ns.nodes.get(&current_ino) {
-                    for (child_name, &child_ino) in &node.children {
-                        let child_old_path = if old_p == "/" {
-                            format!("/{}", child_name)
-                        } else {
-                            format!("{}/{}", old_p, child_name)
-                        };
-                        let child_new_path = if new_p == "/" {
-                            format!("/{}", child_name)
-                        } else {
-                            format!("{}/{}", new_p, child_name)
-                        };
-                        to_update.push((child_ino, child_old_path, child_new_path));
-                    }
-                }
-                i += 1;
-            }
-
-            // Now update all paths in reverse order (children first)
-            for (update_ino, old_p, new_p) in to_update.iter().rev() {
-                ns.lookup.remove(old_p);
-                ns.lookup.insert(new_p.clone(), *update_ino);
-            }
-
-            // Update node parent and name for the renamed item
-            if let Some(node) = ns.nodes.get_mut(&ino) {
-                node.name = new_name.to_string();
-                node.parent = Some(new_parent_ino);
-            }
-
-            // Update old parent's children
-            if let Some(parent) = ns.nodes.get_mut(&old_parent_ino) {
-                parent.children.remove(old_name);
-            }
-
-            // Update new parent's children
-            if let Some(parent) = ns.nodes.get_mut(&new_parent_ino) {
-                parent.children.insert(new_name.to_string(), ino);
-            }
-        }
+        // No need to update namespace - MetaClient cache invalidation handles everything
 
         Ok(())
     }
@@ -761,7 +487,9 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         if &path == "/" {
             return Ok(self.root.0);
         }
-        if let Some(ino) = self.resolve_path(&path) {
+        
+        // Try to resolve the full path first
+        if let Ok(ino) = self.resolve_path(&path).await {
             return Ok(ino.0);
         }
 
@@ -778,7 +506,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
             }
             cur_path.push_str(part);
 
-            if let Some(ino) = self.resolve_path(&cur_path) {
+            if let Ok(ino) = self.resolve_path(&cur_path).await {
                 // Verify it's a directory
                 if let Ok(attr) = self.getattr(ino.0).await {
                     if attr.kind != FileType::Dir {
@@ -811,7 +539,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
         }
 
         // Check if file already exists
-        if let Some(child_ino) = self.child_of(dir_ino, &name) {
+        if let Some(child_ino) = self.child_of(dir_ino, &name).await {
             if let Ok(attr) = self.getattr(child_ino.0).await {
                 return if attr.kind == FileType::Dir {
                     Err(VfsError::NotFile(path.clone()))
@@ -829,120 +557,46 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Get file attributes by path
     pub async fn stat(&self, path: &str) -> Option<crate::meta::store::FileAttr> {
         let path = Self::norm_path(path);
-        let ino = self.resolve_path(&path)?;
+        let ino = self.resolve_path(&path).await.ok()?;
         self.getattr(ino.0).await.ok()
     }
 
     /// List directory by path
     pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         let path = Self::norm_path(path);
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound(path.clone()))?;
+        let ino = self.resolve_path(&path).await?;
 
         // Check if it's a directory
-        {
-            let ns = self.ns.lock().unwrap();
-            if let Some(vnode) = ns.nodes.get(&ino) {
-                if vnode.kind != FileType::Dir {
-                    return Err(VfsError::NotDirectory(path.clone()));
-                }
-
-                // If children already loaded in namespace, use them
-                if !vnode.children.is_empty() {
-                    let mut entries = Vec::new();
-                    for (name, &child_ino) in &vnode.children {
-                        if let Some(child_node) = ns.nodes.get(&child_ino) {
-                            entries.push(DirEntry {
-                                name: name.clone(),
-                                ino: child_ino.0,
-                                kind: child_node.kind,
-                            });
-                        }
-                    }
-                    return Ok(entries);
-                }
-            }
+        let attr = self.meta.getattr(ino).await?;
+        if attr.kind != FileType::Dir {
+            return Err(VfsError::NotDirectory(path.clone()));
         }
 
-        // Load from meta store
+        // Load from meta store (uses MetaClient's cache)
         let meta_entries = self.meta.readdir(ino).await?;
-
-        // Update namespace
-        {
-            let mut ns = self.ns.lock().unwrap();
-
-            if let Some(vnode) = ns.nodes.get_mut(&ino) {
-                vnode.children.clear();
-
-                for entry in &meta_entries {
-                    vnode.children.insert(entry.name.clone(), Inode(entry.ino));
-                }
-            }
-
-            for entry in &meta_entries {
-                let child_path = if path == "/" {
-                    format!("/{}", entry.name)
-                } else {
-                    format!("{}/{}", path, entry.name)
-                };
-
-                let kind = entry.kind;
-
-                ns.nodes.insert(
-                    Inode(entry.ino),
-                    match kind {
-                        FileType::Dir => VNode::dir(entry.name.clone(), Some(ino)),
-                        FileType::File => VNode::file(entry.name.clone(), Some(ino)),
-                    },
-                );
-                ns.lookup.insert(child_path, Inode(entry.ino));
-            }
-        }
 
         Ok(meta_entries)
     }
 
     /// Check if path exists
-    pub fn exists(&self, path: &str) -> bool {
+    pub async fn exists(&self, path: &str) -> bool {
         let path = Self::norm_path(path);
-        self.ns.lock().unwrap().lookup.contains_key(&path)
+        self.resolve_path(&path).await.is_ok()
     }
 
     /// Delete file by path
     pub async fn unlink(&self, path: &str) -> Result<(), VfsError> {
         let path = Self::norm_path(path);
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let (parent_path, parent_ino, name) = self.parse_path(&path).await?;
 
-        let (parent, kind) = {
-            let ns = self.ns.lock().unwrap();
-            let vnode = ns
-                .nodes
-                .get(&ino)
-                .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
-            (
-                vnode
-                    .parent
-                    .ok_or_else(|| VfsError::Operation("orphan".to_string()))?,
-                vnode.kind,
-            )
-        };
-
-        if kind != FileType::File {
+        // Verify it's a file
+        let ino = self.resolve_path(&path).await?;
+        let attr = self.meta.getattr(ino).await?;
+        if attr.kind != FileType::File {
             return Err(VfsError::NotFile(path.clone()));
         }
 
-        let name = {
-            let ns = self.ns.lock().unwrap();
-            ns.nodes
-                .get(&ino)
-                .map(|v| v.name.clone())
-                .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?
-        };
-
-        self.unlink_ino(parent.0, &name).await?;
+        self.unlink_ino(parent_ino.0, &name).await?;
 
         Ok(())
     }
@@ -954,41 +608,22 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
             return Err(VfsError::Operation("cannot remove root".to_string()));
         }
 
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let (parent_path, parent_ino, name) = self.parse_path(&path).await?;
 
-        let (parent, kind, has_children) = {
-            let ns = self.ns.lock().unwrap();
-            let vnode = ns
-                .nodes
-                .get(&ino)
-                .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
-            (
-                vnode
-                    .parent
-                    .ok_or_else(|| VfsError::Operation("orphan".to_string()))?,
-                vnode.kind,
-                !vnode.children.is_empty(),
-            )
-        };
-
-        if kind != FileType::Dir {
+        // Verify it's a directory
+        let ino = self.resolve_path(&path).await?;
+        let attr = self.meta.getattr(ino).await?;
+        if attr.kind != FileType::Dir {
             return Err(VfsError::NotDirectory(path.clone()));
         }
-        if has_children {
+
+        // Check if empty
+        let entries = self.meta.readdir(ino).await?;
+        if !entries.is_empty() {
             return Err(VfsError::DirectoryNotEmpty(path.clone()));
         }
 
-        let name = {
-            let ns = self.ns.lock().unwrap();
-            ns.nodes
-                .get(&ino)
-                .map(|v| v.name.clone())
-                .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?
-        };
-
-        self.rmdir_ino(parent.0, &name).await?;
+        self.rmdir_ino(parent_ino.0, &name).await?;
 
         Ok(())
     }
@@ -997,41 +632,28 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     pub async fn rename_file(&self, old: &str, new: &str) -> Result<(), VfsError> {
         let old = Self::norm_path(old);
         let new = Self::norm_path(new);
-        let (new_dir, new_name) = Self::split_dir_file(&new);
 
-        if self.exists(&new) {
+        if self.exists(&new).await {
             return Err(VfsError::AlreadyExists(new.clone()));
         }
 
-        let ino = self
-            .resolve_path(&old)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let (new_dir, new_name) = Self::split_dir_file(&new);
 
-        // Create missing parent directories
+        // Verify old path exists and is a file
+        let ino = self.resolve_path(&old).await?;
+        let attr = self.meta.getattr(ino).await?;
+        if attr.kind != FileType::File {
+            return Err(VfsError::NotFile(old.clone()));
+        }
+
+        // Get old parent
+        let (_old_parent_path, old_parent_ino, old_name) = self.parse_path(&old).await?;
+
+        // Create missing parent directories for new path
         self.mkdir_p(&new_dir).await?;
-        let new_dir_ino = self
-            .resolve_path(&new_dir)
-            .ok_or_else(|| VfsError::PathNotFound("parent not found".to_string()))?;
+        let new_dir_ino = self.resolve_path(&new_dir).await?;
 
-        let (old_parent, old_name, kind) = {
-            let ns = self.ns.lock().unwrap();
-            let vnode = ns
-                .nodes
-                .get(&ino)
-                .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
-            if vnode.kind != FileType::File {
-                return Err(VfsError::NotFile(old.clone()));
-            }
-            (
-                vnode
-                    .parent
-                    .ok_or_else(|| VfsError::Operation("orphan".to_string()))?,
-                vnode.name.clone(),
-                vnode.kind,
-            )
-        };
-
-        self.rename_ino(old_parent.0, &old_name, new_dir_ino.0, &new_name)
+        self.rename_ino(old_parent_ino.0, &old_name, new_dir_ino.0, &new_name)
             .await?;
 
         Ok(())
@@ -1040,9 +662,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Truncate/extend file size by path
     pub async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
         let path = Self::norm_path(path);
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let ino = self.resolve_path(&path).await?;
 
         self.truncate_ino(ino.0, size).await
     }
@@ -1050,9 +670,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Write to file by path
     pub async fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
         let path = Self::norm_path(path);
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let ino = self.resolve_path(&path).await?;
 
         let spans: Vec<ChunkSpan> = split_file_range_into_chunks(self.layout, offset, data.len());
         let mut cursor = 0usize;
@@ -1078,9 +696,7 @@ impl<S: BlockStore, M: MetaStore> VFS<S, M> {
     /// Read from file by path
     pub async fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
         let path = Self::norm_path(path);
-        let ino = self
-            .resolve_path(&path)
-            .ok_or_else(|| VfsError::PathNotFound("not found".to_string()))?;
+        let ino = self.resolve_path(&path).await?;
         self.read_ino(ino.0, offset, len).await
     }
 }
@@ -1143,11 +759,11 @@ mod tests {
 
         fs.mkdir_p("/a/b").await.unwrap();
         fs.create_file("/a/b/t.txt").await.unwrap();
-        assert!(fs.exists("/a/b/t.txt"));
+        assert!(fs.exists("/a/b/t.txt").await);
 
         // rename file
         fs.rename_file("/a/b/t.txt", "/a/b/u.txt").await.unwrap();
-        assert!(!fs.exists("/a/b/t.txt") && fs.exists("/a/b/u.txt"));
+        assert!(!fs.exists("/a/b/t.txt").await && fs.exists("/a/b/u.txt").await);
 
         // truncate
         fs.truncate("/a/b/u.txt", layout.block_size as u64 * 2)
@@ -1158,9 +774,9 @@ mod tests {
 
         // unlink and rmdir
         fs.unlink("/a/b/u.txt").await.unwrap();
-        assert!(!fs.exists("/a/b/u.txt"));
+        assert!(!fs.exists("/a/b/u.txt").await);
         // dir empty then rmdir
         fs.rmdir("/a/b").await.unwrap();
-        assert!(!fs.exists("/a/b"));
+        assert!(!fs.exists("/a/b").await);
     }
 }

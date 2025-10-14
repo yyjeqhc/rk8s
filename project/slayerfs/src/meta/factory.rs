@@ -1,10 +1,12 @@
 //! Metadata store factory
 //!
-//! Creates appropriate MetaStore implementation based on configuration
+//! Creates appropriate MetaStore implementation and MetaClient based on configuration
 
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::meta::cache::CacheConfig;
+use crate::meta::client::MetaClient;
 use crate::meta::config::{Config, DatabaseType};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::etcd_store::EtcdMetaStore;
@@ -78,6 +80,41 @@ impl MetaStoreFactory {
     }
 }
 
+/// Factory for creating MetaClient instances
+pub struct MetaClientFactory;
+
+impl MetaClientFactory {
+    /// Create MetaClient from URL with default cache config
+    pub async fn create_from_url(url: &str) -> Result<MetaClient, MetaError> {
+        let store = MetaStoreFactory::create_from_url(url).await?;
+        Ok(MetaClient::new(store))
+    }
+
+    /// Create MetaClient from URL with custom cache config
+    pub async fn create_from_url_with_config(
+        url: &str,
+        cache_config: CacheConfig,
+    ) -> Result<MetaClient, MetaError> {
+        let store = MetaStoreFactory::create_from_url(url).await?;
+        Ok(MetaClient::with_config(store, cache_config))
+    }
+
+    /// Create MetaClient from config
+    pub async fn create_from_config(config: Config) -> Result<MetaClient, MetaError> {
+        let store = MetaStoreFactory::create_from_config(config).await?;
+        Ok(MetaClient::new(store))
+    }
+
+    /// Create MetaClient from config with custom cache config
+    pub async fn create_from_config_with_cache(
+        config: Config,
+        cache_config: CacheConfig,
+    ) -> Result<MetaClient, MetaError> {
+        let store = MetaStoreFactory::create_from_config(config).await?;
+        Ok(MetaClient::with_config(store, cache_config))
+    }
+}
+
 /// Convenience function to create MetaStore from path
 #[allow(dead_code)]
 pub async fn create_meta_store(backend_path: &Path) -> Result<Arc<dyn MetaStore>, MetaError> {
@@ -87,4 +124,17 @@ pub async fn create_meta_store(backend_path: &Path) -> Result<Arc<dyn MetaStore>
 /// Convenience function to create MetaStore from URL
 pub async fn create_meta_store_from_url(url: &str) -> Result<Arc<dyn MetaStore>, MetaError> {
     MetaStoreFactory::create_from_url(url).await
+}
+
+/// Convenience function to create MetaClient from URL
+pub async fn create_meta_client(url: &str) -> Result<MetaClient, MetaError> {
+    MetaClientFactory::create_from_url(url).await
+}
+
+/// Convenience function to create MetaClient from URL with custom cache config
+pub async fn create_meta_client_with_cache(
+    url: &str,
+    cache_config: CacheConfig,
+) -> Result<MetaClient, MetaError> {
+    MetaClientFactory::create_from_url_with_config(url, cache_config).await
 }

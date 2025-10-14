@@ -6469,6 +6469,7 @@ dependencies = [
  "hex",
  "libc",
  "log",
+ "lru",
  "md5",
  "moka",
  "rfuse3 0.0.3",
