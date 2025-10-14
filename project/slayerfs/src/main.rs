@@ -20,7 +20,7 @@ async fn main() {
         .init();
 
     tracing::info!("SlayerFS starting...");
-    
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("demo-localfs") => {

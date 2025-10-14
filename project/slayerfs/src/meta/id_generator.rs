@@ -6,8 +6,8 @@
 use crate::meta::store::MetaError;
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// ID generator trait for stateless inode allocation
 #[async_trait]
@@ -113,10 +113,7 @@ impl IdGenerator for SqliteIdGenerator {
         let count_sql = "SELECT COUNT(*) as cnt FROM inode_counter";
         let count = self
             .db
-            .query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                count_sql,
-            ))
+            .query_one(Statement::from_string(DatabaseBackend::Sqlite, count_sql))
             .await
             .map_err(MetaError::Database)?
             .ok_or_else(|| MetaError::Internal("Failed to query counter".to_string()))?;
@@ -129,10 +126,7 @@ impl IdGenerator for SqliteIdGenerator {
             // Insert initial row (id will be 1, but we'll skip to 2 for root)
             let insert_sql = "INSERT INTO inode_counter DEFAULT VALUES";
             self.db
-                .execute(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    insert_sql,
-                ))
+                .execute(Statement::from_string(DatabaseBackend::Sqlite, insert_sql))
                 .await
                 .map_err(MetaError::Database)?;
         }
@@ -145,10 +139,7 @@ impl IdGenerator for SqliteIdGenerator {
         let insert_sql = "INSERT INTO inode_counter DEFAULT VALUES";
         let result = self
             .db
-            .execute(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                insert_sql,
-            ))
+            .execute(Statement::from_string(DatabaseBackend::Sqlite, insert_sql))
             .await
             .map_err(MetaError::Database)?;
 
@@ -196,19 +187,15 @@ impl IdGenerator for EtcdIdGenerator {
         match client.get(self.key.clone(), None).await {
             Ok(resp) if resp.kvs().is_empty() => {
                 // Initialize with value 2 (1 is reserved for root)
-                client
-                    .put(self.key.clone(), "2", None)
-                    .await
-                    .map_err(|e| MetaError::Config(format!("Failed to initialize counter: {}", e)))?;
+                client.put(self.key.clone(), "2", None).await.map_err(|e| {
+                    MetaError::Config(format!("Failed to initialize counter: {}", e))
+                })?;
             }
             Ok(_) => {
                 // Already initialized
             }
             Err(e) => {
-                return Err(MetaError::Config(format!(
-                    "Failed to check counter: {}",
-                    e
-                )));
+                return Err(MetaError::Config(format!("Failed to check counter: {}", e)));
             }
         }
 
@@ -266,10 +253,7 @@ impl IdGenerator for EtcdIdGenerator {
                     }
                 }
                 Err(e) => {
-                    return Err(MetaError::Internal(format!(
-                        "Transaction failed: {}",
-                        e
-                    )));
+                    return Err(MetaError::Internal(format!("Transaction failed: {}", e)));
                 }
             }
         }

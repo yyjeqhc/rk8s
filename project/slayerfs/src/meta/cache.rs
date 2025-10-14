@@ -38,10 +38,10 @@ impl Default for CacheConfig {
             dentry_capacity: 10000,
             path_capacity: 5000,
             negative_capacity: 1000,
-            attr_ttl: Duration::from_secs(60),      // 1 minute
-            dentry_ttl: Duration::from_secs(60),    // 1 minute
-            path_ttl: Duration::from_secs(30),      // 30 seconds
-            negative_ttl: Duration::from_secs(5),   // 5 seconds
+            attr_ttl: Duration::from_secs(60),    // 1 minute
+            dentry_ttl: Duration::from_secs(60),  // 1 minute
+            path_ttl: Duration::from_secs(30),    // 30 seconds
+            negative_ttl: Duration::from_secs(5), // 5 seconds
         }
     }
 }
@@ -85,16 +85,16 @@ impl<T> CachedEntry<T> {
 /// Metadata cache with LRU eviction and TTL
 pub struct MetaCache {
     config: CacheConfig,
-    
+
     /// File attribute cache: Inode -> FileAttr
     attr_cache: Arc<Mutex<LruCache<Inode, CachedEntry<FileAttr>>>>,
-    
+
     /// Directory entry cache: (parent_inode, name) -> child_inode
     dentry_cache: Arc<Mutex<LruCache<(Inode, String), CachedEntry<Inode>>>>,
-    
+
     /// Path cache: path -> inode (for fast path resolution)
     path_cache: Arc<Mutex<LruCache<String, CachedEntry<Inode>>>>,
-    
+
     /// Negative cache: path or (parent, name) -> expiration time
     negative_cache: Arc<Mutex<LruCache<String, Instant>>>,
 }
@@ -123,7 +123,7 @@ impl MetaCache {
     /// Get cached file attributes
     pub fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
         let mut cache = self.attr_cache.lock().unwrap();
-        
+
         if let Some(entry) = cache.get(&ino) {
             if entry.is_valid(None) {
                 return Some(entry.value.clone());
@@ -132,14 +132,14 @@ impl MetaCache {
                 cache.pop(&ino);
             }
         }
-        
+
         None
     }
 
     /// Get cached attributes with version check
     pub fn get_attr_versioned(&self, ino: Inode, expected_version: u64) -> Option<FileAttr> {
         let mut cache = self.attr_cache.lock().unwrap();
-        
+
         if let Some(entry) = cache.get(&ino) {
             if entry.is_valid(Some(expected_version)) {
                 return Some(entry.value.clone());
@@ -147,7 +147,7 @@ impl MetaCache {
                 cache.pop(&ino);
             }
         }
-        
+
         None
     }
 
@@ -179,7 +179,7 @@ impl MetaCache {
     pub fn get_dentry(&self, parent: Inode, name: &str) -> Option<Inode> {
         let mut cache = self.dentry_cache.lock().unwrap();
         let key = (parent, name.to_string());
-        
+
         if let Some(entry) = cache.get(&key) {
             if entry.is_valid(None) {
                 return Some(entry.value);
@@ -187,7 +187,7 @@ impl MetaCache {
                 cache.pop(&key);
             }
         }
-        
+
         None
     }
 
@@ -202,14 +202,14 @@ impl MetaCache {
     /// Invalidate all entries in a directory
     pub fn invalidate_dir(&self, parent: Inode) {
         let mut cache = self.dentry_cache.lock().unwrap();
-        
+
         // Remove all entries with matching parent
         let keys_to_remove: Vec<_> = cache
             .iter()
             .filter(|((p, _), _)| *p == parent)
             .map(|(k, _)| k.clone())
             .collect();
-        
+
         for key in keys_to_remove {
             cache.pop(&key);
         }
@@ -228,7 +228,7 @@ impl MetaCache {
     pub fn get_path(&self, path: &str) -> Option<Inode> {
         let mut cache = self.path_cache.lock().unwrap();
         let key = path.to_string();
-        
+
         if let Some(entry) = cache.get(&key) {
             if entry.is_valid(None) {
                 return Some(entry.value);
@@ -236,7 +236,7 @@ impl MetaCache {
                 cache.pop(&key);
             }
         }
-        
+
         None
     }
 
@@ -257,13 +257,13 @@ impl MetaCache {
     /// Invalidate all paths starting with prefix
     pub fn invalidate_path_prefix(&self, prefix: &str) {
         let mut cache = self.path_cache.lock().unwrap();
-        
+
         let keys_to_remove: Vec<_> = cache
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, _)| k.clone())
             .collect();
-        
+
         for key in keys_to_remove {
             cache.pop(&key);
         }
@@ -274,7 +274,7 @@ impl MetaCache {
     /// Check if entry is in negative cache (known to not exist)
     pub fn is_negative(&self, key: &str) -> bool {
         let mut cache = self.negative_cache.lock().unwrap();
-        
+
         if let Some(&expire_at) = cache.get(&key.to_string()) {
             if Instant::now() < expire_at {
                 return true;
@@ -282,7 +282,7 @@ impl MetaCache {
                 cache.pop(&key.to_string());
             }
         }
-        
+
         false
     }
 
@@ -379,6 +379,9 @@ mod tests {
             mtime: 0,
             ctime: 0,
             nlink: 1,
+            blocks: 0,
+            blksize: 4096,
+            rdev: 0,
             version,
         }
     }

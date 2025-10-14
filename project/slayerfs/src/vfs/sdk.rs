@@ -9,10 +9,10 @@ use crate::cadapter::client::ObjectClient;
 use crate::cadapter::localfs::LocalFsBackend;
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::{BlockStore, ObjectBlockStore};
+use crate::meta::MetaStore;
 use crate::meta::config::{Config, DatabaseConfig, DatabaseType};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::store::DirEntry;
-use crate::meta::MetaStore;
 use crate::vfs::fs::{VFS, VfsError};
 use std::path::Path;
 use std::sync::Arc;
@@ -103,12 +103,18 @@ impl LocalClient {
         let client = ObjectClient::new(LocalFsBackend::new(root));
         let store = ObjectBlockStore::new(client);
 
+        use crate::meta::config::{DatabaseConfig, DatabaseType, MetadataBackend, MetadataConfig};
         let config = Config {
-            database: DatabaseConfig {
-                db_config: DatabaseType::Sqlite {
-                    url: "sqlite::memory:".to_string(),
+            metadata: MetadataConfig {
+                backend: MetadataBackend::Database {
+                    config: DatabaseConfig {
+                        db_config: DatabaseType::Sqlite {
+                            url: "sqlite::memory:".to_string(),
+                        },
+                    },
                 },
             },
+            ..Default::default()
         };
         let meta = DatabaseMetaStore::from_config(config)
             .await

@@ -53,12 +53,16 @@ impl EtcdMetaStore {
         info!("Backend path: {}", backend_path.display());
 
         let client = Self::create_client(&_config).await?;
-        
+
         // Create ID generator
         let id_gen = Arc::new(EtcdIdGenerator::new(client.clone()));
         id_gen.initialize().await?;
-        
-        let store = Self { client, _config, id_gen };
+
+        let store = Self {
+            client,
+            _config,
+            id_gen,
+        };
         store.init_root_directory().await?;
 
         info!("EtcdMetaStore initialized successfully");
@@ -70,12 +74,16 @@ impl EtcdMetaStore {
         info!("Initializing EtcdMetaStore from config");
 
         let client = Self::create_client(&_config).await?;
-        
+
         // Create ID generator
         let id_gen = Arc::new(EtcdIdGenerator::new(client.clone()));
         id_gen.initialize().await?;
-        
-        let store = Self { client, _config, id_gen };
+
+        let store = Self {
+            client,
+            _config,
+            id_gen,
+        };
         store.init_root_directory().await?;
 
         info!("EtcdMetaStore initialized successfully");
@@ -84,7 +92,11 @@ impl EtcdMetaStore {
 
     /// Create etcd client
     async fn create_client(config: &Config) -> Result<EtcdClient, MetaError> {
-        match &config.database.db_config {
+        let db_config = config
+            .database()
+            .ok_or_else(|| MetaError::Config("Database backend not configured".to_string()))?;
+
+        match &db_config.db_config {
             DatabaseType::Etcd { urls } => {
                 info!("Connecting to Etcd cluster: {:?}", urls);
                 let client = EtcdClient::connect(urls, None)
@@ -476,6 +488,9 @@ impl MetaStore for EtcdMetaStore {
                 mtime: now,
                 ctime: now,
                 nlink: 2,
+                blocks: 8,
+                blksize: 4096,
+                rdev: 0,
                 version: 0,
             });
         }
@@ -505,6 +520,9 @@ impl MetaStore for EtcdMetaStore {
                     mtime: entry_info.modify_time,
                     ctime: entry_info.create_time,
                     nlink: entry_info.nlink as u32,
+                    blocks: (entry_info.size.unwrap_or(0) as u64 + 511) / 512,
+                    blksize: 4096,
+                    rdev: 0,
                     version,
                 })
             } else {
@@ -519,6 +537,9 @@ impl MetaStore for EtcdMetaStore {
                     mtime: entry_info.modify_time,
                     ctime: entry_info.create_time,
                     nlink: entry_info.nlink as u32,
+                    blocks: 8,
+                    blksize: 4096,
+                    rdev: 0,
                     version,
                 })
             }
@@ -703,6 +724,9 @@ impl MetaStore for EtcdMetaStore {
             mtime: now,
             ctime: now,
             nlink: if is_file { 1 } else { 2 },
+            blocks: if is_file { 0 } else { 8 },
+            blksize: 4096,
+            rdev: 0,
             version: 1, // Initial version
         };
 

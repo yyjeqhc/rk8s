@@ -7,7 +7,9 @@ use slayerfs::cadapter::client::ObjectClient;
 use slayerfs::cadapter::s3::{S3Backend, S3Config};
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
-use slayerfs::meta::config::{Config, DatabaseConfig, DatabaseType};
+use slayerfs::meta::config::{
+    Config, DatabaseConfig, DatabaseType, MetadataBackend, MetadataConfig,
+};
 use slayerfs::meta::database_store::DatabaseMetaStore;
 use slayerfs::vfs::fs::VFS;
 use slayerfs::vfs::sdk::Client;
@@ -55,11 +57,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create memory metadata store (for demo purposes)
     let config = Config {
-        database: DatabaseConfig {
-            db_config: DatabaseType::Sqlite {
-                url: "sqlite::memory:".to_string(),
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Database {
+                config: DatabaseConfig {
+                    db_config: DatabaseType::Sqlite {
+                        url: "sqlite::memory:".to_string(),
+                    },
+                },
             },
         },
+        cache: Default::default(),
+        logging: Default::default(),
+        storage: Default::default(),
     };
     let meta_store = DatabaseMetaStore::from_config(config)
         .await

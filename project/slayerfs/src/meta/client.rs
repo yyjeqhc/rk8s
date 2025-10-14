@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub struct MetaClient {
     /// Backend metadata store
     store: Arc<dyn MetaStore>,
-    
+
     /// Metadata cache
     cache: Arc<MetaCache>,
 }
@@ -177,7 +177,7 @@ impl MetaClient {
         // Update caches
         self.cache.put_attr(ino, attr.clone());
         self.cache.put_dentry(params.parent, &params.name, ino);
-        
+
         // Remove from negative cache if present
         let neg_key = format!("{}:{}", params.parent.0, params.name);
         self.cache.remove_negative(&neg_key);
@@ -389,9 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_meta_client_basic() {
-        let store = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap();
+        let store = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let client = MetaClient::new(store);
 
         client.initialize().await.unwrap();
@@ -416,9 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_meta_client_negative_cache() {
-        let store = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap();
+        let store = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let client = MetaClient::new(store);
 
         client.initialize().await.unwrap();
@@ -435,9 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_meta_client_resolve_path() {
-        let store = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap();
+        let store = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let client = MetaClient::new(store);
 
         client.initialize().await.unwrap();
@@ -462,4 +456,3 @@ mod tests {
         assert_eq!(resolved2, ino_c);
     }
 }
-

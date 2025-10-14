@@ -39,13 +39,16 @@ impl DatabaseMetaStore {
 
         info!("Initializing DatabaseMetaStore");
         info!("Backend path: {}", backend_path.display());
-        info!("Database type: {}", _config.database.db_type_str());
+        info!(
+            "Database type: {}",
+            _config.database().unwrap().db_type_str()
+        );
 
         let db = Self::create_connection(&_config).await?;
         Self::init_schema(&db).await?;
 
         // Create appropriate ID generator based on database type
-        let id_gen: Arc<dyn IdGenerator> = match &_config.database.db_config {
+        let id_gen: Arc<dyn IdGenerator> = match &_config.database().unwrap().db_config {
             DatabaseType::Sqlite { .. } => {
                 let generator = SqliteIdGenerator::new(db.clone());
                 generator.initialize().await?;
@@ -77,13 +80,16 @@ impl DatabaseMetaStore {
     /// Create from existing config
     pub async fn from_config(_config: Config) -> Result<Self, MetaError> {
         info!("Initializing DatabaseMetaStore from config");
-        info!("Database type: {}", _config.database.db_type_str());
+        info!(
+            "Database type: {}",
+            _config.database().unwrap().db_type_str()
+        );
 
         let db = Self::create_connection(&_config).await?;
         Self::init_schema(&db).await?;
 
         // Create appropriate ID generator based on database type
-        let id_gen: Arc<dyn IdGenerator> = match &_config.database.db_config {
+        let id_gen: Arc<dyn IdGenerator> = match &_config.database().unwrap().db_config {
             DatabaseType::Sqlite { .. } => {
                 let generator = SqliteIdGenerator::new(db.clone());
                 generator.initialize().await?;
@@ -114,22 +120,22 @@ impl DatabaseMetaStore {
 
     /// Create database connection
     async fn create_connection(config: &Config) -> Result<DatabaseConnection, MetaError> {
-        match &config.database.db_config {
+        match &config.database().unwrap().db_config {
             DatabaseType::Sqlite { url } => {
                 info!("Connecting to SQLite: {}", url);
-                
+
                 // For SQLite, use serialized access with proper settings
                 let mut opts = ConnectOptions::new(url.clone());
-                opts.max_connections(10)  // Allow multiple connections for better concurrency
+                opts.max_connections(10) // Allow multiple connections for better concurrency
                     .min_connections(2)
                     .connect_timeout(std::time::Duration::from_secs(30))
-                    .acquire_timeout(std::time::Duration::from_secs(60))  // Longer acquire timeout
+                    .acquire_timeout(std::time::Duration::from_secs(60)) // Longer acquire timeout
                     .idle_timeout(std::time::Duration::from_secs(600))
                     .max_lifetime(std::time::Duration::from_secs(1800))
-                    .sqlx_logging(false);  // Disable verbose logging
-                
+                    .sqlx_logging(false); // Disable verbose logging
+
                 let db = Database::connect(opts).await?;
-                
+
                 // Enable WAL mode for better concurrency
                 db.execute(Statement::from_string(
                     DatabaseBackend::Sqlite,
@@ -137,7 +143,7 @@ impl DatabaseMetaStore {
                 ))
                 .await
                 .map_err(MetaError::Database)?;
-                
+
                 // Set busy timeout to 10 seconds
                 db.execute(Statement::from_string(
                     DatabaseBackend::Sqlite,
@@ -145,7 +151,7 @@ impl DatabaseMetaStore {
                 ))
                 .await
                 .map_err(MetaError::Database)?;
-                
+
                 // Enable synchronous=NORMAL for better performance with WAL
                 db.execute(Statement::from_string(
                     DatabaseBackend::Sqlite,
@@ -153,7 +159,7 @@ impl DatabaseMetaStore {
                 ))
                 .await
                 .map_err(MetaError::Database)?;
-                
+
                 Ok(db)
             }
             DatabaseType::Postgres { url } => {
@@ -391,7 +397,12 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?
         {
             let permission = file.permission();
-            tracing::debug!(ino = ino.as_i64(), size = file.size, kind = "file", "getattr found file");
+            tracing::debug!(
+                ino = ino.as_i64(),
+                size = file.size,
+                kind = "file",
+                "getattr found file"
+            );
             return Ok(FileAttr {
                 ino: ino.as_i64(),
                 size: file.size as u64,
@@ -403,6 +414,9 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: file.modify_time,
                 ctime: file.create_time,
                 nlink: file.nlink as u32,
+                blocks: (file.size as u64 + 511) / 512,
+                blksize: 4096,
+                rdev: 0,
                 version: 0, // TODO: Implement versioning in database schema
             });
         }
@@ -414,7 +428,11 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?
         {
             let permission = dir.permission();
-            tracing::debug!(ino = ino.as_i64(), kind = "directory", "getattr found directory");
+            tracing::debug!(
+                ino = ino.as_i64(),
+                kind = "directory",
+                "getattr found directory"
+            );
             return Ok(FileAttr {
                 ino: ino.as_i64(),
                 size: 4096, // Directory size
@@ -426,6 +444,9 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: dir.modify_time,
                 ctime: dir.create_time,
                 nlink: dir.nlink as u32,
+                blocks: 8,
+                blksize: 4096,
+                rdev: 0,
                 version: 0, // TODO: Implement versioning in database schema
             });
         }
@@ -451,7 +472,7 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?;
 
         tracing::debug!(files_found = files.len(), "batch query: files");
-        
+
         for file in files {
             let permission = file.permission();
             let attr = FileAttr {
@@ -465,6 +486,9 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: file.modify_time,
                 ctime: file.create_time,
                 nlink: file.nlink as u32,
+                blocks: (file.size as u64 + 511) / 512,
+                blksize: 4096,
+                rdev: 0,
                 version: 0, // TODO: Implement versioning
             };
             results.push((Inode(file.inode), attr));
@@ -492,6 +516,9 @@ impl MetaStore for DatabaseMetaStore {
                 mtime: dir.modify_time,
                 ctime: dir.create_time,
                 nlink: dir.nlink as u32,
+                blocks: 8,
+                blksize: 4096,
+                rdev: 0,
                 version: 0, // TODO: Implement versioning
             };
             results.push((Inode(dir.inode), attr));
@@ -502,7 +529,6 @@ impl MetaStore for DatabaseMetaStore {
             found = results.len(),
             "getattr_batch completed"
         );
-
 
         Ok(results)
     }
@@ -543,8 +569,12 @@ impl MetaStore for DatabaseMetaStore {
             .await
             .map_err(MetaError::Database)?;
 
-        tracing::debug!(ino = ino.as_i64(), entries = contents.len(), "readdir: completed");
-        
+        tracing::debug!(
+            ino = ino.as_i64(),
+            entries = contents.len(),
+            "readdir: completed"
+        );
+
         let entries = contents
             .into_iter()
             .map(|c| DirEntry {

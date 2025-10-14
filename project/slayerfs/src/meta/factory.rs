@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use crate::meta::cache::CacheConfig;
 use crate::meta::client::MetaClient;
-use crate::meta::config::{Config, DatabaseType};
+use crate::meta::config::{Config, DatabaseType, MetadataBackend};
 use crate::meta::database_store::DatabaseMetaStore;
 use crate::meta::etcd_store::EtcdMetaStore;
+use crate::meta::remote::RemoteMetaStore;
 use crate::meta::store::{MetaError, MetaStore};
 
 /// Factory for creating MetaStore instances
@@ -26,13 +27,28 @@ impl MetaStoreFactory {
 
     /// Create MetaStore from config
     pub async fn create_from_config(config: Config) -> Result<Arc<dyn MetaStore>, MetaError> {
-        match &config.database.db_config {
-            DatabaseType::Sqlite { .. } | DatabaseType::Postgres { .. } => {
-                let store = DatabaseMetaStore::from_config(config).await?;
-                Ok(Arc::new(store))
-            }
-            DatabaseType::Etcd { .. } => {
-                let store = EtcdMetaStore::from_config(config).await?;
+        match &config.metadata.backend {
+            MetadataBackend::Database { config: db_config } => match &db_config.db_config {
+                DatabaseType::Sqlite { .. } | DatabaseType::Postgres { .. } => {
+                    let store = DatabaseMetaStore::from_config(config).await?;
+                    Ok(Arc::new(store))
+                }
+                DatabaseType::Etcd { .. } => {
+                    let store = EtcdMetaStore::from_config(config).await?;
+                    Ok(Arc::new(store))
+                }
+            },
+            MetadataBackend::Grpc {
+                endpoint,
+                timeout_secs,
+                ..
+            } => {
+                let timeout = if *timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(*timeout_secs))
+                } else {
+                    None
+                };
+                let store = RemoteMetaStore::new(endpoint, timeout).await?;
                 Ok(Arc::new(store))
             }
         }
@@ -46,7 +62,7 @@ impl MetaStoreFactory {
 
     /// Parse URL to config
     fn config_from_url(url: &str) -> Result<Config, MetaError> {
-        use crate::meta::config::{DatabaseConfig, DatabaseType};
+        use crate::meta::config::{DatabaseConfig, DatabaseType, MetadataBackend, MetadataConfig};
 
         let db_config = if url.starts_with("sqlite:") {
             DatabaseType::Sqlite {
@@ -75,7 +91,12 @@ impl MetaStoreFactory {
         };
 
         Ok(Config {
-            database: DatabaseConfig { db_config },
+            metadata: MetadataConfig {
+                backend: MetadataBackend::Database {
+                    config: DatabaseConfig { db_config },
+                },
+            },
+            ..Default::default()
         })
     }
 }

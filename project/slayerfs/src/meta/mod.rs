@@ -28,6 +28,8 @@ pub mod factory;
 pub mod id_generator;
 pub mod migrations;
 pub mod permission;
+pub mod remote;
+pub mod server;
 pub mod store;
 pub mod types;
 
@@ -35,4 +37,6 @@ pub mod types;
 pub use client::MetaClient;
 pub use factory::{create_meta_client, create_meta_store_from_url};
 pub use permission::Permission;
+pub use remote::RemoteMetaStore;
+pub use server::MetaServer;
 pub use store::MetaStore;

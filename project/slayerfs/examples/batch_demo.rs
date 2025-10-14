@@ -43,7 +43,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for i in 1..=100 {
         let path = format!("/test/file_{:03}.txt", i);
         fs.create_file(&path).await?;
-        fs.write(&path, 0, format!("Content of file {}\n", i).as_bytes()).await?;
+        fs.write(&path, 0, format!("Content of file {}\n", i).as_bytes())
+            .await?;
     }
     let create_time = start.elapsed();
     tracing::info!(duration_ms = ?create_time.as_millis(), "File creation completed");
@@ -83,7 +84,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!("File creation (100 files): {:?}", create_time);
     tracing::info!("Directory listing: {:?}", readdir_time);
     tracing::info!("First read pass: {:?}", first_read_time);
-    tracing::info!("Second read pass: {:?} (cache speedup: {:.2}x)", 
+    tracing::info!(
+        "Second read pass: {:?} (cache speedup: {:.2}x)",
         second_read_time,
         first_read_time.as_millis() as f64 / second_read_time.as_millis() as f64
     );

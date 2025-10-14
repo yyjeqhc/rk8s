@@ -7,8 +7,8 @@ use crate::chuck::reader::ChunkReader;
 use crate::chuck::store::BlockStore;
 use crate::chuck::util::{ChunkSpan, split_file_range_into_chunks};
 use crate::chuck::writer::ChunkWriter;
-use crate::meta::client::MetaClient;
 use crate::meta::MetaStore;
+use crate::meta::client::MetaClient;
 use crate::meta::entities::content_meta::EntryType;
 use std::sync::Arc;
 
@@ -149,11 +149,16 @@ impl<S: BlockStore> VFS<S> {
         }
 
         let mut current_ino = self.root;
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
 
         for part in parts {
             // Use MetaClient.lookup which has caching
-            current_ino = self.meta
+            current_ino = self
+                .meta
                 .lookup(current_ino, part)
                 .await
                 .map_err(|e| VfsError::PathNotFound(format!("{}: {}", path, e)))?;
@@ -189,9 +194,7 @@ impl<S: BlockStore> VFS<S> {
             )
         };
 
-        let parent_ino = self
-            .resolve_path(&parent_path)
-            .await?;
+        let parent_ino = self.resolve_path(&parent_path).await?;
 
         Ok((parent_path, parent_ino, basename))
     }
@@ -487,7 +490,7 @@ impl<S: BlockStore> VFS<S> {
         if &path == "/" {
             return Ok(self.root.0);
         }
-        
+
         // Try to resolve the full path first
         if let Ok(ino) = self.resolve_path(&path).await {
             return Ok(ino.0);

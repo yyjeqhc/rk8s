@@ -149,7 +149,7 @@ where
             tracing::warn!(parent = %parent, name = ?name, child = child_ino.0, "lookup: child inode not found");
             return Err(libc::ENOENT.into());
         };
-        
+
         tracing::debug!(parent = %parent, name = ?name, child = child_ino.0, "lookup: success");
         let attr = VFS_to_fuse_attr(&vattr, &req);
         // generation 暂置 0；ttl 设为 1s，可调
@@ -206,7 +206,7 @@ where
                 tracing::error!(ino = %ino, offset = %offset, size = %size, error = %e, "read: failed");
                 libc::EIO
             })?;
-        
+
         tracing::debug!(ino = %ino, offset = %offset, requested = %size, actual = data.len(), "read: success");
         Ok(ReplyData {
             data: Bytes::from(data),
@@ -232,7 +232,7 @@ where
                 tracing::error!(ino = %ino, offset = %offset, size = data.len(), error = %e, "write: failed");
                 libc::EIO
             })? as u32;
-        
+
         tracing::debug!(ino = %ino, offset = %offset, written = %n, "write: success");
         Ok(ReplyWrite { written: n })
     }
@@ -465,7 +465,8 @@ where
             return Err(libc::EEXIST.into());
         }
         // 直接通过 inode 创建目录
-        let _ino = self.mkdir_ino(parent as i64, &name, mode, req.uid, req.gid)
+        let _ino = self
+            .mkdir_ino(parent as i64, &name, mode, req.uid, req.gid)
             .await
             .map_err(|_| libc::EIO)?;
         let Some(vattr) = self.stat_ino(_ino).await else {
@@ -490,7 +491,7 @@ where
     ) -> FuseResult<ReplyCreated> {
         let name = name.to_string_lossy();
         log::debug!("FUSE create: parent={}, name={}", parent, name);
-        
+
         // 父检查
         let Some(pattr) = self.stat_ino(parent as i64).await else {
             log::debug!("FUSE create: parent not found");
@@ -500,10 +501,11 @@ where
             log::debug!("FUSE create: parent not a directory");
             return Err(libc::ENOTDIR.into());
         }
-        
+
         log::debug!("FUSE create: calling create_ino");
         // 直接通过 inode 创建文件
-        let ino = self.create_ino(parent as i64, &name, mode, req.uid, req.gid)
+        let ino = self
+            .create_ino(parent as i64, &name, mode, req.uid, req.gid)
             .await
             .map_err(|e| {
                 log::error!("FUSE create: create_ino failed: {:?}", e);
@@ -512,13 +514,13 @@ where
                     _ => libc::EIO,
                 }
             })?;
-        
+
         log::debug!("FUSE create: create_ino returned ino={}", ino);
         let Some(vattr) = self.stat_ino(ino).await else {
             log::debug!("FUSE create: stat_ino failed");
             return Err(libc::ENOENT.into());
         };
-        
+
         log::debug!("FUSE create: success, returning");
         let attr = VFS_to_fuse_attr(&vattr, &req);
         Ok(ReplyCreated {
@@ -631,14 +633,9 @@ where
         }
 
         // 直接使用 inode 执行重命名
-        self.rename_ino(
-            parent as i64,
-            &name,
-            new_parent as i64,
-            &new_name,
-        )
-        .await
-        .map_err(|_| libc::EIO.into())
+        self.rename_ino(parent as i64, &name, new_parent as i64, &new_name)
+            .await
+            .map_err(|_| libc::EIO.into())
     }
 
     // ===== 资源释放与同步：无状态实现，直接成功返回 =====

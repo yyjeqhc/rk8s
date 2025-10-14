@@ -26,7 +26,8 @@ impl MetaErrorExt for MetaError {
             MetaError::Database(_) | MetaError::Serialization(_) | MetaError::Internal(_) => {
                 libc::EIO
             }
-            MetaError::Config(_) => libc::EINVAL,
+            MetaError::Config(_) | MetaError::InvalidConfig(_) => libc::EINVAL,
+            MetaError::RpcError(_) | MetaError::ConnectionError(_) => libc::EIO,
         }
     }
 }

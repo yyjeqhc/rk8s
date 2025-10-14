@@ -33,15 +33,16 @@ fn process_config_for_backend(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let config: serde_yaml::Value = serde_yaml::from_str(config_content)?;
 
-    if let Some(database) = config.get("database") {
-        if let Some(db_type) = database.get("type").and_then(|t| t.as_str()) {
+    if let Some(metadata) = config.get("metadata") {
+        if let Some(db_type) = metadata.get("type").and_then(|t| t.as_str()) {
             match db_type {
                 "sqlite" => {
                     let db_path = meta_dir.join("metadata.db");
                     let sqlite_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
                     let processed_config = format!(
-                        r#"database:
+                        r#"metadata:
+  backend_type: database
   type: sqlite
   url: "{}"
 "#,

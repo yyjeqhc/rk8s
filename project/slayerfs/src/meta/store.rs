@@ -16,8 +16,50 @@ pub struct FileAttr {
     pub mtime: i64,
     pub ctime: i64,
     pub nlink: u32,
+    pub blocks: u64,
+    pub blksize: u32,
+    pub rdev: u32,
     /// Version number for optimistic locking (0 means versioning not supported)
     pub version: u64,
+}
+
+impl FileAttr {
+    /// Create a new FileAttr with default blocks/blksize/rdev values
+    pub fn new(
+        ino: i64,
+        size: u64,
+        kind: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        atime: i64,
+        mtime: i64,
+        ctime: i64,
+        nlink: u32,
+    ) -> Self {
+        let blocks = if kind == FileType::Dir {
+            8
+        } else {
+            (size + 511) / 512
+        };
+
+        Self {
+            ino,
+            size,
+            kind,
+            mode,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ctime,
+            nlink,
+            blocks,
+            blksize: 4096,
+            rdev: 0,
+            version: 0,
+        }
+    }
 }
 
 /// Directory entry
@@ -73,6 +115,15 @@ pub enum MetaError {
 
     #[error("Config error: {0}")]
     Config(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("RPC error: {0}")]
+    RpcError(String),
+
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
 }
 
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
