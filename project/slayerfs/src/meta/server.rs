@@ -3,14 +3,10 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, instrument};
 
 use crate::meta::MetaStore;
+use crate::meta::proto;
 use crate::meta::store::{DirEntry, FileAttr};
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 use crate::vfs::fs::FileType;
-
-// Generated proto code
-pub mod proto {
-    tonic::include_proto!("slayerfs.meta");
-}
 
 use proto::{
     DirEntry as ProtoDirEntry, FileAttr as ProtoFileAttr,

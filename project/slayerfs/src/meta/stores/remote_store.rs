@@ -4,11 +4,12 @@ use tonic::transport::{Channel, Uri};
 use tracing::{debug, error, instrument};
 
 use crate::meta::MetaStore;
+use crate::meta::proto;
 use crate::meta::store::{DirEntry, FileAttr, MetaError};
 use crate::meta::types::{CreateParams, Inode, SetAttrMask};
 use crate::vfs::fs::FileType;
 
-use super::server::proto::{
+use proto::{
     DirEntry as ProtoDirEntry, FileAttr as ProtoFileAttr, meta_service_client::MetaServiceClient, *,
 };
 

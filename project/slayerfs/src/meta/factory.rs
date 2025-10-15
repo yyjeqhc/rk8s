@@ -8,10 +8,8 @@ use std::sync::Arc;
 use crate::meta::cache::CacheConfig;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{Config, DatabaseType, MetadataBackend};
-use crate::meta::database_store::DatabaseMetaStore;
-use crate::meta::etcd_store::EtcdMetaStore;
-use crate::meta::remote::RemoteMetaStore;
 use crate::meta::store::{MetaError, MetaStore};
+use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RemoteMetaStore};
 
 /// Factory for creating MetaStore instances
 pub struct MetaStoreFactory;

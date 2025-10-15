@@ -10,7 +10,7 @@ use slayerfs::chuck::store::ObjectBlockStore;
 use slayerfs::meta::config::{
     Config, DatabaseConfig, DatabaseType, MetadataBackend, MetadataConfig,
 };
-use slayerfs::meta::database_store::DatabaseMetaStore;
+use slayerfs::meta::stores::DatabaseMetaStore;
 use slayerfs::vfs::fs::VFS;
 use slayerfs::vfs::sdk::Client;
 use std::error::Error;
