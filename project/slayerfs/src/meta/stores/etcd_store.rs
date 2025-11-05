@@ -7,7 +7,9 @@ use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
-use crate::meta::stores::etcd_txn_helper::{atomic_create_with_check, atomic_delete_with_check, atomic_rename, update_parent_children_cas};
+use crate::meta::stores::etcd_txn_helper::{
+    atomic_create_with_check, atomic_delete_with_check, atomic_rename, update_parent_children_cas,
+};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -349,8 +351,8 @@ impl EtcdMetaStore {
             (children_key, children_json),
         ];
 
-        let succeeded = atomic_create_with_check(&mut client, forward_key.clone(), operations)
-            .await?;
+        let succeeded =
+            atomic_create_with_check(&mut client, forward_key.clone(), operations).await?;
 
         if !succeeded {
             // Transaction failed - entry already exists
@@ -444,10 +446,13 @@ impl EtcdMetaStore {
             parent_inode, name, inode
         );
 
-        let operations = vec![(forward_key.clone(), forward_json), (reverse_key, reverse_json)];
+        let operations = vec![
+            (forward_key.clone(), forward_json),
+            (reverse_key, reverse_json),
+        ];
 
-        let succeeded = atomic_create_with_check(&mut client, forward_key.clone(), operations)
-            .await?;
+        let succeeded =
+            atomic_create_with_check(&mut client, forward_key.clone(), operations).await?;
 
         if !succeeded {
             // Transaction failed - entry already exists
@@ -1014,7 +1019,7 @@ impl MetaStore for EtcdMetaStore {
     async fn initialize(&self) -> Result<(), MetaError> {
         Ok(())
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

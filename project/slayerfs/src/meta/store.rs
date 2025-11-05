@@ -131,7 +131,7 @@ pub trait MetaStore: Send + Sync {
     fn root_ino(&self) -> i64;
 
     async fn initialize(&self) -> Result<(), MetaError>;
-    
+
     /// Allow downcasting to concrete types (needed for Watch Worker integration)
     fn as_any(&self) -> &dyn std::any::Any;
 }

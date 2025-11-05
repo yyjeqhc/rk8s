@@ -824,7 +824,7 @@ impl MetaStore for DatabaseMetaStore {
     async fn initialize(&self) -> Result<(), MetaError> {
         Ok(())
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

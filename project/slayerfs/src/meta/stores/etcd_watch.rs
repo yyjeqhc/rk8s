@@ -15,13 +15,13 @@ use tokio::task::JoinHandle;
 pub enum CacheInvalidationEvent {
     /// Invalidate specific inode cache
     InvalidateInode(i64),
-    
+
     /// Invalidate parent's children cache (due to create/delete)
     InvalidateParentChildren(i64),
-    
+
     /// Invalidate path cache with prefix
     InvalidatePathPrefix(String),
-    
+
     /// Full cache invalidation (for safety)
     InvalidateAll,
 }
@@ -31,10 +31,10 @@ pub enum CacheInvalidationEvent {
 pub struct WatchConfig {
     /// Watch key prefix (default: all metadata keys)
     pub key_prefix: String,
-    
+
     /// Buffer size for event channel
     pub event_buffer_size: usize,
-    
+
     /// Enable debug logging
     pub debug: bool,
 }
@@ -141,17 +141,15 @@ impl EtcdWatchWorker {
         loop {
             // Create watch stream with prefix
             let options = WatchOptions::new().with_prefix();
-            let (mut watcher, mut stream) = match client
-                .watch(config.key_prefix.clone(), Some(options))
-                .await
-            {
-                Ok((w, s)) => (w, s),
-                Err(e) => {
-                    error!("Failed to create watch stream: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
+            let (mut watcher, mut stream) =
+                match client.watch(config.key_prefix.clone(), Some(options)).await {
+                    Ok((w, s)) => (w, s),
+                    Err(e) => {
+                        error!("Failed to create watch stream: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
             info!("Watch stream established");
 
@@ -165,7 +163,9 @@ impl EtcdWatchWorker {
                         }
 
                         for event in resp.events() {
-                            if let Err(e) = Self::handle_watch_event(event, &event_tx, &config).await {
+                            if let Err(e) =
+                                Self::handle_watch_event(event, &event_tx, &config).await
+                            {
                                 error!("Failed to handle watch event: {}", e);
                             }
                         }
@@ -243,7 +243,7 @@ impl EtcdWatchWorker {
                 // Forward index: f:{parent}:{name}
                 if let Ok(parent_ino) = parts[1].parse::<i64>() {
                     events.push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
-                    
+
                     // Also invalidate path cache with parent inode
                     // Note: We don't have full path here, so invalidate all paths of this inode
                     // This will be handled by MetaClient using inode_to_paths

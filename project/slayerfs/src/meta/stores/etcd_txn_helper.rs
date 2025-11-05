@@ -1,13 +1,330 @@
-//! Etcd Transaction Helper
+//! Etcd Transaction Operations Implementation
 //!
-//! Provides helper functions for atomic operations using etcd transactions.
-//! Ensures consistency across multiple clients in distributed environment.
+//! Provides etcd-specific implementation of the TransactionOps trait.
+//! Uses etcd's MVCC (Multi-Version Concurrency Control) for atomic operations.
+//!
+//! ## Implementation Strategy
+//!
+//! - **Optimistic Locking**: Uses mod_revision for CAS (Compare-And-Swap)
+//! - **Automatic Retries**: Handles version conflicts with exponential backoff
+//! - **Atomic Transactions**: Leverages etcd's native transaction support
 
 use crate::meta::store::MetaError;
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp, TxnResponse};
+use crate::meta::stores::transaction::TransactionOps;
+use async_trait::async_trait;
+use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
 use log::{debug, warn};
-use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Etcd-based transaction operations implementation
+///
+/// This struct wraps an etcd client and provides atomic operations
+/// using etcd's native MVCC transaction support.
+pub struct EtcdTransactionOps {
+    client: Arc<Mutex<EtcdClient>>,
+}
+
+impl EtcdTransactionOps {
+    /// Create a new EtcdTransactionOps instance
+    pub fn new(client: Arc<Mutex<EtcdClient>>) -> Self {
+        Self { client }
+    }
+
+    /// Get a mutable reference to the underlying etcd client
+    pub async fn client(&self) -> tokio::sync::MutexGuard<'_, EtcdClient> {
+        self.client.lock().await
+    }
+}
+
+#[async_trait]
+impl TransactionOps for EtcdTransactionOps {
+    async fn update_parent_children_cas<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<(), MetaError>
+    where
+        F: Fn(&mut Vec<String>) + Send + 'static,
+    {
+        let mut client = self.client.lock().await;
+
+        for retry in 0..max_retries {
+            // Step 1: Read current value and mod_revision
+            let resp = client
+                .get(key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to get key for CAS: {}", e)))?;
+
+            let (mut children_set, mod_revision) = if let Some(kv) = resp.kvs().first() {
+                let children: crate::meta::entities::etcd::EtcdDirChildren =
+                    serde_json::from_slice(kv.value()).map_err(|e| {
+                        MetaError::Internal(format!("Failed to parse children: {}", e))
+                    })?;
+                // Convert HashSet to Vec for updater
+                let mut children_vec: Vec<String> = children.children.into_iter().collect();
+                (children_vec, kv.mod_revision())
+            } else {
+                // No existing entry - create new with revision 0
+                (Vec::new(), 0)
+            };
+
+            // Step 2: Apply update function
+            let old_size = children_set.len();
+            updater(&mut children_set);
+            let new_size = children_set.len();
+
+            debug!(
+                "CAS update children for {}: {} -> {} entries (retry {})",
+                key, old_size, new_size, retry
+            );
+
+            // Step 3: Prepare new value (convert Vec back to HashSet)
+            let children_hashset: HashSet<String> = children_set.into_iter().collect();
+
+            // Extract parent inode from key (format: "c:123")
+            let parent_ino = key
+                .strip_prefix("c:")
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    MetaError::Internal(format!("Invalid children key format: {}", key))
+                })?;
+
+            let new_children = crate::meta::entities::etcd::EtcdDirChildren {
+                inode: parent_ino,
+                children: children_hashset,
+            };
+            let new_json = serde_json::to_string(&new_children)
+                .map_err(|e| MetaError::Internal(format!("Failed to serialize children: {}", e)))?;
+
+            // Step 4: CAS transaction
+            let txn = if mod_revision == 0 {
+                Txn::new()
+                    .when([Compare::create_revision(key, CompareOp::Equal, 0)])
+                    .and_then([TxnOp::put(key, new_json, None)])
+            } else {
+                Txn::new()
+                    .when([Compare::mod_revision(key, CompareOp::Equal, mod_revision)])
+                    .and_then([TxnOp::put(key, new_json, None)])
+            };
+
+            let txn_resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("CAS transaction failed: {}", e)))?;
+
+            if txn_resp.succeeded() {
+                debug!("CAS update succeeded for {}", key);
+                return Ok(());
+            } else if retry < max_retries - 1 {
+                warn!("CAS conflict for {} (retry {}/{})", key, retry, max_retries);
+                continue;
+            } else {
+                return Err(MetaError::Internal(format!(
+                    "CAS max retries exceeded for {}",
+                    key
+                )));
+            }
+        }
+
+        Err(MetaError::Internal(
+            "CAS update failed: unreachable".to_string(),
+        ))
+    }
+
+    async fn atomic_create_with_check(
+        &self,
+        check_key: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.lock().await;
+
+        // Build transaction: check + puts
+        let mut txn = Txn::new().when([Compare::create_revision(check_key, CompareOp::Equal, 0)]);
+
+        let mut ops = Vec::new();
+        for (key, value) in entries {
+            ops.push(TxnOp::put(*key, *value, None));
+        }
+        txn = txn.and_then(ops);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic create transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic create succeeded for check_key: {}", check_key);
+            Ok(())
+        } else {
+            Err(MetaError::AlreadyExists {
+                parent: 0, // Will be filled by caller
+                name: check_key.to_string(),
+            })
+        }
+    }
+
+    async fn atomic_delete_with_check(
+        &self,
+        check_key: &str,
+        keys: &[&str],
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.lock().await;
+
+        // Build transaction: check + deletes
+        let mut txn =
+            Txn::new().when([Compare::create_revision(check_key, CompareOp::NotEqual, 0)]);
+
+        let mut ops = Vec::new();
+        for key in keys {
+            ops.push(TxnOp::delete(*key, None));
+        }
+        txn = txn.and_then(ops);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic delete transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic delete succeeded for check_key: {}", check_key);
+            Ok(())
+        } else {
+            Err(MetaError::NotFound(0)) // Will be filled by caller
+        }
+    }
+
+    async fn atomic_rename(
+        &self,
+        source_key: &str,
+        target_key: &str,
+        source_value: &str,
+        target_value: &str,
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.lock().await;
+
+        // Transaction: source exists AND target doesn't exist
+        let txn = Txn::new()
+            .when([
+                Compare::create_revision(source_key, CompareOp::NotEqual, 0),
+                Compare::create_revision(target_key, CompareOp::Equal, 0),
+            ])
+            .and_then([
+                TxnOp::put(target_key, target_value, None),
+                TxnOp::delete(source_key, None),
+            ]);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic rename transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic rename succeeded: {} -> {}", source_key, target_key);
+            Ok(())
+        } else {
+            // Check which condition failed
+            let source_resp = client
+                .get(source_key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to check source key: {}", e)))?;
+
+            if source_resp.kvs().is_empty() {
+                Err(MetaError::NotFound(0))
+            } else {
+                Err(MetaError::AlreadyExists {
+                    parent: 0,
+                    name: target_key.to_string(),
+                })
+            }
+        }
+    }
+
+    async fn cas_update<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<i64, MetaError>
+    where
+        F: Fn(&str, i64) -> Result<String, MetaError> + Send + 'static,
+    {
+        let mut client = self.client.lock().await;
+
+        for retry in 0..max_retries {
+            // Step 1: Read current value and version
+            let resp = client
+                .get(key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to get key for CAS: {}", e)))?;
+
+            let (current_value, mod_revision) = if let Some(kv) = resp.kvs().first() {
+                (
+                    String::from_utf8_lossy(kv.value()).to_string(),
+                    kv.mod_revision(),
+                )
+            } else {
+                return Err(MetaError::NotFound(0));
+            };
+
+            // Step 2: Apply updater function
+            let new_value = updater(&current_value, mod_revision)?;
+
+            // Step 3: CAS update
+            let txn = Txn::new()
+                .when([Compare::mod_revision(key, CompareOp::Equal, mod_revision)])
+                .and_then([TxnOp::put(key, new_value, None)]);
+
+            let txn_resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("CAS transaction failed: {}", e)))?;
+
+            if txn_resp.succeeded() {
+                // Get new version
+                let resp = client.get(key, None).await.map_err(|e| {
+                    MetaError::Internal(format!("Failed to get updated key: {}", e))
+                })?;
+
+                if let Some(kv) = resp.kvs().first() {
+                    debug!("CAS update succeeded for key: {}", key);
+                    return Ok(kv.mod_revision());
+                } else {
+                    return Err(MetaError::Internal(
+                        "Key disappeared after CAS update".to_string(),
+                    ));
+                }
+            } else if retry < max_retries - 1 {
+                warn!("CAS conflict for {} (retry {}/{})", key, retry, max_retries);
+                continue;
+            } else {
+                return Err(MetaError::Internal(format!(
+                    "CAS max retries exceeded for {}",
+                    key
+                )));
+            }
+        }
+
+        Err(MetaError::Internal(
+            "CAS update failed: unreachable".to_string(),
+        ))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "etcd"
+    }
+
+    fn supports_native_transactions(&self) -> bool {
+        true
+    }
+}
+
+// ============================================================================
+// Legacy helper functions (deprecated, kept for backward compatibility)
+// These will be removed in future versions - use EtcdTransactionOps instead
+// ============================================================================
 
 /// Helper for atomic parent children update with CAS (Compare-And-Swap)
 ///
@@ -38,15 +355,15 @@ where
 
     for retry in 0..max_retries {
         // Step 1: Read current value and mod_revision
-        let resp = client.get(key.clone(), None).await.map_err(|e| {
-            MetaError::Internal(format!("Failed to get children for CAS: {}", e))
-        })?;
+        let resp = client
+            .get(key.clone(), None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to get children for CAS: {}", e)))?;
 
         let (mut children_set, mod_revision) = if let Some(kv) = resp.kvs().first() {
             let children: crate::meta::entities::etcd::EtcdDirChildren =
-                serde_json::from_slice(kv.value()).map_err(|e| {
-                    MetaError::Internal(format!("Failed to parse children: {}", e))
-                })?;
+                serde_json::from_slice(kv.value())
+                    .map_err(|e| MetaError::Internal(format!("Failed to parse children: {}", e)))?;
             (children.children, kv.mod_revision())
         } else {
             // No existing entry - create new with revision 0
@@ -75,11 +392,7 @@ where
         let txn = if mod_revision == 0 {
             // First time creation - ensure key doesn't exist
             Txn::new()
-                .when([Compare::create_revision(
-                    key.clone(),
-                    CompareOp::Equal,
-                    0,
-                )])
+                .when([Compare::create_revision(key.clone(), CompareOp::Equal, 0)])
                 .and_then([TxnOp::put(key.clone(), new_json, None)])
         } else {
             // Update existing - ensure mod_revision unchanged
@@ -92,9 +405,10 @@ where
                 .and_then([TxnOp::put(key.clone(), new_json, None)])
         };
 
-        let txn_resp = client.txn(txn).await.map_err(|e| {
-            MetaError::Internal(format!("CAS transaction failed: {}", e))
-        })?;
+        let txn_resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("CAS transaction failed: {}", e)))?;
 
         if txn_resp.succeeded() {
             debug!("CAS update succeeded for parent {}", parent_ino);
@@ -171,9 +485,10 @@ pub async fn atomic_create_with_check(
         )])
         .and_then(txn_ops);
 
-    let resp = client.txn(txn).await.map_err(|e| {
-        MetaError::Internal(format!("Atomic create transaction failed: {}", e))
-    })?;
+    let resp = client
+        .txn(txn)
+        .await
+        .map_err(|e| MetaError::Internal(format!("Atomic create transaction failed: {}", e)))?;
 
     Ok(resp.succeeded())
 }
@@ -202,16 +517,13 @@ pub async fn atomic_delete_with_check(
     }
 
     let txn = Txn::new()
-        .when([Compare::create_revision(
-            check_key,
-            CompareOp::Greater,
-            0,
-        )])
+        .when([Compare::create_revision(check_key, CompareOp::Greater, 0)])
         .and_then(txn_ops);
 
-    let resp = client.txn(txn).await.map_err(|e| {
-        MetaError::Internal(format!("Atomic delete transaction failed: {}", e))
-    })?;
+    let resp = client
+        .txn(txn)
+        .await
+        .map_err(|e| MetaError::Internal(format!("Atomic delete transaction failed: {}", e)))?;
 
     Ok(resp.succeeded())
 }
@@ -258,9 +570,10 @@ pub async fn atomic_rename(
         ])
         .and_then(txn_ops);
 
-    let resp = client.txn(txn).await.map_err(|e| {
-        MetaError::Internal(format!("Atomic rename transaction failed: {}", e))
-    })?;
+    let resp = client
+        .txn(txn)
+        .await
+        .map_err(|e| MetaError::Internal(format!("Atomic rename transaction failed: {}", e)))?;
 
     if !resp.succeeded() {
         // Check which condition failed
@@ -311,14 +624,19 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_cas_update_children() {
-        let mut client = EtcdClient::connect(["localhost:2379"], None)
-            .await
-            .unwrap();
+        let mut client = EtcdClient::connect(["localhost:2379"], None).await.unwrap();
 
         // Test adding child
-        update_parent_children_cas(&mut client, 1, |children| { children.insert("test.txt".to_string()); }, 10)
-            .await
-            .unwrap();
+        update_parent_children_cas(
+            &mut client,
+            1,
+            |children| {
+                children.insert("test.txt".to_string());
+            },
+            10,
+        )
+        .await
+        .unwrap();
 
         // Verify
         let resp = client.get("c:1", None).await.unwrap();
@@ -328,12 +646,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_atomic_create() {
-        let mut client = EtcdClient::connect(["localhost:2379"], None)
-            .await
-            .unwrap();
+        let mut client = EtcdClient::connect(["localhost:2379"], None).await.unwrap();
 
         let forward_key = "f:1:test_atomic.txt".to_string();
-        
+
         // First create should succeed
         let succeeded = atomic_create_with_check(
             &mut client,
