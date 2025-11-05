@@ -136,4 +136,6 @@ pub trait MetaStore: Send + Sync {
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError>;
 
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError>;
+    /// Allow downcasting to concrete types
+    fn as_any(&self) -> &dyn std::any::Any;
 }

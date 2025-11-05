@@ -866,4 +866,7 @@ impl MetaStore for DatabaseMetaStore {
 
         Ok(())
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

@@ -1,5 +1,7 @@
 use crate::meta::config::{CacheCapacity, CacheTtl};
+use crate::meta::entities::etcd::EtcdEntryInfo;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
+use crate::meta::stores::{CacheInvalidationEvent, EtcdMetaStore, EtcdWatchWorker, WatchConfig};
 use crate::vfs::fs::FileType;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -9,8 +11,8 @@ use moka::notification::RemovalCause;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::info;
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tracing::{info, warn};
 
 /// Type alias for children map to reduce complexity
 type ChildrenMap = DashMap<String, i64>;
@@ -887,6 +889,42 @@ impl InodeCache {
         self.ttl_manager.invalidate_all();
         self.entries.clear();
     }
+
+    /// Directly updates inode metadata from watch event.
+    ///
+    /// # Arguments
+    ///
+    /// * `ino` - The inode number to update
+    /// * `metadata` - The new EtcdEntryInfo metadata
+    ///
+    /// If the inode is not in cache, this is a no-op (we don't create new entries).
+    async fn update_metadata(&self, ino: i64, metadata: EtcdEntryInfo) {
+        if let Some(node) = self.ttl_manager.get(&ino).await {
+            let new_attr = metadata.to_file_attr(ino);
+            *node.attr.write().await = new_attr;
+        }
+    }
+
+    /// Directly replaces directory children from watch event.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_ino` - The parent directory inode
+    /// * `children` - The new children map from c: key PUT event (name -> inode)
+    ///
+    /// If the parent is not in cache, this is a no-op.
+    async fn replace_children(&self, parent_ino: i64, children: HashMap<String, i64>) {
+        if let Some(parent_node) = self.ttl_manager.get(&parent_ino).await {
+            let mut children_lock = parent_node.children.write().await;
+
+            let new_children = Arc::new(DashMap::new());
+            for (name, ino) in children {
+                new_children.insert(name, ino);
+            }
+
+            *children_lock = ChildrenState::Complete(new_children);
+        }
+    }
 }
 
 /// Metadata client with intelligent caching
@@ -908,6 +946,12 @@ pub struct MetaClient {
     /// Kept separate from trie for O(1) inode-to-paths lookup
     /// it's absolute path.
     inode_to_paths: Arc<DashMap<i64, Vec<String>>>,
+
+    /// Watch Worker for etcd cache invalidation (for now only used for etcd.)
+    /// TODO: Now that we use the watch worker to invalidate cache in real-time,
+    /// may want to consider a more detailed data caching approach.
+    #[allow(dead_code)]
+    watch_worker: Option<Arc<EtcdWatchWorker>>,
 }
 
 impl MetaClient {
@@ -926,8 +970,41 @@ impl MetaClient {
         store: Arc<dyn MetaStore + Send + Sync>,
         capacity: CacheCapacity,
         ttl: CacheTtl,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        // Detect if this is an etcd backend and start Watch Worker
+        let watch_worker = if let Some(etcd_store) = store.as_any().downcast_ref::<EtcdMetaStore>()
+        {
+            let client = etcd_store.get_client();
+
+            // Create Watch Worker configuration
+            // Watch all metadata keys
+            // TODO: Consider watching only specific prefixes?
+            // For now, watch everything for simplicity
+            let config = WatchConfig {
+                key_prefix: "".to_string(),
+                event_buffer_size: 1000,
+                debug: false,
+            };
+
+            let (mut worker, invalidation_rx) = EtcdWatchWorker::new(client, config);
+
+            if let Err(e) = worker.start() {
+                warn!("Failed to start Watch Worker: {}", e);
+                None
+            } else {
+                info!("Watch Worker started for etcd backend");
+
+                // Start the invalidation handler after creating MetaClient
+                let worker_arc = Arc::new(worker);
+                let rx = Arc::new(Mutex::new(invalidation_rx));
+                Some((worker_arc, rx))
+            }
+        } else {
+            None
+        };
+
+        // Create MetaClient
+        let client = Arc::new(Self {
             store,
             inode_cache: InodeCache::new(capacity.inode as u64, ttl.inode_ttl),
             path_cache: Cache::builder()
@@ -936,7 +1013,81 @@ impl MetaClient {
                 .build(),
             path_trie: Arc::new(PathTrie::new()),
             inode_to_paths: Arc::new(DashMap::new()),
+            watch_worker: watch_worker.as_ref().map(|(w, _)| w.clone()),
+        });
+
+        // Start cache invalidation handler if Watch Worker is active
+        if let Some((_, rx)) = watch_worker {
+            let client_clone = client.clone();
+            tokio::spawn(async move {
+                client_clone.handle_cache_invalidation(rx).await;
+            });
         }
+
+        client
+    }
+
+    /// Handle cache invalidation events from Watch Worker
+    ///
+    /// This runs in a background task and processes events from etcd Watch Worker
+    /// to maintain cache consistency across multiple clients.
+    async fn handle_cache_invalidation(
+        self: Arc<Self>,
+        rx: Arc<Mutex<mpsc::Receiver<CacheInvalidationEvent>>>,
+    ) {
+        let mut rx = rx.lock().await;
+
+        info!("Cache invalidation handler started");
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                CacheInvalidationEvent::InvalidateInode(ino) => {
+                    self.inode_cache.ttl_manager.invalidate(&ino).await;
+                    self.inode_cache.entries.remove(&ino);
+
+                    if let Some(paths_entry) = self.inode_to_paths.get(&ino) {
+                        for path in paths_entry.value() {
+                            self.path_cache.invalidate(path).await;
+                        }
+                    }
+                }
+
+                CacheInvalidationEvent::InvalidateParentChildren(parent_ino) => {
+                    self.invalidate_parent_path(parent_ino).await;
+                }
+                CacheInvalidationEvent::AddChild {
+                    parent_ino,
+                    name,
+                    child_ino,
+                } => {
+                    self.inode_cache
+                        .add_child(parent_ino, name, child_ino)
+                        .await;
+                    self.invalidate_parent_path(parent_ino).await;
+                }
+
+                CacheInvalidationEvent::RemoveChild { parent_ino, name } => {
+                    self.inode_cache.remove_child(parent_ino, &name).await;
+                    self.invalidate_parent_path(parent_ino).await;
+                }
+
+                CacheInvalidationEvent::UpdateInodeMetadata { ino, metadata } => {
+                    self.inode_cache.update_metadata(ino, metadata).await;
+                }
+
+                CacheInvalidationEvent::UpdateChildren {
+                    parent_ino,
+                    children,
+                } => {
+                    self.inode_cache
+                        .replace_children(parent_ino, children)
+                        .await;
+                    self.invalidate_parent_path(parent_ino).await;
+                }
+            }
+        }
+
+        info!("Cache invalidation handler stopped (channel closed)");
     }
 
     /// Intelligently invalidates path cache entries for a parent directory.
@@ -1430,6 +1581,9 @@ impl MetaStore for MetaClient {
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         self.store.remove_file_metadata(ino).await
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1439,14 +1593,14 @@ mod tests {
     use crate::meta::stores::database_store::DatabaseMetaStore;
     use std::time::Duration;
 
-    async fn create_test_client() -> MetaClient {
+    async fn create_test_client() -> Arc<MetaClient> {
         create_test_client_with_capacity(100, 100).await
     }
 
     async fn create_test_client_with_capacity(
         inode_capacity: usize,
         path_capacity: usize,
-    ) -> MetaClient {
+    ) -> Arc<MetaClient> {
         let db_path = "sqlite::memory:".to_string();
 
         let config = Config {
