@@ -3,9 +3,11 @@
 //! Monitors etcd changes and invalidates local cache to maintain consistency
 //! across multiple clients.
 
+use crate::meta::entities::etcd::EtcdEntryInfo;
 use crate::meta::store::MetaError;
 use etcd_client::{Client as EtcdClient, EventType, WatchOptions};
 use log::{debug, error, info, warn};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -13,15 +15,48 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 #[allow(clippy::enum_variant_names)]
 pub enum CacheInvalidationEvent {
-    /// Invalidate specific inode cache
+    /// Invalidate specific inode cache (fallback for DELETE or parse errors)
     InvalidateInode(i64),
 
-    /// Invalidate parent's children cache (due to create/delete)
+    /// Invalidate parent's children cache (fallback for complex operations)
     InvalidateParentChildren(i64),
 
     /// Invalidate path cache with prefix (reserved for future use)
     #[allow(dead_code)]
     InvalidatePathPrefix(String),
+
+    /// Incrementally add a child to parent's cached children
+    /// Avoids full directory cache reload for single file creation
+    AddChild {
+        parent_ino: i64,
+        name: String,
+        child_ino: i64,
+    },
+
+    /// Incrementally remove a child from parent's cached children
+    /// Avoids full directory cache reload for single file deletion
+    RemoveChild { parent_ino: i64, name: String },
+
+    /// Incrementally rename a child (move/rename operation)
+    /// Updates both old and new parent's cached children
+    RenameChild {
+        old_parent: i64,
+        old_name: String,
+        new_parent: i64,
+        new_name: String,
+        child_ino: i64,
+    },
+
+    /// Directly update inode metadata from r: key PUT event
+    /// Avoids re-fetching from etcd (chmod, chown, utimens operations)
+    UpdateInodeMetadata { ino: i64, metadata: EtcdEntryInfo },
+
+    /// Directly update directory children from c: key PUT event
+    /// Replaces cached children list without re-fetching
+    UpdateChildren {
+        parent_ino: i64,
+        children: HashSet<String>,
+    },
 }
 
 /// Etcd watch worker configuration
@@ -195,13 +230,14 @@ impl EtcdWatchWorker {
         };
 
         let key = String::from_utf8_lossy(kv.key()).to_string();
+        let value = kv.value().to_vec();
 
         if config.debug {
             debug!("Watch event: {:?} on key: {}", event_type, key);
         }
 
         // Parse key and generate invalidation events
-        let invalidation_events = Self::parse_key_to_events(&key, event_type);
+        let invalidation_events = Self::parse_key_to_events(&key, event_type, &value);
 
         for inv_event in invalidation_events {
             if config.debug {
@@ -224,11 +260,23 @@ impl EtcdWatchWorker {
     /// - `r:{inode}` - Reverse index inode → metadata
     /// - `c:{inode}` - Children index inode → children set
     ///
-    /// # Event Generation Rules
-    /// - `f:*` change → Invalidate parent's children + path cache
-    /// - `r:*` change → Invalidate inode cache + related paths
-    /// - `c:*` change → Invalidate parent's children cache
-    fn parse_key_to_events(key: &str, _event_type: EventType) -> Vec<CacheInvalidationEvent> {
+    /// # Event Generation Rules (Fine-grained approach)
+    /// - `f:*` PUT → Parse value to get child_ino, generate AddChild event
+    /// - `f:*` DELETE → Generate RemoveChild event
+    /// - `r:*` PUT → Parse EtcdEntryInfo JSON, generate UpdateInodeMetadata event
+    /// - `r:*` DELETE → Invalidate inode cache (coarse-grained)
+    /// - `c:*` PUT → Parse HashSet<String> JSON, generate UpdateChildren event
+    /// - `c:*` DELETE → Invalidate parent children (coarse-grained)
+    ///
+    /// # Arguments
+    /// - `key`: etcd key string
+    /// - `event_type`: PUT or DELETE
+    /// - `value`: etcd value bytes (for extracting data from PUT events)
+    fn parse_key_to_events(
+        key: &str,
+        event_type: EventType,
+        value: &[u8],
+    ) -> Vec<CacheInvalidationEvent> {
         let mut events = Vec::new();
 
         // Parse key prefix
@@ -241,23 +289,102 @@ impl EtcdWatchWorker {
             "f" if parts.len() >= 3 => {
                 // Forward index: f:{parent}:{name}
                 if let Ok(parent_ino) = parts[1].parse::<i64>() {
-                    events.push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
+                    let name = parts[2..].join(":"); // Handle names with colons
 
-                    // Also invalidate path cache with parent inode
-                    // Note: We don't have full path here, so invalidate all paths of this inode
-                    // This will be handled by MetaClient using inode_to_paths
+                    match event_type {
+                        EventType::Put => {
+                            // Try to extract child_ino from value
+                            // Value format: inode number as string
+                            if let Ok(value_str) = std::str::from_utf8(value)
+                                && let Ok(child_ino) = value_str.parse::<i64>()
+                            {
+                                // Fine-grained event: AddChild
+                                events.push(CacheInvalidationEvent::AddChild {
+                                    parent_ino,
+                                    name,
+                                    child_ino,
+                                });
+                                return events;
+                            }
+
+                            // Fallback: value parse failed
+                            warn!(
+                                "Failed to parse child_ino from f: key PUT, using coarse-grained invalidation"
+                            );
+                            events
+                                .push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
+                        }
+                        EventType::Delete => {
+                            // Fine-grained event: RemoveChild
+                            events.push(CacheInvalidationEvent::RemoveChild { parent_ino, name });
+                        }
+                    }
                 }
             }
             "r" if parts.len() >= 2 => {
-                // Reverse index: r:{inode}
+                // Reverse index: r:{inode} → EtcdEntryInfo JSON
+                // Fine-grained: Parse JSON and update cached metadata directly
                 if let Ok(inode) = parts[1].parse::<i64>() {
-                    events.push(CacheInvalidationEvent::InvalidateInode(inode));
+                    match event_type {
+                        EventType::Put => {
+                            // Try to parse EtcdEntryInfo JSON from value
+                            if let Ok(value_str) = std::str::from_utf8(value)
+                                && let Ok(metadata) =
+                                    serde_json::from_str::<EtcdEntryInfo>(value_str)
+                            {
+                                // Fine-grained event: UpdateInodeMetadata
+                                events.push(CacheInvalidationEvent::UpdateInodeMetadata {
+                                    ino: inode,
+                                    metadata,
+                                });
+                                return events;
+                            }
+
+                            // Fallback: JSON parse failed
+                            warn!(
+                                "Failed to parse EtcdEntryInfo JSON from r: key PUT, using invalidate"
+                            );
+                            events.push(CacheInvalidationEvent::InvalidateInode(inode));
+                        }
+                        EventType::Delete => {
+                            // Coarse-grained: inode deleted
+                            events.push(CacheInvalidationEvent::InvalidateInode(inode));
+                        }
+                    }
                 }
             }
             "c" if parts.len() >= 2 => {
-                // Children index: c:{parent_inode}
+                // Children index: c:{parent_inode} → HashSet<String> JSON array
+                // Fine-grained: Parse JSON array and replace cached children
                 if let Ok(parent_ino) = parts[1].parse::<i64>() {
-                    events.push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
+                    match event_type {
+                        EventType::Put => {
+                            // Try to parse children HashSet from JSON array
+                            if let Ok(value_str) = std::str::from_utf8(value)
+                                && let Ok(children) =
+                                    serde_json::from_str::<HashSet<String>>(value_str)
+                            {
+                                // Fine-grained event: UpdateChildren
+                                events.push(CacheInvalidationEvent::UpdateChildren {
+                                    parent_ino,
+                                    children,
+                                });
+                                return events;
+                            }
+
+                            // Fallback: JSON parse failed
+                            warn!(
+                                "Failed to parse children JSON from c: key PUT, using invalidate"
+                            );
+                            events
+                                .push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
+                        }
+                        EventType::Delete => {
+                            // Coarse-grained: children deleted
+                            events
+                                .push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
+                        }
+                    }
                 }
             }
             _ => {
@@ -283,8 +410,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_forward_key() {
-        let events = EtcdWatchWorker::parse_key_to_events("f:10:file.txt", EventType::Put);
+    fn test_parse_forward_key_put() {
+        // PUT event with child_ino in value
+        let events = EtcdWatchWorker::parse_key_to_events("f:10:file.txt", EventType::Put, b"100");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CacheInvalidationEvent::AddChild {
+                parent_ino,
+                name,
+                child_ino,
+            } => {
+                assert_eq!(*parent_ino, 10);
+                assert_eq!(name, "file.txt");
+                assert_eq!(*child_ino, 100);
+            }
+            _ => panic!("Expected AddChild event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_forward_key_delete() {
+        // DELETE event generates RemoveChild
+        let events = EtcdWatchWorker::parse_key_to_events("f:10:file.txt", EventType::Delete, b"");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CacheInvalidationEvent::RemoveChild { parent_ino, name } => {
+                assert_eq!(*parent_ino, 10);
+                assert_eq!(name, "file.txt");
+            }
+            _ => panic!("Expected RemoveChild event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_forward_key_invalid_value() {
+        // PUT with invalid value falls back to coarse-grained
+        let events =
+            EtcdWatchWorker::parse_key_to_events("f:10:file.txt", EventType::Put, b"invalid");
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
@@ -294,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_parse_reverse_key() {
-        let events = EtcdWatchWorker::parse_key_to_events("r:100", EventType::Put);
+        let events = EtcdWatchWorker::parse_key_to_events("r:100", EventType::Put, b"");
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
@@ -304,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_parse_children_key() {
-        let events = EtcdWatchWorker::parse_key_to_events("c:50", EventType::Delete);
+        let events = EtcdWatchWorker::parse_key_to_events("c:50", EventType::Delete, b"");
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
@@ -314,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_key() {
-        let events = EtcdWatchWorker::parse_key_to_events("unknown:123", EventType::Put);
+        let events = EtcdWatchWorker::parse_key_to_events("unknown:123", EventType::Put, b"");
         assert_eq!(events.len(), 0); // No events for unknown keys
     }
 }

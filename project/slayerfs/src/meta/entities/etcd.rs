@@ -1,6 +1,7 @@
 //! Etcd backend-specific data structures
 
 use crate::meta::Permission;
+use crate::meta::store::{FileAttr, FileType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -54,5 +55,33 @@ impl EtcdEntryInfo {
 
     pub fn gid(&self) -> u32 {
         self.permission.gid
+    }
+
+    /// Converts EtcdEntryInfo to FileAttr for cache updates
+    ///
+    /// # Arguments
+    ///
+    /// * `ino` - The inode number (extracted from the r:{ino} key)
+    ///
+    /// # Returns
+    ///
+    /// FileAttr suitable for direct cache insertion
+    pub fn to_file_attr(&self, ino: i64) -> FileAttr {
+        FileAttr {
+            ino,
+            size: self.size.unwrap_or(0).max(0) as u64,
+            kind: if self.is_file {
+                FileType::File
+            } else {
+                FileType::Dir
+            },
+            mode: self.permission.mode,
+            uid: self.permission.uid,
+            gid: self.permission.gid,
+            atime: self.access_time,
+            mtime: self.modify_time,
+            ctime: self.create_time,
+            nlink: self.nlink,
+        }
     }
 }

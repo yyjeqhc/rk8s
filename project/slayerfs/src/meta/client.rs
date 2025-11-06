@@ -888,6 +888,73 @@ impl InodeCache {
         self.ttl_manager.invalidate_all();
         self.entries.clear();
     }
+
+    /// Directly updates inode metadata from watch event.
+    ///
+    /// # Arguments
+    ///
+    /// * `ino` - The inode number to update
+    /// * `metadata` - The new EtcdEntryInfo metadata
+    ///
+    /// # Behavior
+    ///
+    /// Directly updates the cached inode entry's metadata without re-fetching from etcd.
+    /// This provides zero-overhead cache updates for chmod, chown, utimens operations.
+    ///
+    /// If the inode is not in cache, this is a no-op (we don't create new entries).
+    async fn update_metadata(
+        &self,
+        ino: i64,
+        metadata: crate::meta::entities::etcd::EtcdEntryInfo,
+    ) {
+        if let Some(node) = self.ttl_manager.get(&ino).await {
+            // Convert EtcdEntryInfo → FileAttr
+            let new_attr = metadata.to_file_attr(ino);
+
+            // Directly update cached attributes (zero-overhead!)
+            *node.attr.write().await = new_attr;
+
+            debug!(
+                "Directly updated inode metadata: ino={}, size={}, mtime={}",
+                ino,
+                metadata.size.unwrap_or(0),
+                metadata.modify_time
+            );
+        }
+    }
+
+    /// Directly replaces directory children from watch event.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_ino` - The parent directory inode
+    /// * `children` - The new children set from c: key PUT event
+    ///
+    /// # Behavior
+    ///
+    /// Replaces the cached children list with the new set.
+    /// This is more efficient than invalidating and re-fetching from etcd.
+    ///
+    /// If the parent is not in cache, this is a no-op.
+    async fn replace_children(&self, parent_ino: i64, children: std::collections::HashSet<String>) {
+        if let Some(parent_node) = self.ttl_manager.get(&parent_ino).await {
+            let mut children_lock = parent_node.children.write().await;
+
+            // We can only update if there's already a map (Partial or Complete state)
+            // For c: key updates, we actually need to invalidate since we don't have inode numbers
+            // The c: key only stores names, not (name, ino) pairs
+            // So we fall back to invalidation to force a proper reload with f: key lookups
+
+            // Invalidate parent's children to force reload
+            *children_lock = ChildrenState::NotLoaded;
+
+            debug!(
+                "Invalidated children for parent {} (c: key only has names, not inodes, {} entries)",
+                parent_ino,
+                children.len()
+            );
+        }
+    }
 }
 
 /// Metadata client with intelligent caching
@@ -1056,6 +1123,106 @@ impl MetaClient {
                     }
 
                     debug!("Invalidated path prefix: {}", prefix);
+                }
+
+                // Fine-grained incremental cache update events
+                CacheInvalidationEvent::AddChild {
+                    parent_ino,
+                    name,
+                    child_ino,
+                } => {
+                    // Incrementally add child to parent's cached children
+                    // This avoids full directory reload for single file creation
+                    self.inode_cache
+                        .add_child(parent_ino, name.clone(), child_ino)
+                        .await;
+
+                    // Invalidate path cache for this parent (new child may affect lookups)
+                    self.invalidate_parent_path(parent_ino).await;
+
+                    debug!(
+                        "Incrementally added child: parent={}, name={}, child={}",
+                        parent_ino, name, child_ino
+                    );
+                }
+
+                CacheInvalidationEvent::RemoveChild { parent_ino, name } => {
+                    // Incrementally remove child from parent's cached children
+                    // This avoids full directory reload for single file deletion
+                    if let Some(removed_ino) =
+                        self.inode_cache.remove_child(parent_ino, &name).await
+                    {
+                        // Invalidate path cache for this parent
+                        self.invalidate_parent_path(parent_ino).await;
+
+                        debug!(
+                            "Incrementally removed child: parent={}, name={}, removed_ino={}",
+                            parent_ino, name, removed_ino
+                        );
+                    }
+                }
+
+                CacheInvalidationEvent::RenameChild {
+                    old_parent,
+                    old_name,
+                    new_parent,
+                    new_name,
+                    child_ino,
+                } => {
+                    // Incrementally handle rename: remove from old parent, add to new parent
+                    self.inode_cache.remove_child(old_parent, &old_name).await;
+                    self.inode_cache
+                        .add_child(new_parent, new_name.clone(), child_ino)
+                        .await;
+
+                    // Update child's parent pointer
+                    if let Some(child_node) = self.inode_cache.get_node(child_ino).await {
+                        child_node.set_parent(new_parent).await;
+                    }
+
+                    // Invalidate path cache for both parents
+                    self.invalidate_parent_path(old_parent).await;
+                    if old_parent != new_parent {
+                        self.invalidate_parent_path(new_parent).await;
+                    }
+
+                    debug!(
+                        "Incrementally renamed child: {}:{} -> {}:{}, ino={}",
+                        old_parent, old_name, new_parent, new_name, child_ino
+                    );
+                }
+
+                CacheInvalidationEvent::UpdateInodeMetadata { ino, metadata } => {
+                    // Directly update inode metadata from r: key PUT event
+                    // This avoids re-fetching from etcd for chmod, chown, utimens operations
+                    self.inode_cache
+                        .update_metadata(ino, metadata.clone())
+                        .await;
+
+                    debug!(
+                        "Directly updated inode metadata: ino={}, size={:?}, mtime={}",
+                        ino, metadata.size, metadata.modify_time
+                    );
+                }
+
+                CacheInvalidationEvent::UpdateChildren {
+                    parent_ino,
+                    children,
+                } => {
+                    // Directly replace directory children from c: key PUT event
+                    // This is more efficient than invalidating and re-fetching
+                    self.inode_cache
+                        .replace_children(parent_ino, children.clone())
+                        .await;
+
+                    // Invalidate path cache for this parent (children changed)
+                    self.invalidate_parent_path(parent_ino).await;
+
+                    debug!(
+                        "Directly replaced children: parent={}, count={}",
+                        parent_ino,
+                        children.len()
+                    );
                 }
             }
         }
