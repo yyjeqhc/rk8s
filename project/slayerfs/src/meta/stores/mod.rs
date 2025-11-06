@@ -5,11 +5,6 @@
 //!
 //! - `DatabaseMetaStore`: SQL databases (PostgreSQL, SQLite)
 //! - `EtcdMetaStore`: Distributed etcd cluster
-//!
-//! ## Transaction Abstraction
-//!
-//! The `transaction` module provides a unified interface for atomic operations
-//! across different storage backends through the `TransactionOps` trait.
 pub mod database_store;
 pub mod etcd_store;
 pub mod etcd_watch;

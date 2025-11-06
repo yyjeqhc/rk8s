@@ -45,9 +45,30 @@ pub struct DirEntry {
 }
 
 /// Transaction operations for atomic metadata updates
+///
+/// This trait provides low-level atomic operations for metadata storage backends
+/// that support transactions (etcd, PostgreSQL, MySQL, etc.).
 #[async_trait]
 pub trait TransactionOps: Send + Sync {
-    async fn update_parent_children_cas<F>(
+    /// Update a list value using Compare-And-Swap (CAS)
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key identifying the list to update
+    /// * `updater` - Function to modify the list in-place
+    /// * `max_retries` - Maximum retry attempts on CAS conflicts
+    ///
+    /// # Implementation Notes
+    ///
+    /// - **Etcd/TiKV**: Read JSON → deserialize to Vec → apply updater → serialize → CAS write
+    /// - **PostgreSQL/MySQL**: SELECT FOR UPDATE → modify JSONB column → UPDATE with version check
+    /// - **SQLite**: BEGIN IMMEDIATE → modify → COMMIT (serializable isolation)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Update succeeded within max_retries
+    /// * `Err(MetaError::Internal)` - All retries exhausted (concurrent modification)
+    async fn cas_update_list<F>(
         &self,
         key: &str,
         updater: F,
@@ -56,19 +77,78 @@ pub trait TransactionOps: Send + Sync {
     where
         F: Fn(&mut Vec<String>) + Send + 'static;
 
-    async fn atomic_create_with_check(
+    /// Atomically create multiple entries if check_key does NOT exist
+    ///
+    /// # Arguments
+    ///
+    /// * `check_key` - Key to check for non-existence (e.g., forward index key)
+    /// * `entries` - List of (key, value) pairs to create atomically
+    ///
+    /// # Semantics
+    ///
+    /// Equivalent to: `if not exists(check_key) { create(entries) }`
+    ///
+    /// # Implementation Notes
+    ///
+    /// - **Etcd**: Transaction with Compare(check_key, CompareOp::Equal, "") + batch Put
+    /// - **SQL**: `INSERT ... WHERE NOT EXISTS (SELECT 1 FROM ... WHERE key = check_key)`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Creation succeeded (check passed)
+    /// * `Err(MetaError::AlreadyExists)` - check_key already exists
+    async fn create_if_not_exists(
         &self,
         check_key: &str,
         entries: &[(&str, &str)],
     ) -> Result<(), MetaError>;
 
-    async fn atomic_delete_with_check(
-        &self,
-        check_key: &str,
-        keys: &[&str],
-    ) -> Result<(), MetaError>;
+    /// Atomically delete multiple entries if check_key exists
+    ///
+    /// # Arguments
+    ///
+    /// * `check_key` - Key to check for existence (e.g., forward index key)
+    /// * `keys` - List of keys to delete atomically
+    ///
+    /// # Semantics
+    ///
+    /// Equivalent to: `if exists(check_key) { delete(keys) }`
+    ///
+    /// # Implementation Notes
+    ///
+    /// - **Etcd**: Transaction with Compare(check_key, CompareOp::NotEqual, "") + batch Delete
+    /// - **SQL**: `DELETE FROM ... WHERE key IN (...) AND EXISTS (SELECT 1 FROM ... WHERE key = check_key)`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Deletion succeeded (check passed)
+    /// * `Err(MetaError::NotFound)` - check_key doesn't exist
+    async fn delete_if_exists(&self, check_key: &str, keys: &[&str]) -> Result<(), MetaError>;
 
-    async fn atomic_rename(
+    /// Atomically rename an entry (move from source to target)
+    ///
+    /// # Arguments
+    ///
+    /// * `source_key` - Key of the source entry (must exist)
+    /// * `target_key` - Key of the target entry (must NOT exist)
+    /// * `source_value` - Expected value at source_key (for verification)
+    /// * `target_value` - New value to write at target_key
+    ///
+    /// # Semantics
+    ///
+    /// Equivalent to: `if exists(source_key) && not exists(target_key) { delete(source_key); create(target_key) }`
+    ///
+    /// # Implementation Notes
+    ///
+    /// - **Etcd**: Transaction with Compare(source exists) AND Compare(target not exists) + Delete + Put
+    /// - **SQL**: `UPDATE ... SET key = target_key WHERE key = source_key AND NOT EXISTS (SELECT 1 FROM ... WHERE key = target_key)`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Rename succeeded
+    /// * `Err(MetaError::NotFound)` - source_key doesn't exist
+    /// * `Err(MetaError::AlreadyExists)` - target_key already exists
+    async fn rename_atomic(
         &self,
         source_key: &str,
         target_key: &str,
@@ -76,9 +156,25 @@ pub trait TransactionOps: Send + Sync {
         target_value: &str,
     ) -> Result<(), MetaError>;
 
-    /// Generic CAS (Compare-And-Swap) update for any value (reserved for future use)
+    /// Generic CAS update for a single scalar value (reserved for future use)
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to update
+    /// * `updater` - Function that takes (current_value, current_version) and returns new_value
+    /// * `max_retries` - Maximum retry attempts on CAS conflicts
+    ///
+    /// # Implementation Notes
+    ///
+    /// This is a lower-level primitive for implementing custom CAS logic.
+    /// Most use cases should prefer higher-level methods like `cas_update_list`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(new_version)` - Update succeeded, returns new version number
+    /// * `Err(MetaError::Internal)` - All retries exhausted
     #[allow(dead_code)]
-    async fn cas_update<F>(
+    async fn cas_update_value<F>(
         &self,
         key: &str,
         updater: F,
@@ -176,6 +272,6 @@ pub trait MetaStore: Send + Sync {
 
     async fn initialize(&self) -> Result<(), MetaError>;
 
-    /// Allow downcasting to concrete types (needed for Watch Worker integration)
+    /// Allow downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 }

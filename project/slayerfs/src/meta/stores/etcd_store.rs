@@ -348,10 +348,7 @@ impl EtcdMetaStore {
         ];
 
         // Step 4: Atomic transaction - create all keys only if forward key doesn't exist
-        match self
-            .atomic_create_with_check(&forward_key, &operations)
-            .await
-        {
+        match self.create_if_not_exists(&forward_key, &operations).await {
             Ok(()) => {}
             Err(MetaError::AlreadyExists { .. }) => {
                 warn!(
@@ -369,7 +366,7 @@ impl EtcdMetaStore {
         // Step 5: Update parent's children set with CAS
         let children_key = format!("c:{}", parent_inode);
         let name_clone = name.clone();
-        self.update_parent_children_cas(
+        self.cas_update_list(
             &children_key,
             move |children| {
                 children.push(name_clone.clone());
@@ -452,10 +449,7 @@ impl EtcdMetaStore {
         ];
 
         // Step 4: Atomic transaction - create keys only if forward key doesn't exist
-        match self
-            .atomic_create_with_check(&forward_key, &operations)
-            .await
-        {
+        match self.create_if_not_exists(&forward_key, &operations).await {
             Ok(()) => {}
             Err(MetaError::AlreadyExists { .. }) => {
                 warn!(
@@ -473,7 +467,7 @@ impl EtcdMetaStore {
         // Step 5: Update parent's children set with CAS
         let children_key = format!("c:{}", parent_inode);
         let name_clone = name.clone();
-        self.update_parent_children_cas(
+        self.cas_update_list(
             &children_key,
             move |children| {
                 children.push(name_clone.clone());
@@ -735,10 +729,7 @@ impl MetaStore for EtcdMetaStore {
         ];
 
         // Step 3: Atomic transaction - delete only if forward key exists
-        match self
-            .atomic_delete_with_check(&forward_key, &delete_keys)
-            .await
-        {
+        match self.delete_if_exists(&forward_key, &delete_keys).await {
             Ok(()) => {}
             Err(MetaError::NotFound(_)) => {
                 warn!(
@@ -753,7 +744,7 @@ impl MetaStore for EtcdMetaStore {
         // Step 4: Update parent's children set with CAS
         let parent_children_key = format!("c:{}", parent);
         let name_clone = name.to_string();
-        self.update_parent_children_cas(
+        self.cas_update_list(
             &parent_children_key,
             move |children| {
                 children.retain(|c| c != &name_clone);
@@ -798,10 +789,7 @@ impl MetaStore for EtcdMetaStore {
         let reverse_key = Self::etcd_reverse_key(file_ino);
         let delete_keys = vec![forward_key.as_str(), reverse_key.as_str()];
 
-        match self
-            .atomic_delete_with_check(&forward_key, &delete_keys)
-            .await
-        {
+        match self.delete_if_exists(&forward_key, &delete_keys).await {
             Ok(()) => {}
             Err(MetaError::NotFound(_)) => {
                 warn!(
@@ -816,7 +804,7 @@ impl MetaStore for EtcdMetaStore {
         // Step 3: Update parent's children set with CAS
         let parent_children_key = format!("c:{}", parent);
         let name_owned = name.to_string();
-        self.update_parent_children_cas(
+        self.cas_update_list(
             &parent_children_key,
             move |children| {
                 children.retain(|c| c != &name_owned);
@@ -880,7 +868,7 @@ impl MetaStore for EtcdMetaStore {
         );
 
         // Step 4: Atomic rename - old exists AND new doesn't exist
-        self.atomic_rename(&old_forward_key, &new_forward_key, "", &new_forward_json)
+        self.rename_atomic(&old_forward_key, &new_forward_key, "", &new_forward_json)
             .await?;
 
         // Update reverse index separately
@@ -894,7 +882,7 @@ impl MetaStore for EtcdMetaStore {
         if old_parent != new_parent || old_name != new_name {
             let old_parent_children_key = format!("c:{}", old_parent);
             let old_name_owned = old_name.to_string();
-            self.update_parent_children_cas(
+            self.cas_update_list(
                 &old_parent_children_key,
                 move |children| {
                     children.retain(|c| c != &old_name_owned);
@@ -908,7 +896,7 @@ impl MetaStore for EtcdMetaStore {
         if old_parent != new_parent {
             let new_parent_children_key = format!("c:{}", new_parent);
             let new_name_clone = new_name.clone();
-            self.update_parent_children_cas(
+            self.cas_update_list(
                 &new_parent_children_key,
                 move |children| {
                     children.push(new_name_clone.clone());
@@ -920,7 +908,7 @@ impl MetaStore for EtcdMetaStore {
             let parent_children_key = format!("c:{}", new_parent);
             let old_name_owned = old_name.to_string();
             let new_name_clone = new_name.clone();
-            self.update_parent_children_cas(
+            self.cas_update_list(
                 &parent_children_key,
                 move |children| {
                     children.retain(|c| c != &old_name_owned);
@@ -1049,7 +1037,7 @@ impl EtcdMetaStore {
 
 #[async_trait]
 impl TransactionOps for EtcdMetaStore {
-    async fn update_parent_children_cas<F>(
+    async fn cas_update_list<F>(
         &self,
         key: &str,
         updater: F,
@@ -1131,7 +1119,7 @@ impl TransactionOps for EtcdMetaStore {
         ))
     }
 
-    async fn atomic_create_with_check(
+    async fn create_if_not_exists(
         &self,
         check_key: &str,
         entries: &[(&str, &str)],
@@ -1160,11 +1148,7 @@ impl TransactionOps for EtcdMetaStore {
         }
     }
 
-    async fn atomic_delete_with_check(
-        &self,
-        check_key: &str,
-        keys: &[&str],
-    ) -> Result<(), MetaError> {
+    async fn delete_if_exists(&self, check_key: &str, keys: &[&str]) -> Result<(), MetaError> {
         let mut client = self.client.clone();
         let mut txn =
             Txn::new().when([Compare::create_revision(check_key, CompareOp::NotEqual, 0)]);
@@ -1187,7 +1171,7 @@ impl TransactionOps for EtcdMetaStore {
         }
     }
 
-    async fn atomic_rename(
+    async fn rename_atomic(
         &self,
         source_key: &str,
         target_key: &str,
@@ -1230,7 +1214,7 @@ impl TransactionOps for EtcdMetaStore {
         }
     }
 
-    async fn cas_update<F>(
+    async fn cas_update_value<F>(
         &self,
         key: &str,
         updater: F,
