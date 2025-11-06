@@ -1162,36 +1162,6 @@ impl MetaClient {
                     }
                 }
 
-                CacheInvalidationEvent::RenameChild {
-                    old_parent,
-                    old_name,
-                    new_parent,
-                    new_name,
-                    child_ino,
-                } => {
-                    // Incrementally handle rename: remove from old parent, add to new parent
-                    self.inode_cache.remove_child(old_parent, &old_name).await;
-                    self.inode_cache
-                        .add_child(new_parent, new_name.clone(), child_ino)
-                        .await;
-
-                    // Update child's parent pointer
-                    if let Some(child_node) = self.inode_cache.get_node(child_ino).await {
-                        child_node.set_parent(new_parent).await;
-                    }
-
-                    // Invalidate path cache for both parents
-                    self.invalidate_parent_path(old_parent).await;
-                    if old_parent != new_parent {
-                        self.invalidate_parent_path(new_parent).await;
-                    }
-
-                    debug!(
-                        "Incrementally renamed child: {}:{} -> {}:{}, ino={}",
-                        old_parent, old_name, new_parent, new_name, child_ino
-                    );
-                }
-
                 CacheInvalidationEvent::UpdateInodeMetadata { ino, metadata } => {
                     // Directly update inode metadata from r: key PUT event
                     // This avoids re-fetching from etcd for chmod, chown, utimens operations

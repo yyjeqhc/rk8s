@@ -37,16 +37,6 @@ pub enum CacheInvalidationEvent {
     /// Avoids full directory cache reload for single file deletion
     RemoveChild { parent_ino: i64, name: String },
 
-    /// Incrementally rename a child (move/rename operation)
-    /// Updates both old and new parent's cached children
-    RenameChild {
-        old_parent: i64,
-        old_name: String,
-        new_parent: i64,
-        new_name: String,
-        child_ino: i64,
-    },
-
     /// Directly update inode metadata from r: key PUT event
     /// Avoids re-fetching from etcd (chmod, chown, utimens operations)
     UpdateInodeMetadata { ino: i64, metadata: EtcdEntryInfo },
