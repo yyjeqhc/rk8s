@@ -22,10 +22,6 @@ pub enum CacheInvalidationEvent {
     /// Invalidate path cache with prefix (reserved for future use)
     #[allow(dead_code)]
     InvalidatePathPrefix(String),
-
-    /// Full cache invalidation (reserved for future use)
-    #[allow(dead_code)]
-    InvalidateAll,
 }
 
 /// Etcd watch worker configuration
@@ -263,9 +259,6 @@ impl EtcdWatchWorker {
                 if let Ok(parent_ino) = parts[1].parse::<i64>() {
                     events.push(CacheInvalidationEvent::InvalidateParentChildren(parent_ino));
                 }
-            }
-            "slayerfs" if key.contains("next_inode_id") => {
-                // ID counter change - no cache invalidation needed
             }
             _ => {
                 // Unknown key format - safe fallback

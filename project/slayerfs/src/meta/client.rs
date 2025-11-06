@@ -896,9 +896,6 @@ impl InodeCache {
 /// - Inode attributes (file metadata)
 /// - Directory children (directory listings)
 /// - Path-to-inode mappings (path resolution)
-///
-/// For etcd backend, also provides:
-/// - Watch Worker for real-time cache invalidation across multiple clients
 pub struct MetaClient {
     store: Arc<dyn MetaStore + Send + Sync>,
     inode_cache: InodeCache,
@@ -915,6 +912,8 @@ pub struct MetaClient {
 
     /// Watch Worker for etcd cache invalidation (None for other backends)
     /// Reserved for future cache invalidation integration
+    /// TODO: Now that use watch worker to invalidate cache in real-time,
+    /// may think about considering a more detailed data caching approach.
     #[allow(dead_code)]
     watch_worker: Option<Arc<EtcdWatchWorker>>,
 }
@@ -948,8 +947,10 @@ impl MetaClient {
             let client = etcd_store.get_client();
 
             // Create Watch Worker configuration
+            // Watch all metadata keys
+            // TODO: May think about watch only specific prefixes?
             let config = WatchConfig {
-                key_prefix: "".to_string(), // Watch all metadata keys
+                key_prefix: "".to_string(),
                 event_buffer_size: 1000,
                 debug: false,
             };
@@ -969,7 +970,6 @@ impl MetaClient {
                 let worker_arc = Arc::new(worker);
                 let rx = Arc::new(Mutex::new(invalidation_rx));
 
-                // Return the worker (we'll spawn handler below)
                 Some((worker_arc, rx))
             }
         } else {
@@ -1056,16 +1056,6 @@ impl MetaClient {
                     }
 
                     debug!("Invalidated path prefix: {}", prefix);
-                }
-
-                CacheInvalidationEvent::InvalidateAll => {
-                    // Clear all caches
-                    self.inode_cache.invalidate_all();
-                    self.path_cache.invalidate_all();
-                    self.path_trie.clear().await;
-                    self.inode_to_paths.clear();
-
-                    warn!("Invalidated all caches (full cache clear)");
                 }
             }
         }
