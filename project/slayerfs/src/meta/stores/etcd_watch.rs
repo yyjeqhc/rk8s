@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 /// Cache invalidation events from etcd watch
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 pub enum CacheInvalidationEvent {
     /// Invalidate specific inode cache
     InvalidateInode(i64),
@@ -18,10 +19,12 @@ pub enum CacheInvalidationEvent {
     /// Invalidate parent's children cache (due to create/delete)
     InvalidateParentChildren(i64),
 
-    /// Invalidate path cache with prefix
+    /// Invalidate path cache with prefix (reserved for future use)
+    #[allow(dead_code)]
     InvalidatePathPrefix(String),
 
-    /// Full cache invalidation (for safety)
+    /// Full cache invalidation (reserved for future use)
+    #[allow(dead_code)]
     InvalidateAll,
 }
 
@@ -119,6 +122,7 @@ impl EtcdWatchWorker {
     }
 
     /// Stop watch worker
+    #[allow(dead_code)]
     pub async fn stop(&mut self) {
         if let Some(handle) = self.worker_handle.take() {
             handle.abort();
@@ -140,7 +144,7 @@ impl EtcdWatchWorker {
         loop {
             // Create watch stream with prefix
             let options = WatchOptions::new().with_prefix();
-            let (mut watcher, mut stream) =
+            let (_watcher, mut stream) =
                 match client.watch(config.key_prefix.clone(), Some(options)).await {
                     Ok((w, s)) => (w, s),
                     Err(e) => {
@@ -228,7 +232,7 @@ impl EtcdWatchWorker {
     /// - `f:*` change → Invalidate parent's children + path cache
     /// - `r:*` change → Invalidate inode cache + related paths
     /// - `c:*` change → Invalidate parent's children cache
-    fn parse_key_to_events(key: &str, event_type: EventType) -> Vec<CacheInvalidationEvent> {
+    fn parse_key_to_events(key: &str, _event_type: EventType) -> Vec<CacheInvalidationEvent> {
         let mut events = Vec::new();
 
         // Parse key prefix

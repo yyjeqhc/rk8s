@@ -914,6 +914,8 @@ pub struct MetaClient {
     inode_to_paths: Arc<DashMap<i64, Vec<String>>>,
 
     /// Watch Worker for etcd cache invalidation (None for other backends)
+    /// Reserved for future cache invalidation integration
+    #[allow(dead_code)]
     watch_worker: Option<Arc<EtcdWatchWorker>>,
 }
 

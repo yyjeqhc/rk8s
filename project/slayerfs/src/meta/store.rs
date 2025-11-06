@@ -76,6 +76,8 @@ pub trait TransactionOps: Send + Sync {
         target_value: &str,
     ) -> Result<(), MetaError>;
 
+    /// Generic CAS (Compare-And-Swap) update for any value (reserved for future use)
+    #[allow(dead_code)]
     async fn cas_update<F>(
         &self,
         key: &str,

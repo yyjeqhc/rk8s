@@ -698,7 +698,6 @@ impl MetaStore for EtcdMetaStore {
     }
 
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
-
         // Step 1: Read forward entry to get child inode
         let forward_key = Self::etcd_forward_key(parent, name);
         let forward_entry: EtcdForwardEntry =
