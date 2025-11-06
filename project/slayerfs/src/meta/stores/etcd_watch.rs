@@ -4,9 +4,8 @@
 //! across multiple clients.
 
 use crate::meta::store::MetaError;
-use etcd_client::{Client as EtcdClient, EventType, WatchOptions, WatchStream};
+use etcd_client::{Client as EtcdClient, EventType, WatchOptions};
 use log::{debug, error, info, warn};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 

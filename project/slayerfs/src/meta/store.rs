@@ -44,6 +44,48 @@ pub struct DirEntry {
     pub kind: FileType,
 }
 
+/// Transaction operations for atomic metadata updates
+#[async_trait]
+pub trait TransactionOps: Send + Sync {
+    async fn update_parent_children_cas<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<(), MetaError>
+    where
+        F: Fn(&mut Vec<String>) + Send + 'static;
+
+    async fn atomic_create_with_check(
+        &self,
+        check_key: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(), MetaError>;
+
+    async fn atomic_delete_with_check(
+        &self,
+        check_key: &str,
+        keys: &[&str],
+    ) -> Result<(), MetaError>;
+
+    async fn atomic_rename(
+        &self,
+        source_key: &str,
+        target_key: &str,
+        source_value: &str,
+        target_value: &str,
+    ) -> Result<(), MetaError>;
+
+    async fn cas_update<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<i64, MetaError>
+    where
+        F: Fn(&str, i64) -> Result<String, MetaError> + Send + 'static;
+}
+
 /// Metadata operation errors
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]

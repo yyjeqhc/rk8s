@@ -12,9 +12,7 @@
 //! across different storage backends through the `TransactionOps` trait.
 pub mod database_store;
 pub mod etcd_store;
-mod etcd_txn_helper;
 pub mod etcd_watch;
-pub mod transaction;
 
 // Re-export main types for convenience
 pub use database_store::DatabaseMetaStore;

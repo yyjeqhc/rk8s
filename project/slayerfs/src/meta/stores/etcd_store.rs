@@ -6,15 +6,12 @@ use crate::meta::Permission;
 use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
-use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
-use crate::meta::stores::etcd_txn_helper::{
-    atomic_create_with_check, atomic_delete_with_check, atomic_rename, update_parent_children_cas,
-};
+use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore, TransactionOps};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::Utc;
-use etcd_client::Client as EtcdClient;
-use log::{error, info, warn};
+use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
+use log::{debug, error, info, warn};
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::collections::HashSet;
@@ -302,7 +299,6 @@ impl EtcdMetaStore {
 
         // Step 2: Generate inode (already uses CAS)
         let inode = self.generate_id().await?;
-        let mut client = self.client.clone();
 
         // Step 3: Prepare all data
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -346,34 +342,39 @@ impl EtcdMetaStore {
         );
 
         let operations = vec![
-            (forward_key.clone(), forward_json),
-            (reverse_key, reverse_json),
-            (children_key, children_json),
+            (forward_key.as_str(), forward_json.as_str()),
+            (reverse_key.as_str(), reverse_json.as_str()),
+            (children_key.as_str(), children_json.as_str()),
         ];
 
-        let succeeded =
-            atomic_create_with_check(&mut client, forward_key.clone(), operations).await?;
-
-        if !succeeded {
-            // Transaction failed - entry already exists
-            warn!(
-                "Directory creation failed - already exists: parent={}, name={}",
-                parent_inode, name
-            );
-            return Err(MetaError::AlreadyExists {
-                parent: parent_inode,
-                name,
-            });
+        // Step 4: Atomic transaction - create all keys only if forward key doesn't exist
+        match self
+            .atomic_create_with_check(&forward_key, &operations)
+            .await
+        {
+            Ok(()) => {}
+            Err(MetaError::AlreadyExists { .. }) => {
+                warn!(
+                    "Directory creation failed - already exists: parent={}, name={}",
+                    parent_inode, name
+                );
+                return Err(MetaError::AlreadyExists {
+                    parent: parent_inode,
+                    name,
+                });
+            }
+            Err(e) => return Err(e),
         }
 
         // Step 5: Update parent's children set with CAS
-        update_parent_children_cas(
-            &mut client,
-            parent_inode,
-            |children| {
-                children.insert(name.clone());
+        let children_key = format!("c:{}", parent_inode);
+        let name_clone = name.clone();
+        self.update_parent_children_cas(
+            &children_key,
+            move |children| {
+                children.push(name_clone.clone());
             },
-            10, // max retries
+            10,
         )
         .await?;
 
@@ -410,7 +411,6 @@ impl EtcdMetaStore {
 
         // Step 2: Generate inode (already uses CAS)
         let inode = self.generate_id().await?;
-        let mut client = self.client.clone();
 
         // Step 3: Prepare all data
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -447,33 +447,38 @@ impl EtcdMetaStore {
         );
 
         let operations = vec![
-            (forward_key.clone(), forward_json),
-            (reverse_key, reverse_json),
+            (forward_key.as_str(), forward_json.as_str()),
+            (reverse_key.as_str(), reverse_json.as_str()),
         ];
 
-        let succeeded =
-            atomic_create_with_check(&mut client, forward_key.clone(), operations).await?;
-
-        if !succeeded {
-            // Transaction failed - entry already exists
-            warn!(
-                "File creation failed - already exists: parent={}, name={}",
-                parent_inode, name
-            );
-            return Err(MetaError::AlreadyExists {
-                parent: parent_inode,
-                name,
-            });
+        // Step 4: Atomic transaction - create keys only if forward key doesn't exist
+        match self
+            .atomic_create_with_check(&forward_key, &operations)
+            .await
+        {
+            Ok(()) => {}
+            Err(MetaError::AlreadyExists { .. }) => {
+                warn!(
+                    "File creation failed - already exists: parent={}, name={}",
+                    parent_inode, name
+                );
+                return Err(MetaError::AlreadyExists {
+                    parent: parent_inode,
+                    name,
+                });
+            }
+            Err(e) => return Err(e),
         }
 
         // Step 5: Update parent's children set with CAS
-        update_parent_children_cas(
-            &mut client,
-            parent_inode,
-            |children| {
-                children.insert(name.clone());
+        let children_key = format!("c:{}", parent_inode);
+        let name_clone = name.clone();
+        self.update_parent_children_cas(
+            &children_key,
+            move |children| {
+                children.push(name_clone.clone());
             },
-            10, // max retries
+            10,
         )
         .await?;
 
@@ -693,7 +698,6 @@ impl MetaStore for EtcdMetaStore {
     }
 
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
-        let mut client = self.client.clone();
 
         // Step 1: Read forward entry to get child inode
         let forward_key = Self::etcd_forward_key(parent, name);
@@ -724,26 +728,38 @@ impl MetaStore for EtcdMetaStore {
         );
 
         let reverse_key = Self::etcd_reverse_key(child_ino);
-        let delete_keys = vec![forward_key.clone(), reverse_key, children_key];
+        let children_key = Self::etcd_children_key(child_ino);
+        let delete_keys = vec![
+            forward_key.as_str(),
+            reverse_key.as_str(),
+            children_key.as_str(),
+        ];
 
-        let succeeded = atomic_delete_with_check(&mut client, forward_key, delete_keys).await?;
-
-        if !succeeded {
-            warn!(
-                "Directory deletion failed - not found: parent={}, name={}",
-                parent, name
-            );
-            return Err(MetaError::NotFound(parent));
+        // Step 3: Atomic transaction - delete only if forward key exists
+        match self
+            .atomic_delete_with_check(&forward_key, &delete_keys)
+            .await
+        {
+            Ok(()) => {}
+            Err(MetaError::NotFound(_)) => {
+                warn!(
+                    "Directory deletion failed - not found: parent={}, name={}",
+                    parent, name
+                );
+                return Err(MetaError::NotFound(parent));
+            }
+            Err(e) => return Err(e),
         }
 
         // Step 4: Update parent's children set with CAS
-        update_parent_children_cas(
-            &mut client,
-            parent,
-            |children| {
-                children.remove(name);
+        let parent_children_key = format!("c:{}", parent);
+        let name_clone = name.to_string();
+        self.update_parent_children_cas(
+            &parent_children_key,
+            move |children| {
+                children.retain(|c| c != &name_clone);
             },
-            10, // max retries
+            10,
         )
         .await?;
 
@@ -760,8 +776,6 @@ impl MetaStore for EtcdMetaStore {
     }
 
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
-        let mut client = self.client.clone();
-
         // Step 1: Read forward entry to get file inode
         let forward_key = Self::etcd_forward_key(parent, name);
         let forward_entry: EtcdForwardEntry =
@@ -783,26 +797,32 @@ impl MetaStore for EtcdMetaStore {
         );
 
         let reverse_key = Self::etcd_reverse_key(file_ino);
-        let delete_keys = vec![forward_key.clone(), reverse_key];
+        let delete_keys = vec![forward_key.as_str(), reverse_key.as_str()];
 
-        let succeeded = atomic_delete_with_check(&mut client, forward_key, delete_keys).await?;
-
-        if !succeeded {
-            warn!(
-                "File deletion failed - not found: parent={}, name={}",
-                parent, name
-            );
-            return Err(MetaError::NotFound(parent));
+        match self
+            .atomic_delete_with_check(&forward_key, &delete_keys)
+            .await
+        {
+            Ok(()) => {}
+            Err(MetaError::NotFound(_)) => {
+                warn!(
+                    "File deletion failed - not found: parent={}, name={}",
+                    parent, name
+                );
+                return Err(MetaError::NotFound(parent));
+            }
+            Err(e) => return Err(e),
         }
 
         // Step 3: Update parent's children set with CAS
-        update_parent_children_cas(
-            &mut client,
-            parent,
-            |children| {
-                children.remove(name);
+        let parent_children_key = format!("c:{}", parent);
+        let name_owned = name.to_string();
+        self.update_parent_children_cas(
+            &parent_children_key,
+            move |children| {
+                children.retain(|c| c != &name_owned);
             },
-            10, // max retries
+            10,
         )
         .await?;
 
@@ -821,8 +841,6 @@ impl MetaStore for EtcdMetaStore {
         new_parent: i64,
         new_name: String,
     ) -> Result<(), MetaError> {
-        let mut client = self.client.clone();
-
         // Step 1: Read entry information
         let old_forward_key = Self::etcd_forward_key(old_parent, old_name);
         let forward_entry = self
@@ -862,29 +880,25 @@ impl MetaStore for EtcdMetaStore {
             old_name, old_parent, new_name, new_parent, entry_ino
         );
 
-        let operations = vec![
-            (new_forward_key.clone(), new_forward_json),
-            (reverse_key, updated_reverse_json),
-        ];
+        // Step 4: Atomic rename - old exists AND new doesn't exist
+        self.atomic_rename(&old_forward_key, &new_forward_key, "", &new_forward_json)
+            .await?;
 
-        let delete_keys = vec![old_forward_key.clone()];
-
-        atomic_rename(
-            &mut client,
-            old_forward_key,
-            new_forward_key,
-            operations,
-            delete_keys,
-        )
-        .await?;
+        // Update reverse index separately
+        let mut client = self.client.clone();
+        client
+            .put(reverse_key, updated_reverse_json, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to update reverse index: {}", e)))?;
 
         // Step 5: Update old parent's children with CAS
         if old_parent != new_parent || old_name != new_name {
-            update_parent_children_cas(
-                &mut client,
-                old_parent,
-                |children| {
-                    children.remove(old_name);
+            let old_parent_children_key = format!("c:{}", old_parent);
+            let old_name_owned = old_name.to_string();
+            self.update_parent_children_cas(
+                &old_parent_children_key,
+                move |children| {
+                    children.retain(|c| c != &old_name_owned);
                 },
                 10,
             )
@@ -893,23 +907,25 @@ impl MetaStore for EtcdMetaStore {
 
         // Step 6: Update new parent's children with CAS
         if old_parent != new_parent {
-            update_parent_children_cas(
-                &mut client,
-                new_parent,
-                |children| {
-                    children.insert(new_name.clone());
+            let new_parent_children_key = format!("c:{}", new_parent);
+            let new_name_clone = new_name.clone();
+            self.update_parent_children_cas(
+                &new_parent_children_key,
+                move |children| {
+                    children.push(new_name_clone.clone());
                 },
                 10,
             )
             .await?;
         } else if old_name != new_name {
-            // Same parent, different name - update atomically
-            update_parent_children_cas(
-                &mut client,
-                new_parent,
-                |children| {
-                    children.remove(old_name);
-                    children.insert(new_name.clone());
+            let parent_children_key = format!("c:{}", new_parent);
+            let old_name_owned = old_name.to_string();
+            let new_name_clone = new_name.clone();
+            self.update_parent_children_cas(
+                &parent_children_key,
+                move |children| {
+                    children.retain(|c| c != &old_name_owned);
+                    children.push(new_name_clone.clone());
                 },
                 10,
             )
@@ -1029,5 +1045,253 @@ impl EtcdMetaStore {
     /// Get a clone of the etcd client (for Watch Worker)
     pub fn get_client(&self) -> EtcdClient {
         self.client.clone()
+    }
+}
+
+#[async_trait]
+impl TransactionOps for EtcdMetaStore {
+    async fn update_parent_children_cas<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<(), MetaError>
+    where
+        F: Fn(&mut Vec<String>) + Send + 'static,
+    {
+        let mut client = self.client.clone();
+        for retry in 0..max_retries {
+            let resp = client
+                .get(key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to get key for CAS: {}", e)))?;
+
+            let (mut children_set, mod_revision) = if let Some(kv) = resp.kvs().first() {
+                let children: EtcdDirChildren = serde_json::from_slice(kv.value())
+                    .map_err(|e| MetaError::Internal(format!("Failed to parse children: {}", e)))?;
+                let children_vec: Vec<String> = children.children.into_iter().collect();
+                (children_vec, kv.mod_revision())
+            } else {
+                (Vec::new(), 0)
+            };
+
+            let old_size = children_set.len();
+            updater(&mut children_set);
+            let new_size = children_set.len();
+
+            debug!(
+                "CAS update children for {}: {} -> {} entries (retry {})",
+                key, old_size, new_size, retry
+            );
+
+            let children_hashset: HashSet<String> = children_set.into_iter().collect();
+            let parent_ino = key
+                .strip_prefix("c:")
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    MetaError::Internal(format!("Invalid children key format: {}", key))
+                })?;
+
+            let new_children = EtcdDirChildren {
+                inode: parent_ino,
+                children: children_hashset,
+            };
+            let new_json = serde_json::to_string(&new_children)
+                .map_err(|e| MetaError::Internal(format!("Failed to serialize children: {}", e)))?;
+
+            let txn = if mod_revision == 0 {
+                Txn::new()
+                    .when([Compare::create_revision(key, CompareOp::Equal, 0)])
+                    .and_then([TxnOp::put(key, new_json, None)])
+            } else {
+                Txn::new()
+                    .when([Compare::mod_revision(key, CompareOp::Equal, mod_revision)])
+                    .and_then([TxnOp::put(key, new_json, None)])
+            };
+
+            let txn_resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("CAS transaction failed: {}", e)))?;
+
+            if txn_resp.succeeded() {
+                debug!("CAS update succeeded for {}", key);
+                return Ok(());
+            } else if retry < max_retries - 1 {
+                warn!("CAS conflict for {} (retry {}/{})", key, retry, max_retries);
+                continue;
+            } else {
+                return Err(MetaError::Internal(format!(
+                    "CAS max retries exceeded for {}",
+                    key
+                )));
+            }
+        }
+        Err(MetaError::Internal(
+            "CAS update failed: unreachable".to_string(),
+        ))
+    }
+
+    async fn atomic_create_with_check(
+        &self,
+        check_key: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.clone();
+        let mut txn = Txn::new().when([Compare::create_revision(check_key, CompareOp::Equal, 0)]);
+        let mut ops = Vec::new();
+        for (key, value) in entries {
+            ops.push(TxnOp::put(*key, *value, None));
+        }
+        txn = txn.and_then(ops);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic create transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic create succeeded for check_key: {}", check_key);
+            Ok(())
+        } else {
+            Err(MetaError::AlreadyExists {
+                parent: 0,
+                name: check_key.to_string(),
+            })
+        }
+    }
+
+    async fn atomic_delete_with_check(
+        &self,
+        check_key: &str,
+        keys: &[&str],
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.clone();
+        let mut txn =
+            Txn::new().when([Compare::create_revision(check_key, CompareOp::NotEqual, 0)]);
+        let mut ops = Vec::new();
+        for key in keys {
+            ops.push(TxnOp::delete(*key, None));
+        }
+        txn = txn.and_then(ops);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic delete transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic delete succeeded for check_key: {}", check_key);
+            Ok(())
+        } else {
+            Err(MetaError::NotFound(0))
+        }
+    }
+
+    async fn atomic_rename(
+        &self,
+        source_key: &str,
+        target_key: &str,
+        _source_value: &str,
+        target_value: &str,
+    ) -> Result<(), MetaError> {
+        let mut client = self.client.clone();
+        let txn = Txn::new()
+            .when([
+                Compare::create_revision(source_key, CompareOp::NotEqual, 0),
+                Compare::create_revision(target_key, CompareOp::Equal, 0),
+            ])
+            .and_then([
+                TxnOp::put(target_key, target_value, None),
+                TxnOp::delete(source_key, None),
+            ]);
+
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Atomic rename transaction failed: {}", e)))?;
+
+        if resp.succeeded() {
+            debug!("Atomic rename succeeded: {} -> {}", source_key, target_key);
+            Ok(())
+        } else {
+            let source_resp = client
+                .get(source_key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to check source key: {}", e)))?;
+
+            if source_resp.kvs().is_empty() {
+                Err(MetaError::NotFound(0))
+            } else {
+                Err(MetaError::AlreadyExists {
+                    parent: 0,
+                    name: target_key.to_string(),
+                })
+            }
+        }
+    }
+
+    async fn cas_update<F>(
+        &self,
+        key: &str,
+        updater: F,
+        max_retries: usize,
+    ) -> Result<i64, MetaError>
+    where
+        F: Fn(&str, i64) -> Result<String, MetaError> + Send + 'static,
+    {
+        let mut client = self.client.clone();
+        for retry in 0..max_retries {
+            let resp = client
+                .get(key, None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to get key for CAS: {}", e)))?;
+
+            let (current_value, mod_revision) = if let Some(kv) = resp.kvs().first() {
+                (
+                    String::from_utf8_lossy(kv.value()).to_string(),
+                    kv.mod_revision(),
+                )
+            } else {
+                return Err(MetaError::NotFound(0));
+            };
+
+            let new_value = updater(&current_value, mod_revision)?;
+
+            let txn = Txn::new()
+                .when([Compare::mod_revision(key, CompareOp::Equal, mod_revision)])
+                .and_then([TxnOp::put(key, new_value, None)]);
+
+            let txn_resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("CAS transaction failed: {}", e)))?;
+
+            if txn_resp.succeeded() {
+                let resp = client.get(key, None).await.map_err(|e| {
+                    MetaError::Internal(format!("Failed to get updated key: {}", e))
+                })?;
+
+                if let Some(kv) = resp.kvs().first() {
+                    debug!("CAS update succeeded for key: {}", key);
+                    return Ok(kv.mod_revision());
+                } else {
+                    return Err(MetaError::Internal(
+                        "Key disappeared after CAS update".to_string(),
+                    ));
+                }
+            } else if retry < max_retries - 1 {
+                warn!("CAS conflict for {} (retry {}/{})", key, retry, max_retries);
+                continue;
+            } else {
+                return Err(MetaError::Internal(format!(
+                    "CAS max retries exceeded for {}",
+                    key
+                )));
+            }
+        }
+        Err(MetaError::Internal(
+            "CAS update failed: unreachable".to_string(),
+        ))
     }
 }
