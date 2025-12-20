@@ -82,8 +82,10 @@ impl BenchConfig {
         let block_size_u32 = block_size_bytes
             .try_into()
             .expect("block size must fit into u32");
-        let mut layout = ChunkLayout::default();
-        layout.block_size = block_size_u32;
+        let layout = ChunkLayout {
+            block_size: block_size_u32,
+            ..Default::default()
+        };
 
         let backend = BackendMode::from_env();
         let meta_url =
@@ -240,6 +242,7 @@ impl FuseDriver {
             OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(true)
                 .open(&full)
                 .context("fuse create")?;
             Ok(())
@@ -256,6 +259,7 @@ impl FuseDriver {
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(true)
                 .open(&full)
                 .context("fuse write open")?;
             file.seek(SeekFrom::Start(offset))
@@ -270,7 +274,7 @@ impl FuseDriver {
 
     async fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         let full = self.full_path(path);
-        let buf = spawn_blocking(move || -> Result<Vec<u8>> {
+        spawn_blocking(move || -> Result<Vec<u8>> {
             use std::io::{Read, Seek, SeekFrom};
             let mut file = OpenOptions::new()
                 .read(true)
@@ -290,18 +294,16 @@ impl FuseDriver {
             }
             Ok(buf)
         })
-        .await?;
-        Ok(buf?)
+        .await?
     }
 
     async fn stat(&self, path: &str) -> Result<u64> {
         let full = self.full_path(path);
-        let size = spawn_blocking(move || -> Result<u64> {
+        spawn_blocking(move || -> Result<u64> {
             let meta = fs::metadata(&full).context("fuse stat")?;
             Ok(meta.len())
         })
-        .await?;
-        Ok(size?)
+        .await?
     }
 }
 

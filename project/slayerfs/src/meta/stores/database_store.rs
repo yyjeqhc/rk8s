@@ -790,6 +790,10 @@ impl DatabaseMetaStore {
 
 #[async_trait]
 impl MetaStore for DatabaseMetaStore {
+    fn name(&self) -> &'static str {
+        "database"
+    }
+
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
             let permission = file_meta.permission();
@@ -834,6 +838,84 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         Ok(None)
+    }
+
+    /// Batch stat implementation using SQL WHERE IN clause for optimal performance
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use concurrent queries for both tables - simpler and potentially faster
+        let file_query = FileMeta::find()
+            .filter(file_meta::Column::Inode.is_in(inodes.iter().copied()))
+            .all(&self.db);
+
+        let dir_query = AccessMeta::find()
+            .filter(access_meta::Column::Inode.is_in(inodes.iter().copied()))
+            .all(&self.db);
+
+        let (file_metas, access_metas) =
+            tokio::try_join!(file_query, dir_query).map_err(MetaError::Database)?;
+
+        // Build result map
+        let mut result_map: HashMap<i64, FileAttr> = HashMap::with_capacity(inodes.len());
+
+        // Process file_meta results
+        for file_meta in file_metas {
+            let permission = file_meta.permission();
+            let kind = if file_meta.symlink_target.is_some() {
+                FileType::Symlink
+            } else {
+                FileType::File
+            };
+            let size = if let Some(target) = &file_meta.symlink_target {
+                target.len() as u64
+            } else {
+                file_meta.size as u64
+            };
+            result_map.insert(
+                file_meta.inode,
+                FileAttr {
+                    ino: file_meta.inode,
+                    size,
+                    kind,
+                    mode: permission.mode,
+                    uid: permission.uid,
+                    gid: permission.gid,
+                    atime: file_meta.access_time,
+                    mtime: file_meta.modify_time,
+                    ctime: file_meta.create_time,
+                    nlink: file_meta.nlink as u32,
+                },
+            );
+        }
+
+        // Process access_meta results (directories)
+        for access_meta in access_metas {
+            let permission = access_meta.permission();
+            result_map.insert(
+                access_meta.inode,
+                FileAttr {
+                    ino: access_meta.inode,
+                    size: 4096,
+                    kind: FileType::Dir,
+                    mode: permission.mode,
+                    uid: permission.uid,
+                    gid: permission.gid,
+                    atime: access_meta.access_time,
+                    mtime: access_meta.modify_time,
+                    ctime: access_meta.create_time,
+                    nlink: access_meta.nlink as u32,
+                },
+            );
+        }
+
+        // Preserve input order
+        Ok(inodes
+            .iter()
+            .map(|ino| result_map.get(ino).cloned())
+            .collect())
     }
 
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
@@ -2120,7 +2202,7 @@ mod tests {
         store1
             .set_plock(
                 file_ino,
-                owner1 as i64,
+                owner1,
                 false,
                 FileLockType::Read,
                 FileLockRange { start: 0, end: 100 },
@@ -2134,7 +2216,7 @@ mod tests {
         store2
             .set_plock(
                 file_ino,
-                owner2 as i64,
+                owner2,
                 false,
                 FileLockType::Read,
                 FileLockRange { start: 0, end: 100 },
@@ -2257,7 +2339,7 @@ mod tests {
 
         // Verify lock exists
         let query = FileLockQuery {
-            owner: owner as i64,
+            owner,
             lock_type: FileLockType::Write,
             range: FileLockRange { start: 0, end: 100 },
         };
@@ -2303,7 +2385,7 @@ mod tests {
         store1
             .set_plock(
                 file_ino,
-                owner1 as i64,
+                owner1,
                 false,
                 FileLockType::Write,
                 FileLockRange { start: 0, end: 100 },
@@ -2317,7 +2399,7 @@ mod tests {
         store2
             .set_plock(
                 file_ino,
-                owner2 as i64,
+                owner2,
                 false,
                 FileLockType::Write,
                 FileLockRange {
@@ -2381,7 +2463,7 @@ mod tests {
             store1
                 .set_plock(
                     file_ino,
-                    owner1 as i64,
+                    owner1,
                     false,
                     FileLockType::Write,
                     FileLockRange { start: 0, end: 100 },
@@ -2397,7 +2479,7 @@ mod tests {
             store2
                 .set_plock(
                     file_ino,
-                    owner2 as i64,
+                    owner2,
                     false,
                     FileLockType::Read,
                     FileLockRange {
@@ -2416,7 +2498,7 @@ mod tests {
             let result = store3
                 .set_plock(
                     file_ino,
-                    owner3 as i64,
+                    owner3,
                     false,
                     FileLockType::Write,
                     FileLockRange {

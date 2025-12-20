@@ -20,7 +20,9 @@ use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, LeaseKeeper, PutOptions, Txn, TxnOp};
+use etcd_client::{
+    Client as EtcdClient, Compare, CompareOp, LeaseKeeper, PutOptions, Txn, TxnOp, TxnOpResponse,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
@@ -1169,50 +1171,172 @@ impl EtcdMetaStore {
 
 #[async_trait]
 impl MetaStore for EtcdMetaStore {
+    fn name(&self) -> &'static str {
+        "etcd"
+    }
+
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
-        if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
-            let permission = file_meta.permission();
-            let kind = if file_meta.symlink_target.is_some() {
-                FileType::Symlink
-            } else {
-                FileType::File
-            };
-            let size = if let Some(target) = &file_meta.symlink_target {
-                target.len() as u64
-            } else {
-                file_meta.size as u64
-            };
+        // Special case for root directory
+        if ino == 1 {
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             return Ok(Some(FileAttr {
-                ino: file_meta.inode,
+                ino: 1,
+                size: 4096,
+                kind: FileType::Dir,
+                mode: 0o40755,
+                uid: 0,
+                gid: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                nlink: 2,
+            }));
+        }
+
+        // Query reverse index once to get all metadata
+        let reverse_key = Self::etcd_reverse_key(ino);
+        if let Ok(Some(entry_info)) = self
+            .etcd_get_json_lenient::<EtcdEntryInfo>(&reverse_key)
+            .await
+        {
+            let permission = entry_info.permission;
+
+            // Determine file type and size based on metadata
+            let (kind, size) = if entry_info.is_file {
+                let file_type = if entry_info.symlink_target.is_some() {
+                    FileType::Symlink
+                } else {
+                    FileType::File
+                };
+                let file_size = if let Some(target) = &entry_info.symlink_target {
+                    target.len() as u64
+                } else {
+                    entry_info.size.unwrap_or(0) as u64
+                };
+                (file_type, file_size)
+            } else {
+                (FileType::Dir, 4096)
+            };
+
+            return Ok(Some(FileAttr {
+                ino,
                 size,
                 kind,
                 mode: permission.mode,
                 uid: permission.uid,
                 gid: permission.gid,
-                atime: file_meta.access_time,
-                mtime: file_meta.modify_time,
-                ctime: file_meta.create_time,
-                nlink: file_meta.nlink as u32,
-            }));
-        }
-
-        if let Ok(Some(access_meta)) = self.get_access_meta(ino).await {
-            let permission = access_meta.permission();
-            return Ok(Some(FileAttr {
-                ino: access_meta.inode,
-                size: 4096,
-                kind: FileType::Dir,
-                mode: permission.mode,
-                uid: permission.uid,
-                gid: permission.gid,
-                atime: access_meta.access_time,
-                mtime: access_meta.modify_time,
-                ctime: access_meta.create_time,
-                nlink: access_meta.nlink as u32,
+                atime: entry_info.access_time,
+                mtime: entry_info.modify_time,
+                ctime: entry_info.create_time,
+                nlink: entry_info.nlink,
             }));
         }
 
         Ok(None)
+    }
+
+    /// Batch stat implementation for Etcd using Transaction batch GET
+    /// Uses single transaction to fetch multiple keys - much faster than sequential queries
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Etcd transaction has ~128 operations limit, process in chunks
+        const MAX_KEYS_PER_TXN: usize = 100;
+
+        let mut results: Vec<Option<FileAttr>> = vec![None; inodes.len()];
+
+        // Process in chunks to respect Etcd transaction limits
+        for (chunk_idx, chunk) in inodes.chunks(MAX_KEYS_PER_TXN).enumerate() {
+            let chunk_offset = chunk_idx * MAX_KEYS_PER_TXN;
+
+            // Build transaction with GET operations for all inodes in chunk
+            let mut get_ops = Vec::new();
+            for &ino in chunk {
+                let reverse_key = Self::etcd_reverse_key(ino);
+                get_ops.push(TxnOp::get(reverse_key.as_bytes(), None));
+            }
+
+            // Execute transaction - all GETs in single round trip
+            let mut client_clone = self.client.clone();
+            let txn = Txn::new().and_then(get_ops);
+            let txn_response = client_clone
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd batch txn error: {}", e)))?;
+
+            let responses = txn_response.op_responses();
+
+            // Parse responses - one response per inode
+            for (i, &ino) in chunk.iter().enumerate() {
+                let result_idx = chunk_offset + i;
+
+                // Handle special case for root inode
+                if ino == 1 {
+                    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    results[result_idx] = Some(FileAttr {
+                        ino: 1,
+                        size: 4096,
+                        kind: FileType::Dir,
+                        mode: 0o40755,
+                        uid: 0,
+                        gid: 0,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                        nlink: 2,
+                    });
+                    continue;
+                }
+
+                // Get response for this inode
+                if let Some(resp) = responses.get(i) {
+                    // TxnOpResponse is an enum, match to extract GetResponse
+                    if let TxnOpResponse::Get(range_resp) = resp
+                        && let Some(kv) = range_resp.kvs().first()
+                    {
+                        // Parse EtcdEntryInfo from the value
+                        if let Ok(entry_info) = serde_json::from_slice::<EtcdEntryInfo>(kv.value())
+                        {
+                            let permission = entry_info.permission;
+
+                            // Determine file type and size
+                            let (kind, size) = if entry_info.is_file {
+                                let file_type = if entry_info.symlink_target.is_some() {
+                                    FileType::Symlink
+                                } else {
+                                    FileType::File
+                                };
+                                let file_size = if let Some(target) = &entry_info.symlink_target {
+                                    target.len() as u64
+                                } else {
+                                    entry_info.size.unwrap_or(0) as u64
+                                };
+                                (file_type, file_size)
+                            } else {
+                                (FileType::Dir, 4096)
+                            };
+
+                            results[result_idx] = Some(FileAttr {
+                                ino,
+                                size,
+                                kind,
+                                mode: permission.mode,
+                                uid: permission.uid,
+                                gid: permission.gid,
+                                atime: entry_info.access_time,
+                                mtime: entry_info.modify_time,
+                                ctime: entry_info.create_time,
+                                nlink: entry_info.nlink,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
@@ -2827,7 +2951,7 @@ mod tests {
         store1
             .set_plock(
                 file_ino,
-                owner1 as i64,
+                owner1,
                 false,
                 FileLockType::Write,
                 FileLockRange { start: 0, end: 100 },
@@ -2841,7 +2965,7 @@ mod tests {
         store2
             .set_plock(
                 file_ino,
-                owner2 as i64,
+                owner2,
                 false,
                 FileLockType::Write,
                 FileLockRange {
@@ -2921,7 +3045,7 @@ mod tests {
             store2
                 .set_plock(
                     file_ino,
-                    owner2 as i64,
+                    owner2,
                     false,
                     FileLockType::Read,
                     FileLockRange {
@@ -2940,7 +3064,7 @@ mod tests {
             let result = store3
                 .set_plock(
                     file_ino,
-                    owner3 as i64,
+                    owner3,
                     false,
                     FileLockType::Write,
                     FileLockRange {

@@ -15,6 +15,7 @@ use crate::meta::stores::{CacheInvalidationEvent, EtcdMetaStore, EtcdWatchWorker
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use futures::stream;
 use if_addrs::get_if_addrs;
 use moka::future::Cache;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use std::{collections::HashSet, process};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::vfs::extract_ino_and_chunk_index;
@@ -52,6 +53,75 @@ pub struct MetaClientOptions {
     /// When true, lookups fall back to case-insensitive matching similar to
     /// JuiceFS `CaseInsensi`.
     pub case_insensitive: bool,
+    /// Batch attribute prefetch configuration
+    pub batch_prefetch: BatchPrefetchConfig,
+}
+
+/// Configuration for batch attribute prefetching during opendir
+#[derive(Debug, Clone)]
+pub struct BatchPrefetchConfig {
+    /// Enable batch prefetching
+    pub enabled: bool,
+    /// Batch size for each query (default: 200)
+    pub batch_size: usize,
+    /// Maximum concurrent batches (default: 3)
+    pub max_concurrency: usize,
+    /// Timeout per batch (default: 100ms per batch)
+    /// Total timeout = base_timeout + (num_batches * prefetch_timeout)
+    pub prefetch_timeout: Duration,
+}
+
+impl Default for BatchPrefetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            batch_size: 200,
+            max_concurrency: 3,
+            prefetch_timeout: Duration::from_millis(100),
+        }
+    }
+}
+
+impl BatchPrefetchConfig {
+    /// Create optimized config for traditional databases like Postgres/sqlite
+    pub fn for_database() -> Self {
+        Self {
+            enabled: true,
+            batch_size: 500,
+            max_concurrency: 5,
+            prefetch_timeout: Duration::from_millis(100),
+        }
+    }
+
+    /// Create optimized config for Redis
+    pub fn for_redis() -> Self {
+        Self {
+            enabled: true,
+            batch_size: 300,     // Redis MGET is very fast
+            max_concurrency: 10, // Redis supports high concurrency
+            prefetch_timeout: Duration::from_millis(50),
+        }
+    }
+
+    /// Create optimized config for Etcd
+    pub fn for_etcd() -> Self {
+        Self {
+            enabled: true,
+            batch_size: 100, // Etcd Txn limited to ~128 ops
+            max_concurrency: 3,
+            prefetch_timeout: Duration::from_millis(500), // Longer timeout for network latency
+        }
+    }
+
+    /// Automatically select optimal config based on backend store name
+    pub fn for_store(store_name: &str) -> Self {
+        match store_name {
+            name if name.contains("database") => Self::for_database(),
+            name if name.contains("redis") => Self::for_redis(),
+            name if name.contains("etcd") => Self::for_etcd(),
+            _ => Self::default(),
+        }
+    }
 }
 
 impl Default for MetaClientOptions {
@@ -62,6 +132,7 @@ impl Default for MetaClientOptions {
             read_only: false,
             no_background_jobs: false,
             case_insensitive: false,
+            batch_prefetch: BatchPrefetchConfig::default(),
         }
     }
 }
@@ -125,8 +196,20 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         store: Arc<T>,
         capacity: CacheCapacity,
         ttl: CacheTtl,
-        options: MetaClientOptions,
+        mut options: MetaClientOptions,
     ) -> Arc<Self> {
+        // Auto-configure batch prefetch based on backend type if not explicitly configured
+        if options.batch_prefetch.batch_size == BatchPrefetchConfig::default().batch_size {
+            let store_name = store.name();
+            options.batch_prefetch = BatchPrefetchConfig::for_store(store_name);
+            debug!(
+                "store_name: {} Batch prefetch config: size={}, concurrency={}",
+                store_name,
+                options.batch_prefetch.batch_size,
+                options.batch_prefetch.max_concurrency
+            );
+        }
+
         // Detect if this is an etcd backend and start Watch Worker
         let watch_worker = if options.no_background_jobs {
             None
@@ -149,7 +232,7 @@ impl<T: MetaStore + 'static> MetaClient<T> {
                 warn!("Failed to start Watch Worker: {}", e);
                 None
             } else {
-                info!("Watch Worker started for etcd backend");
+                debug!("Watch Worker started for etcd backend");
 
                 // Start the invalidation handler after creating MetaClient
                 let worker_arc = Arc::new(worker);
@@ -621,6 +704,147 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         }
         Ok(None)
     }
+
+    /// Batch prefetch attributes for directory entries in background
+    ///
+    /// This method starts a background task that:
+    /// 1. Collects inodes that need prefetching (not in cache)
+    /// 2. Splits them into batches
+    /// 3. Queries each batch concurrently
+    /// 4. Inserts results into cache
+    ///
+    /// Returns a tuple of (done_flag, task_handle)
+    pub fn spawn_batch_prefetch(
+        self: &Arc<Self>,
+        ino: i64,
+        entries: &[DirEntry],
+    ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let config = &self.options.batch_prefetch;
+
+        if !config.enabled || entries.is_empty() {
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let handle = tokio::spawn(async {});
+            return (done, handle);
+        }
+
+        // Collect inodes that need to be fetched
+        let inodes_to_fetch: Vec<i64> = entries.iter().map(|e| e.ino).collect();
+
+        let batch_size = config.batch_size;
+        let max_concurrency = config.max_concurrency;
+        let prefetch_timeout = config.prefetch_timeout;
+        let done_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag_clone = Arc::clone(&done_flag);
+
+        let client = Arc::clone(self);
+        let parent_ino = ino; // Capture parent directory inode for the async block
+
+        let task = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            debug!(
+                "Starting batch prefetch for directory inode {}: {} entries, batch_size={}, max_concurrency={}, timeout={:?}",
+                parent_ino,
+                inodes_to_fetch.len(),
+                batch_size,
+                max_concurrency,
+                prefetch_timeout
+            );
+
+            // Split into batches
+            let chunks: Vec<Vec<i64>> = inodes_to_fetch
+                .chunks(batch_size)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+
+            let total_batches = chunks.len();
+
+            // Calculate dynamic timeout based on number of batches
+            // Base timeout + per-batch timeout to handle large directories fairly
+            let base_timeout = Duration::from_millis(200);
+            let total_timeout = base_timeout + prefetch_timeout * (total_batches as u32);
+
+            // Process batches with controlled concurrency using stream
+            // Spawn into a separate task so timeout won't cancel the work
+            let prefetch_handle = tokio::spawn(async move {
+                use futures::stream::StreamExt;
+                stream::iter(chunks.into_iter().enumerate())
+                    .map(|(batch_idx, chunk)| {
+                        let client_clone = Arc::clone(&client);
+                        let parent = parent_ino;  // Capture parent for inner async block
+                        async move {
+                            let batch_start = std::time::Instant::now();
+                            match client_clone.store.batch_stat(&chunk).await {
+                                Ok(attrs) => {
+                                    let mut cached_count = 0;
+                                    // Insert results into cache
+                                    for (child_ino, attr_opt) in chunk.iter().zip(attrs.iter()) {
+                                        if let Some(attr) = attr_opt {
+                                            client_clone
+                                                .inode_cache
+                                                .insert_node(*child_ino, attr.clone(), Some(parent))
+                                                .await;
+                                            cached_count += 1;
+                                        }
+                                    }
+                                    debug!(
+                                        "Batch {}/{} completed: {} inodes queried, {} cached in {:?}",
+                                        batch_idx + 1,
+                                        total_batches,
+                                        chunk.len(),
+                                        cached_count,
+                                        batch_start.elapsed()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Batch {}/{} failed: {} - continuing with remaining batches",
+                                        batch_idx + 1,
+                                        total_batches,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .buffer_unordered(max_concurrency)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                debug!(
+                    "All batches completed for directory inode {}: {} total inodes in {:?}",
+                    parent_ino,
+                    inodes_to_fetch.len(),
+                    start.elapsed()
+                );
+            });
+
+            // Wait for completion with dynamic timeout
+            // Timeout = base(200ms) + batches * per_batch_timeout
+            // Small dir (1 batch): 200 + 100 = 300ms
+            // Large dir (50 batches): 200 + 50*100 = 5200ms
+            match tokio::time::timeout(total_timeout, prefetch_handle).await {
+                Ok(Ok(())) => {
+                    debug!(
+                        "Prefetch for dir {} completed within timeout {:?} ({} batches)",
+                        parent_ino, total_timeout, total_batches
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!("Prefetch task for dir {} panicked: {}", parent_ino, e);
+                }
+                Err(_) => {
+                    warn!(
+                        "Prefetch for dir {} timed out after {:?} ({} batches), task continues in background",
+                        parent_ino, total_timeout, total_batches
+                    );
+                }
+            }
+
+            done_flag_clone.store(true, Ordering::Release);
+        });
+
+        (done_flag, task)
+    }
 }
 
 #[async_trait]
@@ -704,14 +928,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             entries.iter().map(|e| (e.name.clone(), e.ino)).collect();
         self.inode_cache.load_children(inode, children_data).await;
 
-        // Also cache each child's attributes
-        for entry in &entries {
-            if let Ok(Some(attr)) = self.store.stat(entry.ino).await {
-                self.inode_cache
-                    .insert_node(entry.ino, attr, Some(inode))
-                    .await;
-            }
-        }
+        // Note: We don't pre-fetch attributes here anymore
+        // Attributes will be batch-fetched in spawn_batch_prefetch during opendir
 
         Ok(entries)
     }
