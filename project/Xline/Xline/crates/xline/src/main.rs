@@ -146,6 +146,7 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::{debug, info};
 use xline::{
     server::XlineServer,
+    shutdown_shared_quic,
     utils::{init_metrics, init_subscriber, parse_config},
 };
 
@@ -187,6 +188,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    shutdown_shared_quic();
     global::shutdown_tracer_provider();
     // TODO: Since the `shutdown_meter_provider` has removed in the latest version of opentelemetry, we use `NoopMeterProvider` to replace it.
     // FYI: https://github.com/open-telemetry/opentelemetry-rust/pull/1623
