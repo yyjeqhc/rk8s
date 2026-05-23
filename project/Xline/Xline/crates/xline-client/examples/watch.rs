@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
     //
     // The _sender field in WatchStreaming is a lifecycle pin: even if Watcher
     // is dropped, the handler task stays alive until WatchStreaming is dropped.
+    //
+    // For explicit cleanup, call close() on either side:
+    //   watcher.close();  // closes channel, stream will return None
+    //   stream.close();   // same effect
     let (mut watcher, mut stream) = watch_client.watch("key1", None).await?;
     kv_client.put("key1", "value1", None).await?;
 

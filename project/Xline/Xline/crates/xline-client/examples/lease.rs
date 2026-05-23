@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
     // Drop order: drop LeaseStreaming first (or both together).
     // Dropping LeaseKeeper alone leaves the handler task alive until
     // LeaseStreaming is also dropped.
+    //
+    // For explicit cleanup, call close() on either side:
+    //   keeper.close();  // closes channel, stream will return None
+    //   stream.close();  // same effect
     let (mut keeper, mut stream) = client.keep_alive(lease_id2).await?;
 
     if let Some(resp) = stream.message().await? {

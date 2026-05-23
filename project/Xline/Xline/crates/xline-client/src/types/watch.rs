@@ -116,6 +116,32 @@ impl Watcher {
             .try_send(request)
             .map_err(|e| XlineClientError::WatchError(e.to_string()))
     }
+
+    /// Closes the request channel, causing the handler task to exit and the
+    /// QUIC stream to close. This also affects [`WatchStreaming`] since both
+    /// share the same channel. After calling `close()`, subsequent `watch()`,
+    /// `cancel()`, and `request_progress()` calls will fail.
+    ///
+    /// This is equivalent to dropping both `Watcher` and `WatchStreaming`.
+    /// Call this when you want to explicitly signal cleanup without relying
+    /// on Drop.
+    #[inline]
+    pub fn close(&mut self) {
+        self.sender.close_channel();
+        debug!(watch_id = self.watch_id, "Watcher channel closed");
+    }
+
+    /// Returns whether the request channel is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        debug!(watch_id = self.watch_id, "Watcher dropped");
+    }
 }
 
 /// Watch Request
@@ -293,6 +319,26 @@ impl WatchStreaming {
     #[inline]
     pub async fn message(&mut self) -> Result<Option<WatchResponse>> {
         self.inner.message().await.map_err(Into::into)
+    }
+
+    /// Closes the request channel, causing the handler task to exit and the
+    /// QUIC stream to close. This also affects [`Watcher`] since both share
+    /// the same channel. After calling `close()`, subsequent `message()` calls
+    /// will return `None`.
+    ///
+    /// This is equivalent to dropping both `WatchStreaming` and `Watcher`.
+    /// Call this when you want to explicitly signal cleanup without relying
+    /// on Drop.
+    #[inline]
+    pub fn close(&mut self) {
+        self._sender.close_channel();
+        debug!("WatchStreaming channel closed");
+    }
+
+    /// Returns whether the request channel is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self._sender.is_closed()
     }
 }
 

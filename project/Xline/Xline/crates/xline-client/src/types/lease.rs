@@ -4,6 +4,7 @@ use std::{
 };
 
 use futures::{Stream, channel::mpsc::Sender};
+use tracing::debug;
 pub use xlineapi::{
     LeaseGrantResponse, LeaseKeepAliveResponse, LeaseLeasesResponse, LeaseRevokeResponse,
     LeaseStatus, LeaseTimeToLiveResponse,
@@ -66,6 +67,32 @@ impl LeaseKeeper {
             .try_send(xlineapi::LeaseKeepAliveRequest { id: self.id })
             .map_err(|e| XlineClientError::LeaseError(e.to_string()))
     }
+
+    /// Closes the request channel, causing the handler task to exit and the
+    /// QUIC stream to close. This also affects [`LeaseStreaming`] since both
+    /// share the same channel. After calling `close()`, subsequent
+    /// `keep_alive()` calls will fail.
+    ///
+    /// This is equivalent to dropping both `LeaseKeeper` and `LeaseStreaming`.
+    /// Call this when you want to explicitly signal cleanup without relying
+    /// on Drop.
+    #[inline]
+    pub fn close(&mut self) {
+        self.sender.close_channel();
+        debug!(lease_id = self.id, "LeaseKeeper channel closed");
+    }
+
+    /// Returns whether the request channel is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        debug!(lease_id = self.id, "LeaseKeeper dropped");
+    }
 }
 
 /// Lease keep-alive response stream.
@@ -112,6 +139,26 @@ impl LeaseStreaming {
     #[inline]
     pub async fn message(&mut self) -> Result<Option<LeaseKeepAliveResponse>> {
         self.inner.message().await.map_err(Into::into)
+    }
+
+    /// Closes the request channel, causing the handler task to exit and the
+    /// QUIC stream to close. This also affects [`LeaseKeeper`] since both
+    /// share the same channel. After calling `close()`, subsequent
+    /// `message()` calls will return `None`.
+    ///
+    /// This is equivalent to dropping both `LeaseStreaming` and `LeaseKeeper`.
+    /// Call this when you want to explicitly signal cleanup without relying
+    /// on Drop.
+    #[inline]
+    pub fn close(&mut self) {
+        self._sender.close_channel();
+        debug!("LeaseStreaming channel closed");
+    }
+
+    /// Returns whether the request channel is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self._sender.is_closed()
     }
 }
 
