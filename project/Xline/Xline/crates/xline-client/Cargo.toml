@@ -38,6 +38,7 @@ xlinerpc = { path = "../xlinerpc" }
 rand = "0.8.5"
 serial_test = "3"
 test-macros = { path = "../test-macros" }
+tracing-subscriber = { workspace = true }
 xline-test-utils = { path = "../xline-test-utils" }
 
 [lints]

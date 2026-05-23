@@ -271,10 +271,6 @@ impl H3Channel {
         }
     }
 
-    // Each RPC creates a new QUIC connection, H3 session, and driver task.
-    // This is intentional: h3 SendRequest is Clone (connection reuse is feasible)
-    // but the current design prioritizes simplicity over performance.
-    // See H3ClientFactory doc for the connection reuse analysis.
     pub async fn unary<Req, Resp>(
         &self,
         path: &str,
@@ -287,11 +283,11 @@ impl H3Channel {
         Resp: Message + Default,
     {
         let (endpoint_str, conn) = self.connect_with_retry().await?;
+
         it_debug(format!(
             "h3 init start endpoint={} path={}",
             endpoint_str, path
         ));
-
         let (mut h3_driver, mut send_req) =
             with_timeout(effective_timeout(self.timeout), "h3 init", async {
                 h3::client::new(h3_shim::QuicConnection::new(Arc::new(conn)))
@@ -299,23 +295,21 @@ impl H3Channel {
                     .map_err(|e| Status::unavailable(format!("h3 init error: {e}")))
             })
             .await?;
-        it_debug(format!(
-            "h3 init ok endpoint={} path={}",
-            endpoint_str, path
-        ));
-
-        let request = Self::build_request(path, method_id_hex, metadata, &endpoint_str)?;
-        let mut stream = with_timeout(effective_timeout(self.timeout), "send request", async {
-            send_req
-                .send_request(request)
-                .await
-                .map_err(h3_stream_error_to_status)
-        })
-        .await?;
+        it_debug(format!("h3 init ok endpoint={}", endpoint_str));
 
         let _driver = tokio::spawn(async move {
             let _ = h3_driver.wait_idle().await;
         });
+
+        let request = Self::build_request(path, method_id_hex, metadata, &endpoint_str)?;
+        let mut stream: H3RequestStream =
+            with_timeout(effective_timeout(self.timeout), "send request", async {
+                send_req
+                    .send_request(request)
+                    .await
+                    .map_err(h3_stream_error_to_status)
+            })
+            .await?;
 
         let grpc_body = grpc::frame_encode(&req)?;
         with_timeout(self.timeout, "send request body", async {

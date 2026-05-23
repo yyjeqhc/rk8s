@@ -76,12 +76,12 @@ The QUIC handshake dominates. Connection reuse would eliminate this for subseque
 - **CURP quorum connections**: Each CURP request uses a separate bidi stream. This benchmark did not evaluate CURP-level connection pooling; it should be assessed separately.
 - **Server-side**: No client connection state to pool
 
-### Minimal Safe Design
+### Minimal Safe Design (Future Idea — Not Implemented)
 
-The current code has **no connection pool** — `H3ClientFactory` is just an `Arc<QuicClient>` wrapper; every RPC creates a fresh QUIC connection. A future implementation could use a session cache:
+The current code has **no connection pool** — `H3ClientFactory` is just an `Arc<QuicClient>` wrapper; every RPC creates a fresh QUIC connection. A future implementation could use a session cache, but as shown in the CRITICAL FINDING below, this would not benefit KV workloads:
 
 ```
-// NOT current code — future design sketch
+// Future idea — NOT implemented, NOT committed
 H3SessionKey {
     endpoint_authority: String,  // e.g. "server0:2379"
     server_name: String,         // SNI target
@@ -92,20 +92,9 @@ H3SessionCache {  // or H3PoolPrototype
     sessions: DashMap<H3SessionKey, (SendRequest, JoinHandle)>,
     client: QuicClient,
 }
-
-// On first request to a server:
-//   1. Build H3SessionKey from endpoint + TLS config
-//   2. QUIC connect → h3::client::new → (conn, send_req, driver)
-//   3. Store (send_req, driver_handle) in cache
-//   4. Spawn driver task
-// On subsequent requests:
-//   1. Look up cache by H3SessionKey
-//   2. Clone send_req, call send_request()
-//   3. No new QUIC connection
-// On connection error:
-//   1. Remove from cache
-//   2. Reconnect on next request
 ```
+
+**Why this was not implemented**: KV operations bypass H3Channel entirely (see CRITICAL FINDING). The cache would only benefit `compact()` and `status()` — rarely called operations.
 
 ### Expected Improvement (Estimated)
 
@@ -121,17 +110,61 @@ With connection reuse in a long-running client:
 3. **Memory**: Each connection holds TLS state + QUIC state. Pool size limit needed.
 4. **Concurrency**: Multiple streams on same connection share bandwidth. May need per-server connection limit.
 
+## CRITICAL FINDING: KV Operations Bypass H3Channel Entirely
+
+**All KV operations (put, get, delete, txn, compact) go through `curp_client.propose()` → CURP's `QuicChannel`, NOT through `H3Channel`.**
+
+| Operation | Transport Path | H3Channel Used? |
+|-----------|---------------|-----------------|
+| KV put/get/delete/range/txn | `curp_client.propose()` → CURP QuicChannel | **NO** |
+| Watch | `channel.client_streaming()` → H3Channel | Yes (but not unary cache) |
+| Lease keepalive | `channel.client_streaming()` → H3Channel | Yes (but not unary cache) |
+| Compact | `channel.unary()` → H3Channel | **Yes** |
+| Status | `channel.unary()` → H3Channel | **Yes** |
+| Auth | varies → H3Channel | Yes |
+| Cluster member operations | `curp_client.propose()` → CURP | **NO** |
+
+### Impact on Connection Cache (Tested, Not Committed)
+
+A prototype H3 session cache was built and benchmarked. It only cached `H3Channel::unary()` connections. Since KV operations bypass H3Channel entirely, **the cache had zero effect on KV workloads**.
+
+Both baseline and cached benchmarks showed identical performance (~265ms avg, ~3.8 req/s) because the workload (KV put+get) doesn't touch H3Channel at all. The prototype was rolled back — no runtime H3 cache code is committed.
+
+The cache would only benefit:
+- `compact()` operations (rarely called)
+- `status()` operations (monitoring only)
+- Auth operations (once per session)
+
+### Implications for Connection Pool Direction
+
+1. **H3Channel caching is the wrong target** for KV workload optimization
+2. **CURP QuicChannel** is where KV operations live — that's where connection reuse matters
+3. Watch and lease use `client_streaming()`, not `unary()` — the cache doesn't apply there either
+4. The per-RPC connection overhead comes from CURP, not H3
+
+### Revised Connection Reuse Strategy
+
+If connection reuse is pursued, it should target **CURP's `QuicChannel`**, not `H3Channel`:
+
+```
+Current: KvClient → curp_client.propose() → QuicChannel.get_connection() → new QUIC conn per RPC
+Target:  KvClient → curp_client.propose() → QuicChannel.get_connection() → cached QUIC conn
+```
+
+The `QuicChannel` already has round-robin retry across endpoints. Adding a connection cache at this level would benefit all KV operations.
+
 ## Recommendations
 
 1. **For `xlinectl` (CLI tool)**: Connection pool has minimal benefit — each invocation is short-lived and cannot reuse connections. The ~1.3s per invocation comes from QUIC/TLS handshake, cluster discovery, and connection setup, not server-side execution.
 
-2. **For `xline-client` (library)**: Connection pool has significant benefit for long-running clients (watch, lease keepalive, repeated KV ops). The library already creates one H3Channel per client — pooling at this level is natural.
+2. **For `xline-client` (library)**: H3Channel connection caching has minimal benefit — KV operations bypass H3Channel. CURP connection caching would benefit KV operations, but requires changes in the `curp` crate.
 
-3. **For CURP (quorum)**: Uses bidi streams. This benchmark did not evaluate CURP-level pooling; it should be assessed separately.
+3. **For CURP (quorum)**: Connection reuse at the QuicChannel level would eliminate per-RPC QUIC handshake overhead for KV operations. This is the highest-value target.
 
-4. **Priority**: Low. The current pattern works correctly. Connection pool is an optimization for library users, not a correctness issue.
+4. **Priority**: Low. The current pattern works correctly. Connection pool is an optimization for library users, not a correctness issue. If pursued, target CURP's QuicChannel, not H3Channel.
 
 ## Files
 
 - `scripts/quic_h3_benchmark.sh` — benchmark script
+- `crates/xline-client/examples/client_kv_benchmark.rs` — long-running KV benchmark (demonstrates H3 cache is not on hot path)
 - `docs/quic-h3-benchmark.md` — this document
