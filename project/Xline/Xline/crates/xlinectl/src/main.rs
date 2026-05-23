@@ -366,6 +366,23 @@ fn validate_endpoints(endpoints: &[String]) -> Result<()> {
                  Hint: Use 'host:port' format, e.g., 'https://server0:2379'."
             );
         }
+        let host = stripped
+            .rsplit_once(':')
+            .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+            .unwrap_or(stripped);
+        if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+            anyhow::bail!(
+                "Endpoint '{ep}' uses an IP address or 'localhost' as the hostname.\n\
+                 Xline QUIC routing uses the endpoint hostname as the TLS SNI (Server Name Indication)\n\
+                 to route connections to the correct server. An IP address can only be registered by\n\
+                 one server, so connections to other servers on the same IP will fail.\n\
+                 \n\
+                 Use DNS server names instead:\n\
+                 1. Use 'https://server0:2379' (not 'https://127.0.0.1:2379')\n\
+                 2. Map server names in /etc/hosts: echo '127.0.0.1 server0 server1 server2' >> /etc/hosts\n\
+                 3. Ensure the server's TLS certificate includes the DNS name in its SAN"
+            );
+        }
     }
     Ok(())
 }

@@ -184,10 +184,22 @@ impl H3Channel {
                     "connected_to_with_source failed for server_name={}: {}",
                     server_name, e
                 ));
+                let ip_hint = if server_name.parse::<std::net::IpAddr>().is_ok() {
+                    format!(
+                        "\n  Hint: QUIC SNI routing uses the endpoint hostname as the TLS SNI (Server Name Indication). \
+                        An IP address like '{server_name}' can only be registered by one server. \
+                        Use a DNS name (e.g., 'https://server0:{port}') and map it in /etc/hosts: \
+                        'echo \"127.0.0.1 server0\" >> /etc/hosts'",
+                        server_name = server_name,
+                        port = socket_addr.port(),
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(Status::unavailable(format!(
                     "QUIC connect error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}\n\
                      Hint: Verify the server is running and reachable. If using TLS, check that the CA certificate is correct \
-                     and the server's cert includes '{server_name}' in its Subject Alternative Name."
+                     and the server's cert includes '{server_name}' in its Subject Alternative Name.{ip_hint}"
                 )));
             }
         };
@@ -213,10 +225,21 @@ impl H3Channel {
                         "quic handshake FAILED endpoint={} server_name={}: {}",
                         endpoint_str, server_name, e
                     ));
+                    let ip_hint = if server_name.parse::<std::net::IpAddr>().is_ok() {
+                        format!(
+                            "\n  Hint: QUIC SNI routing uses the endpoint hostname as the TLS SNI. \
+                            An IP address like '{server_name}' can only be registered by one server. \
+                            Use a DNS name (e.g., 'https://server0:{port}') and map it in /etc/hosts.",
+                            server_name = server_name,
+                            port = socket_addr.port(),
+                        )
+                    } else {
+                        String::new()
+                    };
                     Err(Status::unavailable(format!(
                         "QUIC handshake error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}\n\
                          Hint: TLS handshake failure often means the CA certificate doesn't match the server's cert, \
-                         or the server's cert SAN doesn't include '{server_name}'."
+                         or the server's cert SAN doesn't include '{server_name}'.{ip_hint}"
                     )))
                 }
             }

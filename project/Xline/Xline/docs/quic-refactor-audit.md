@@ -1242,11 +1242,11 @@ ca.crt (self-signed CA)
 The QUIC server uses SNI (Server Name Indication) to route connections to the correct virtual server. The SNI routing table is populated from:
 
 1. **Server name** (`--name server0`)
-2. **Advertise URL hosts** (`--client-advertise-urls https://server0:2379`)
+2. **URL hosts** from listen URLs (`--client-listen-urls https://127.0.0.1:2379`)
 
-IP addresses and `localhost` are NOT registered as SNI aliases. Connections with IP/localhost as SNI fail at the QUIC routing level (before TLS verification), even though the cert includes those SANs.
+When multiple servers share the same IP (e.g., `127.0.0.1:2379`, `127.0.0.1:2381`, `127.0.0.1:2383`), only the **first** server to register that IP as an SNI alias succeeds. Subsequent registrations fail silently. Additionally, the `ServerAuther` validates that the SNI-matched server is bound to the specific interface that received the packet. This means IP-based SNI only works for one server per IP address.
 
-**To use IP endpoints**: Add `localhost` to the advertise URLs or modify `server_registry.rs` to register listen URL hosts as SNI aliases.
+See §26 for full root cause analysis and behavior.
 
 ### CA Certificate Behavior by Component
 
@@ -1263,7 +1263,78 @@ IP addresses and `localhost` are NOT registered as SNI aliases. Connections with
 1. **Production**: Always specify `--ca_cert_pem_path` explicitly. Never rely on auto-discovery.
 2. **Development**: The `fixtures/ca.crt` auto-discovery is a convenience for developers running from source. It does NOT work in release builds.
 3. **mTLS**: Use `--peer-cert-path`, `--peer-key-path`, `--peer-ca-cert-path` for mutual TLS. The server verifies client certs against the peer CA.
-4. **IP endpoints**: Use DNS names (e.g., `server0`) instead of IP addresses for endpoints. IP endpoints fail at QUIC SNI routing level.
+4. **IP endpoints**: Use DNS names (e.g., `server0`) instead of IP addresses for endpoints. IP endpoints fail at QUIC SNI routing level. See §26.
+
+---
+
+## §26 IP Endpoint and SNI Routing Analysis
+
+### Root Cause
+
+QUIC SNI routing in dquic uses a `DashMap<String, Server>` keyed by server name. The `VirtualHosts::resolve()` method (rustls `ResolvesServerCert` impl) looks up the SNI from the TLS ClientHello to select the server certificate. The `ServerAuther::verify_client_name()` then validates that the matched server is bound to the interface that received the packet.
+
+**Why `https://127.0.0.1:2379` fails:**
+
+1. `ServerRegistry::register_sni_aliases()` registers URL hosts as SNI aliases via `dquic::QuicListeners::add_server(host, ...)`.
+2. `add_server()` returns `ServerError::ServerAlreadyExists` if the name is already in the `DashMap`. Only the **first** server to register an IP wins.
+3. For `127.0.0.1`: server0 registers first → `DashMap["127.0.0.1"]` = server0's cert + bind interfaces (`127.0.0.1:2379`, `127.0.0.1:2380`).
+4. server1 and server2's attempts to register `127.0.0.1` fail silently (non-fatal warning in logs).
+5. When a client connects to `127.0.0.1:2381` with SNI=`127.0.0.1`:
+   - TLS handshake: `VirtualHosts::resolve("127.0.0.1")` → server0's cert (has `IP:127.0.0.1` SAN) → handshake succeeds
+   - Auth: `ServerAuther` checks `servers["127.0.0.1"].bind_ifaces.contains_key(127.0.0.1:2381)` → **false** (server0 only has 2379, 2380)
+   - Result: `ClientNameVerifyResult::Refuse` → connection dropped → client sees "No viable network path"
+
+**Why `https://localhost:2379` fails:**
+
+1. `localhost` resolves via DNS to `127.0.0.1` (or `::1`).
+2. If `127.0.0.1`: same SNI routing issue as above.
+3. If `::1`: server binds to `127.0.0.1:2379` (IPv4), not `[::1]:2379` (IPv6) → UDP packet doesn't reach server → timeout.
+
+### What It Is NOT
+
+- **NOT a TLS SAN failure**: The cert includes `IP:127.0.0.1`, `DNS:localhost`, `DNS:server0`. TLS handshake succeeds.
+- **NOT a DNS failure**: IP addresses don't need DNS resolution.
+- **IS a QUIC SNI routing failure**: The SNI-to-server mapping is ambiguous when multiple servers share the same IP.
+
+### Behavior Summary
+
+| Endpoint | Result | Error Type | Root Cause |
+|----------|--------|-----------|------------|
+| `https://server0:2379` | ✅ OK | — | DNS name, unique SNI |
+| `https://127.0.0.1:2379` | ❌ Fail | No viable network path | SNI "127.0.0.1" → wrong server, interface check fails |
+| `https://127.0.0.1:2381` | ❌ Fail | No viable network path | Same: SNI "127.0.0.1" → server0 (port 2379), not server1 |
+| `https://localhost:2379` | ❌ Fail | Timeout | DNS resolves to `::1` (IPv6), server listens on IPv4 |
+| `https://server0:2381` | ❌ Fail | Port mismatch | SNI "server0" → correct server, but wrong port routing |
+
+### Mitigations Applied
+
+1. **xlinectl `validate_endpoints()`**: Detects IP/localhost/IPv6 endpoints and rejects them with actionable guidance: use DNS names + `/etc/hosts`.
+2. **h3_client.rs error hints**: When server_name is an IP address and connect/handshake fails, adds SNI routing explanation to the error message.
+
+### Why Not Support IP Endpoints
+
+Supporting IP endpoints would require one of:
+
+- **(A) `--server-name` CLI flag**: Override SNI separately from endpoint host. New public API, increases complexity.
+- **(B) Port-based SNI routing**: Register `127.0.0.1:2379` as SNI alias. Non-standard (SNI is hostname, not host:port), breaks TLS cert validation.
+- **(C) Remove interface validation**: Allow any server to handle any SNI on any port. Breaks multi-tenant isolation.
+
+None of these are low-risk. The recommended approach is DNS names via `/etc/hosts`.
+
+### Recommended Local Development Setup
+
+```bash
+# /etc/hosts
+127.0.0.1 server0 server1 server2
+
+# xline server args
+--name server0 \
+--client-listen-urls https://127.0.0.1:2379 \
+--client-advertise-urls https://server0:2379
+
+# xlinectl
+--endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt
+```
 
 ---
 
