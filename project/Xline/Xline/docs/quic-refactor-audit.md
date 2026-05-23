@@ -985,11 +985,11 @@ rate(quic_connect_attempts_total{component="curp_channel"}[5m])
 rate(quic_connect_failures_total{component="curp_channel"}[5m])
 ```
 
-### Runtime Verification (2026-05-23)
+### Runtime Verification (2026-05-23, re-verified)
 
-Verified on a local 3-node cluster with `--metrics-port 9100/9101/9102`:
+Verified on a local 3-node cluster with `--metrics-enable --metrics-port 9100/9101/9102`:
 
-**server0 (port 9100) — all metrics after KV ops + member list**:
+**server0 (port 9100) — all metrics after KV ops**:
 ```
 current_rust_version{server_rust_version=""} 1
 current_version{server_version="0.6.1"} 1
@@ -999,18 +999,38 @@ has_leader 1
 is_leader 0
 is_learner 0
 online_clients 0
-quic_connect_attempts_total{component="curp_channel"} 17
+quic_connect_attempts_total{component="curp_channel"} 15
 server_id 15397586489680409000
 sp_cnt 0
 ```
 
+**server1 (port 9101)**: `quic_connect_attempts_total` = 232 (leader, more peer traffic)
+**server2 (port 9102)**: `quic_connect_attempts_total` = 11
+
 **Key observations**:
-- `quic_connect_attempts_total` ✅ exported and incrementing (17 after basic ops)
+- `quic_connect_attempts_total` ✅ exported and incrementing on all 3 nodes
 - `quic_connect_failures_total` — NOT present (expected: no failures in healthy cluster)
 - `port_router_unknown_total` — NOT present (expected: no Unknown routes in healthy cluster)
 - `current_rust_version` shows empty string — pre-existing issue (`CARGO_PKG_RUST_VERSION` not set in build env)
 - OTel scope attributes (`otel_scope_name`, `otel_scope_version`) are automatically added by the Prometheus exporter
 - All labels are low cardinality (`component`, `reason`, `error_type`) — no endpoint/socket_addr/raw error labels
+
+### Failure-Path Metrics Verification
+
+The failure-path counters (`quic_connect_failures_total`, `port_router_unknown_total`) are verified by:
+
+1. **Code audit**: Both counters are in the correct trigger locations:
+   - `quic_connect_failures_total` — `channel.rs:163`, after ALL addresses exhausted in `get_connection()`
+   - `port_router_unknown_total` — `port_router.rs:68,80`, on both `unknown_port` and `unknown_server_name` paths
+
+2. **Counter initialization**: Both counters are in `define_metrics!` groups alongside counters that DO fire:
+   - `quic_connect_failures_total` shares the `curp_quic` group with `quic_connect_attempts_total` (confirmed live)
+   - `port_router_unknown_total` shares the `xline` group with `slow_read_indexes_total` (confirmed live)
+   - When any counter in a group fires, `OnceLock` initializes ALL counters in that group
+
+3. **Prometheus behavior**: Unobserved counters don't appear in `/metrics` output (standard Prometheus convention). They will appear on first increment.
+
+4. **Cannot safely trigger**: Both metrics require cluster failure (all peers unreachable or unknown port routing). Triggering them would break the running cluster. They are inherently failure-path metrics meant for production monitoring, not CI smoke tests.
 
 ### High Cardinality Fields (Avoid)
 
@@ -1022,6 +1042,72 @@ The following fields are intentionally NOT included in metrics labels:
 - Token or certificate contents
 
 These fields are only in debug logs, not metrics.
+
+---
+
+## §23 Configuration Validation and Deployment Checklist
+
+### Startup Validation
+
+`validate_server_config()` runs in `parse_config()` after CLI/config file parsing, before server startup. It checks:
+
+| Check | Severity | Example Error |
+|-------|----------|---------------|
+| Port conflict (metrics vs client/peer) | **Fatal** | `Port conflict: port 2379 is used by multiple sources: client-listen-urls, --metrics-port` |
+| TLS cert without key (or vice versa) | **Fatal** | `TLS misconfiguration: --peer-cert-path is set but --peer-key-path is missing` |
+| Advertise URL uses DNS name | Info | `client-advertise-urls uses DNS name 'server0' — ensure /etc/hosts resolves it` |
+| HTTPS advertise without TLS cert | Warning | `advertise URL uses https:// but no TLS certificate is configured` |
+
+### Script Preflight Checks
+
+`quic_ci_smoke.sh` and `quic_local_cluster.sh` now run preflight checks before starting:
+
+1. **Hosts check**: Verifies `server0`, `server1`, `server2` are in `/etc/hosts`
+2. **Port check**: Verifies ports 2379-2384 and 9100-9102 are not in use
+
+### Deployment Checklist
+
+For a 3-node local cluster:
+
+- [ ] `/etc/hosts` contains `127.0.0.1 server0`, `127.0.0.1 server1`, `127.0.0.1 server2`
+- [ ] TLS certs exist in `fixtures/` with SANs matching server names
+- [ ] Ports 2379-2384 (client/peer) and 9100-9102 (metrics) are free
+- [ ] Each node has a unique `--data-dir`
+- [ ] `--client-listen-urls` and `--peer-listen-urls` use `127.0.0.1` (not DNS names)
+- [ ] `--client-advertise-urls` and `--peer-advertise-urls` use DNS names matching cert SANs
+- [ ] `--metrics-port` does not conflict with client/peer ports
+
+### URL/SNI/Cert Relationship
+
+```
+Listen URL (bind)     → Must be IP address (127.0.0.1:2379)
+Advertise URL (SNI)   → Must match cert SAN (server0:2379)
+Cert SAN              → DNS:server0, IP:127.0.0.1
+/etc/hosts            → 127.0.0.1 server0
+```
+
+The server listens on `127.0.0.1:2379` (IP bind). Clients connect to `server0:2379` (DNS name). TLS SNI sends `server0` as the server name. The cert must have `DNS:server0` in its SAN. `/etc/hosts` must resolve `server0` to `127.0.0.1`.
+
+### Common Misconfigurations
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Port conflict: port 2379` | metrics-port = client port | Use `--metrics-port 9100` |
+| `TLS misconfiguration: --peer-cert-path is set but --peer-key-path is missing` | Partial TLS config | Provide both cert and key |
+| `Connection refused` on startup | Port already in use | Kill existing xline or use different ports |
+| `TLS handshake failed` at runtime | Cert SAN doesn't match advertise URL | Ensure cert has DNS:name in SAN |
+| `No viable network path` | DNS name not resolving | Check `/etc/hosts` entries |
+
+### Metrics Port Usage
+
+Default metrics port is 9100. For multi-node:
+```
+server0: --metrics-port 9100
+server1: --metrics-port 9101
+server2: --metrics-port 9102
+```
+
+View metrics: `curl http://127.0.0.1:9100/metrics`
 
 ---
 

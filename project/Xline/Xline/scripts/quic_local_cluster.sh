@@ -43,6 +43,23 @@ ensure_hosts() {
     fi
 }
 
+check_ports() {
+    local ports=(2379 2380 2381 2382 2383 2384)
+    local busy=()
+    for port in "${ports[@]}"; do
+        if ss -tlnp 2>/dev/null | grep -q ":${port} " || \
+           netstat -tlnp 2>/dev/null | grep -q ":${port} "; then
+            busy+=("$port")
+        fi
+    done
+    if [ ${#busy[@]} -gt 0 ]; then
+        echo "ERROR: Ports already in use: ${busy[*]}"
+        echo "These ports are needed for the 3-node cluster (client/peer listen)."
+        echo "Kill existing xline processes or wait for ports to be released."
+        exit 1
+    fi
+}
+
 build_binaries() {
     echo "=== Building xline and xlinectl ==="
     cd "$PROJECT_DIR"
@@ -212,6 +229,7 @@ main() {
     echo "========================================"
 
     ensure_hosts
+    check_ports
     build_binaries
 
     echo "=== Starting 3-node cluster ==="

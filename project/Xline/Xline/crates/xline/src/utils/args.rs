@@ -350,15 +350,178 @@ impl From<ServerArgs> for XlineServerConfig {
 /// Return error if parse failed
 #[inline]
 pub async fn parse_config() -> Result<XlineServerConfig> {
-    if env::args_os().len() == 1 {
+    let config = if env::args_os().len() == 1 {
         let path = env::var(XLINE_SERVER_CONFIG_ENV)
             .unwrap_or_else(|_| DEFAULT_XLINE_SERVER_CONFIG_PATH.to_owned());
         let config_file = fs::read_to_string(&path)
             .await
             .map_err(|err| ConfigFileError::FileError(path, err))?;
-        Ok(toml::from_str(&config_file)?)
+        toml::from_str(&config_file)?
     } else {
         let server_args: ServerArgs = ServerArgs::parse();
-        Ok(server_args.into())
+        server_args.into()
+    };
+    validate_server_config(&config)?;
+    Ok(config)
+}
+
+/// Validate server configuration for common misconfigurations.
+///
+/// Checks for:
+/// - Port conflicts between metrics, client listen, and peer listen ports
+/// - TLS configuration completeness (cert+key must both be present)
+/// - Advertise URLs using DNS names vs IP addresses
+///
+/// # Errors
+///
+/// Returns an error if a fatal misconfiguration is detected (e.g., port conflict).
+#[inline]
+fn validate_server_config(config: &XlineServerConfig) -> Result<()> {
+    use std::collections::HashSet;
+
+    let cluster = config.cluster();
+    let tls = config.tls();
+    let metrics = config.metrics();
+    let name = cluster.name();
+
+    // ── 1. Port conflict detection ───────────────────────────────────────
+    let mut all_ports: Vec<(u16, String)> = Vec::new();
+
+    // Extract ports from client listen URLs
+    for url in cluster.client_listen_urls() {
+        if let Some(port) = extract_port_from_url(url) {
+            all_ports.push((port, format!("client-listen-urls ({url})")));
+        }
     }
+    // Extract ports from peer listen URLs
+    for url in cluster.peer_listen_urls() {
+        if let Some(port) = extract_port_from_url(url) {
+            all_ports.push((port, format!("peer-listen-urls ({url})")));
+        }
+    }
+    // Add metrics port if enabled
+    if *metrics.enable() {
+        all_ports.push((
+            *metrics.port(),
+            format!("--metrics-port ({})", metrics.port()),
+        ));
+    }
+
+    let mut seen: HashSet<u16> = HashSet::new();
+    for (port, _source) in &all_ports {
+        if !seen.insert(*port) {
+            let conflicts: Vec<String> = all_ports
+                .iter()
+                .filter(|(p, _)| *p == *port)
+                .map(|(_, s)| s.clone())
+                .collect();
+            anyhow::bail!(
+                "Port conflict: port {port} is used by multiple sources: {}\n\
+                 Hint: Use different ports for client-listen, peer-listen, and metrics.\n\
+                 Example: --client-listen-urls https://127.0.0.1:2379 --peer-listen-urls https://127.0.0.1:2380 --metrics-port 9100",
+                conflicts.join(", ")
+            );
+        }
+    }
+
+    // ── 2. TLS completeness ──────────────────────────────────────────────
+    match (tls.peer_cert_path(), tls.peer_key_path()) {
+        (Some(_), None) => {
+            anyhow::bail!(
+                "TLS misconfiguration for server '{name}': --peer-cert-path is set but --peer-key-path is missing.\n\
+                 Hint: Both --peer-cert-path and --peer-key-path must be provided together."
+            );
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "TLS misconfiguration for server '{name}': --peer-key-path is set but --peer-cert-path is missing.\n\
+                 Hint: Both --peer-cert-path and --peer-key-path must be provided together."
+            );
+        }
+        _ => {}
+    }
+    match (tls.client_cert_path(), tls.client_key_path()) {
+        (Some(_), None) => {
+            anyhow::bail!(
+                "TLS misconfiguration for server '{name}': --client-cert-path is set but --client-key-path is missing.\n\
+                 Hint: Both --client-cert-path and --client-key-path must be provided together."
+            );
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "TLS misconfiguration for server '{name}': --client-key-path is set but --client-cert-path is missing.\n\
+                 Hint: Both --client-cert-path and --client-key-path must be provided together."
+            );
+        }
+        _ => {}
+    }
+
+    // ── 3. Advertise URL DNS vs IP warnings ──────────────────────────────
+    for url in cluster.client_advertise_urls() {
+        if let Some(host) = extract_host_from_url(url) {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                tracing::info!(
+                    "server '{name}': client-advertise-urls uses DNS name '{host}' — \
+                     ensure /etc/hosts or DNS resolves '{host}' to this server's listen address, \
+                     and that the TLS certificate includes DNS:{host} in its Subject Alternative Name"
+                );
+            }
+        }
+    }
+    for url in cluster.peer_advertise_urls() {
+        if let Some(host) = extract_host_from_url(url) {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                tracing::info!(
+                    "server '{name}': peer-advertise-urls uses DNS name '{host}' — \
+                     ensure /etc/hosts or DNS resolves '{host}' to this server's listen address, \
+                     and that the TLS certificate includes DNS:{host} in its Subject Alternative Name"
+                );
+            }
+        }
+    }
+
+    // ── 4. Advertise URL without TLS warning ─────────────────────────────
+    if !tls.server_tls_enabled() {
+        for url in cluster
+            .client_advertise_urls()
+            .iter()
+            .chain(cluster.peer_advertise_urls().iter())
+        {
+            if url.starts_with("https://") {
+                tracing::warn!(
+                    "server '{name}': advertise URL '{url}' uses https:// but no TLS certificate is configured.\n\
+                     Hint: Provide --peer-cert-path and --peer-key-path, or use http:// for advertise URLs."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract port number from a URL like "https://host:port" or "http://host:port".
+fn extract_port_from_url(url: &str) -> Option<u16> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("quic://"))?;
+    // Find the port after the last ':'
+    let port_str = rest.rsplit(':').next()?;
+    // Strip any trailing path
+    let port_str = port_str.split('/').next()?;
+    port_str.parse().ok()
+}
+
+/// Extract the host portion from a URL string like "https://host:port/path".
+fn extract_host_from_url(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("quic://"))?;
+    let end = rest
+        .find(':')
+        .or_else(|| rest.find('/'))
+        .unwrap_or(rest.len());
+    let host = &rest[..end];
+    if host.is_empty() { None } else { Some(host) }
 }

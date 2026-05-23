@@ -72,7 +72,30 @@ check_hosts() {
     fi
 }
 
+check_ports() {
+    local ports=(2379 2380 2381 2382 2383 2384 9100 9101 9102)
+    local busy=()
+    for port in "${ports[@]}"; do
+        if ss -tlnp 2>/dev/null | grep -q ":${port} " || \
+           netstat -tlnp 2>/dev/null | grep -q ":${port} "; then
+            busy+=("$port")
+        fi
+    done
+    if [ ${#busy[@]} -gt 0 ]; then
+        echo -e "${RED}ERROR: Ports already in use: ${busy[*]}${NC}"
+        echo ""
+        echo "These ports are needed for the 3-node cluster:"
+        echo "  2379-2384: client/peer listen ports"
+        echo "  9100-9102: metrics ports"
+        echo ""
+        echo "Kill existing processes or wait for them to release the ports."
+        echo ""
+        exit 1
+    fi
+}
+
 check_hosts
+check_ports
 
 # ── Cleanup on exit ───────────────────────────────────────────────────
 
