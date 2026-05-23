@@ -189,7 +189,7 @@ fn cli() -> Command {
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
         .arg(
-            arg!(--endpoints <"SERVER_NAME ADDR"> "Xline endpoints, using the format of [addr0, addr1, ...]")
+            arg!(--endpoints <"SERVER_NAME ADDR"> "Xline endpoints, using the format of [addr0, addr1, ...]. Each endpoint must include a scheme (https://) and port.")
                 .num_args(1..)
                 .default_values(["https://server0:2379"])
                 .value_delimiter(',')
@@ -266,7 +266,14 @@ fn cli() -> Command {
 async fn main() -> Result<()> {
     let matches = cli().get_matches();
     let user_opt = parse_user(&matches)?;
-    let endpoints = matches.get_many::<String>("endpoints").expect("Required");
+    let endpoints: Vec<String> = matches
+        .get_many::<String>("endpoints")
+        .expect("Required")
+        .map(|s| s.to_string())
+        .collect();
+
+    validate_endpoints(&endpoints)?;
+
     let client_config = ClientConfig::new(
         Duration::from_secs(*matches.get_one("wait_synced_timeout").expect("Required")),
         Duration::from_secs(*matches.get_one("propose_timeout").expect("Required")),
@@ -279,18 +286,27 @@ async fn main() -> Result<()> {
     let ca_path: Option<PathBuf> = matches.get_one("ca_cert_pem_path").cloned();
     let quic_tls_config = match ca_path {
         Some(path) => {
-            let ca_pem = fs::read(path).await?;
+            if !path.exists() {
+                anyhow::bail!(
+                    "CA certificate file not found: {}\n\
+                     Hint: Provide a valid path with --ca_cert_pem_path",
+                    path.display()
+                );
+            }
+            let ca_pem = fs::read(&path).await?;
             Some(QuicTlsConfig::default().with_peer_ca_cert_pem(ca_pem))
         }
         None => {
-            // Default: load CA cert from fixtures directory relative to the project root.
-            // This allows xlinectl to work out-of-the-box with the local test cluster.
             let default_ca_path =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ca.crt");
             if default_ca_path.exists() {
                 let ca_pem = fs::read(&default_ca_path).await?;
                 Some(QuicTlsConfig::default().with_peer_ca_cert_pem(ca_pem))
             } else {
+                eprintln!(
+                    "Warning: No CA certificate configured. TLS server identity will not be verified."
+                );
+                eprintln!("  Hint: Use --ca_cert_pem_path <PATH> to specify the CA certificate.");
                 None
             }
         }
@@ -308,8 +324,48 @@ async fn main() -> Result<()> {
     };
     set_printer_type(printer_type);
 
-    let mut client = Client::connect(endpoints, options).await?;
+    let mut client = Client::connect(&endpoints, options).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to Xline cluster: {e}\n\
+             \n\
+             Troubleshooting:\n\
+             1. Verify endpoints are reachable: ping <host>, nc -zu <host> <port>\n\
+             2. Check /etc/hosts: grep server0 /etc/hosts\n\
+             3. Verify CA certificate: openssl x509 -in <ca.pem> -noout -subject\n\
+             4. Check server TLS SANs: openssl x509 -in <server.crt> -noout -ext subjectAltName\n\
+             5. Enable debug logs: RUST_LOG=xlinerpc=debug,xline_client=debug xlinectl ..."
+        )
+    })?;
     handle_matches!(matches, client, { get, put, delete, txn, compaction, lease, snapshot, auth, user, role, watch, lock, member });
 
+    Ok(())
+}
+
+/// Validate endpoint format before attempting connection.
+fn validate_endpoints(endpoints: &[String]) -> Result<()> {
+    for ep in endpoints {
+        if !ep.contains("://") {
+            anyhow::bail!(
+                "Endpoint '{ep}' is missing a scheme (https:// or http://).\n\
+                 Hint: Use 'https://host:port' for TLS or 'http://host:port' for plaintext."
+            );
+        }
+        if ep.starts_with("http://") {
+            eprintln!(
+                "Warning: Endpoint '{ep}' uses http:// (plaintext). Traffic is not encrypted."
+            );
+        }
+        let stripped = ep
+            .strip_prefix("https://")
+            .or_else(|| ep.strip_prefix("http://"))
+            .or_else(|| ep.strip_prefix("quic://"))
+            .unwrap_or(ep);
+        if !stripped.contains(':') {
+            anyhow::bail!(
+                "Endpoint '{ep}' is missing a port number.\n\
+                 Hint: Use 'host:port' format, e.g., 'https://server0:2379'."
+            );
+        }
+    }
     Ok(())
 }

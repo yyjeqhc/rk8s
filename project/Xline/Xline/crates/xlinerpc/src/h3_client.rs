@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::endpoint::{DnsFallback, resolve_endpoint_with_fallback};
+use crate::endpoint::{DnsFallback, EndpointError, resolve_endpoint_with_fallback};
 use bytes::{Buf, Bytes};
 use dquic::prelude::{Connection as GmConnection, QuicClient};
 use dquic::qresolve::Source;
@@ -152,7 +152,18 @@ impl H3Channel {
 
         let resolved = resolve_endpoint_with_fallback(endpoint_str, DnsFallback::Disabled)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| match &e {
+                EndpointError::DnsError { host, .. } => Status::unavailable(format!(
+                    "{e}\n\
+                         Hint: Check /etc/hosts or DNS for '{host}'. \
+                         If testing locally, add '127.0.0.1 {host}' to /etc/hosts."
+                )),
+                EndpointError::ParseError { .. } => Status::invalid_argument(format!(
+                    "{e}\n\
+                         Hint: Endpoint must be 'scheme://host:port', e.g., 'https://server0:2379'."
+                )),
+                _ => Status::internal(e.to_string()),
+            })?;
         let server_name = resolved.server_name;
         let socket_addr = resolved.socket_addr;
 
@@ -174,7 +185,9 @@ impl H3Channel {
                     server_name, e
                 ));
                 return Err(Status::unavailable(format!(
-                    "QUIC connect error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}"
+                    "QUIC connect error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}\n\
+                     Hint: Verify the server is running and reachable. If using TLS, check that the CA certificate is correct \
+                     and the server's cert includes '{server_name}' in its Subject Alternative Name."
                 )));
             }
         };
@@ -201,7 +214,9 @@ impl H3Channel {
                         endpoint_str, server_name, e
                     ));
                     Err(Status::unavailable(format!(
-                        "QUIC handshake error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}"
+                        "QUIC handshake error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}\n\
+                         Hint: TLS handshake failure often means the CA certificate doesn't match the server's cert, \
+                         or the server's cert SAN doesn't include '{server_name}'."
                     )))
                 }
             }
