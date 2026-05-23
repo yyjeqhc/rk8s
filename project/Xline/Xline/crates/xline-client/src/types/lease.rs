@@ -174,3 +174,115 @@ impl Stream for LeaseStreaming {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::channel::mpsc;
+
+    use crate::transport::Streaming;
+
+    use super::*;
+
+    fn make_pair() -> (
+        LeaseKeeper,
+        LeaseStreaming,
+        mpsc::Receiver<xlineapi::LeaseKeepAliveRequest>,
+    ) {
+        let (tx, rx) = mpsc::channel::<xlineapi::LeaseKeepAliveRequest>(128);
+        let keeper = LeaseKeeper::new(42, tx.clone());
+        let streaming = LeaseStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+        (keeper, streaming, rx)
+    }
+
+    #[test]
+    fn lease_keeper_close_marks_both_closed() {
+        let (mut keeper, streaming, _rx) = make_pair();
+        assert!(!keeper.is_closed());
+        assert!(!streaming.is_closed());
+
+        keeper.close();
+
+        assert!(keeper.is_closed());
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn lease_streaming_close_marks_both_closed() {
+        let (keeper, mut streaming, _rx) = make_pair();
+        assert!(!keeper.is_closed());
+        assert!(!streaming.is_closed());
+
+        streaming.close();
+
+        assert!(keeper.is_closed());
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn lease_keeper_close_idempotent() {
+        let (mut keeper, _streaming, _rx) = make_pair();
+        keeper.close();
+        keeper.close();
+        keeper.close();
+        assert!(keeper.is_closed());
+    }
+
+    #[test]
+    fn lease_streaming_close_idempotent() {
+        let (_keeper, mut streaming, _rx) = make_pair();
+        streaming.close();
+        streaming.close();
+        streaming.close();
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn drop_keeper_alone_does_not_close_channel() {
+        let (tx, rx) = mpsc::channel::<xlineapi::LeaseKeepAliveRequest>(128);
+        let keeper = LeaseKeeper::new(42, tx.clone());
+        let streaming = LeaseStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+        let _rx = rx;
+
+        drop(keeper);
+
+        assert!(!streaming.is_closed());
+    }
+
+    #[test]
+    fn drop_streaming_then_keeper_closes_channel() {
+        let (tx, rx) = mpsc::channel::<xlineapi::LeaseKeepAliveRequest>(128);
+        let keeper = LeaseKeeper::new(42, tx.clone());
+        let streaming = LeaseStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+        let _rx = rx;
+
+        drop(streaming);
+        assert!(!keeper.is_closed());
+
+        drop(keeper);
+    }
+
+    #[test]
+    fn lease_keeper_send_after_close_errors() {
+        let (mut keeper, _streaming, _rx) = make_pair();
+        keeper.close();
+
+        let err = keeper.keep_alive().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("closed")
+                || msg.contains("disconnected")
+                || msg.contains("full")
+                || msg.contains("gone"),
+            "unexpected error: {msg}"
+        );
+    }
+}

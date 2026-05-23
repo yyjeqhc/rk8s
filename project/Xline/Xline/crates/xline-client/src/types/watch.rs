@@ -363,9 +363,26 @@ impl Drop for WatchStreaming {
 
 #[cfg(test)]
 mod tests {
+    use futures::channel::mpsc;
     use xlineapi::command::KeyRange;
 
+    use crate::transport::Streaming;
+
     use super::*;
+
+    fn make_pair() -> (
+        Watcher,
+        WatchStreaming,
+        mpsc::Receiver<xlineapi::WatchRequest>,
+    ) {
+        let (tx, rx) = mpsc::channel::<xlineapi::WatchRequest>(128);
+        let watcher = Watcher::new(1, tx.clone());
+        let streaming = WatchStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+        (watcher, streaming, rx)
+    }
 
     #[test]
     fn test_watch_request_build_from_watch_options() {
@@ -377,5 +394,96 @@ mod tests {
         let options2 = options.clone().with_prefix();
         let request = xlineapi::WatchCreateRequest::from(options2.clone());
         assert_eq!(request.range_end, KeyRange::get_prefix("key"));
+    }
+
+    #[test]
+    fn watcher_close_marks_both_closed() {
+        let (mut watcher, streaming, _rx) = make_pair();
+        assert!(!watcher.is_closed());
+        assert!(!streaming.is_closed());
+
+        watcher.close();
+
+        assert!(watcher.is_closed());
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn watch_streaming_close_marks_both_closed() {
+        let (watcher, mut streaming, _rx) = make_pair();
+        assert!(!watcher.is_closed());
+        assert!(!streaming.is_closed());
+
+        streaming.close();
+
+        assert!(watcher.is_closed());
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn watcher_close_idempotent() {
+        let (mut watcher, _streaming, _rx) = make_pair();
+        watcher.close();
+        watcher.close();
+        watcher.close();
+        assert!(watcher.is_closed());
+    }
+
+    #[test]
+    fn watch_streaming_close_idempotent() {
+        let (_watcher, mut streaming, _rx) = make_pair();
+        streaming.close();
+        streaming.close();
+        streaming.close();
+        assert!(streaming.is_closed());
+    }
+
+    #[test]
+    fn drop_watcher_alone_does_not_close_channel() {
+        let (tx, rx) = mpsc::channel::<xlineapi::WatchRequest>(128);
+        let watcher = Watcher::new(1, tx.clone());
+        let streaming = WatchStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+
+        drop(watcher);
+        let _rx = rx;
+
+        assert!(!streaming.is_closed());
+    }
+
+    #[test]
+    fn drop_streaming_then_watcher_closes_channel() {
+        let (tx, rx) = mpsc::channel::<xlineapi::WatchRequest>(128);
+        let watcher = Watcher::new(1, tx.clone());
+        let streaming = WatchStreaming::new(
+            Streaming::new(Box::pin(futures::stream::empty()), "test"),
+            tx,
+        );
+        let _rx = rx;
+
+        drop(streaming);
+        assert!(!watcher.is_closed());
+
+        drop(watcher);
+    }
+
+    #[test]
+    fn watcher_send_after_close_errors() {
+        let (mut watcher, _streaming, _rx) = make_pair();
+        watcher.close();
+
+        let err = watcher
+            .watch(WatchOptions::default().with_key("k"))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("closed")
+                || msg.contains("disconnected")
+                || msg.contains("full")
+                || msg.contains("gone"),
+            "unexpected error: {msg}"
+        );
     }
 }
