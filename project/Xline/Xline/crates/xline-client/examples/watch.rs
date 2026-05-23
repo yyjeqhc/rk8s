@@ -20,6 +20,13 @@ async fn main() -> Result<()> {
     let kv_client = client.kv_client();
 
     // watch
+    //
+    // watch() returns (Watcher, WatchStreaming):
+    //   - Watcher: sends create/cancel/progress requests
+    //   - WatchStreaming: receives events
+    //
+    // The _sender field in WatchStreaming is a lifecycle pin: even if Watcher
+    // is dropped, the handler task stays alive until WatchStreaming is dropped.
     let (mut watcher, mut stream) = watch_client.watch("key1", None).await?;
     kv_client.put("key1", "value1", None).await?;
 

@@ -1,6 +1,17 @@
 use anyhow::Result;
 use xline_client::{Client, ClientOptions};
 
+// Migration note: keep_alive() now returns (LeaseKeeper, LeaseStreaming)
+// instead of (LeaseKeeper, Streaming<LeaseKeepAliveResponse>).
+//
+// If you used .message().await on the stream, no code changes needed:
+//   let (mut keeper, mut stream) = client.keep_alive(id).await?;
+//   let resp = stream.message().await?;  // works unchanged
+//
+// If you had explicit type annotations, update them:
+//   Old: let mut stream: Streaming<LeaseKeepAliveResponse> = ...;
+//   New: let mut stream: LeaseStreaming = ...;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // the name and address of all curp members
@@ -31,6 +42,14 @@ async fn main() -> Result<()> {
     println!("remaining ttl: {}", resp.ttl);
 
     // keep alive lease2
+    //
+    // keep_alive() returns (LeaseKeeper, LeaseStreaming):
+    //   - LeaseKeeper: sends keep-alive requests
+    //   - LeaseStreaming: receives TTL responses
+    //
+    // Drop order: drop LeaseStreaming first (or both together).
+    // Dropping LeaseKeeper alone leaves the handler task alive until
+    // LeaseStreaming is also dropped.
     let (mut keeper, mut stream) = client.keep_alive(lease_id2).await?;
 
     if let Some(resp) = stream.message().await? {

@@ -11,6 +11,24 @@ use tracing::debug;
 use crate::Status;
 
 /// Generic RPC response stream wrapper.
+///
+/// Wraps a pinned stream of `Result<T, Status>` messages. Use [`message()`](Self::message)
+/// to receive the next response, or use the [`Stream`] impl for async iteration.
+///
+/// # Drop behavior
+///
+/// Dropping a `Streaming` emits a `debug`-level trace log. It does **not** guarantee
+/// that the remote peer is immediately notified — the underlying QUIC stream may
+/// linger until the connection driver processes the reset.
+///
+/// # Examples
+///
+/// ```ignore
+/// while let Some(resp) = stream.message().await? {
+///     println!("received: {:?}", resp);
+/// }
+/// // stream ended (EOF)
+/// ```
 pub struct Streaming<T> {
     inner: Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>,
     label: &'static str,

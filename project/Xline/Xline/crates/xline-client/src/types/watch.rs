@@ -12,7 +12,21 @@ use tracing::debug;
 pub use xlineapi::{Event, EventType, KeyValue, WatchResponse};
 use xlineapi::{RequestUnion, WatchCancelRequest, WatchProgressRequest};
 
-/// The watching handle.
+/// Watch request sender.
+///
+/// Sends watch create, cancel, and progress requests to the server.
+/// Typically paired with [`WatchStreaming`] to receive events. Dropping
+/// the `Watcher` closes the request channel — but if `WatchStreaming`
+/// is still alive, the handler task stays open (the `_sender` lifecycle
+/// pin in `WatchStreaming` prevents premature teardown).
+///
+/// # Examples
+///
+/// ```ignore
+/// let (mut watcher, mut stream) = client.watch("key", None).await?;
+/// // ... receive events from stream ...
+/// watcher.cancel()?;
+/// ```
 #[derive(Debug)]
 pub struct Watcher {
     /// Id of the watcher
@@ -233,7 +247,22 @@ impl From<WatchFilterType> for i32 {
     }
 }
 
-/// Watch response stream
+/// Watch event stream.
+///
+/// Receives [`WatchResponse`] events from the server. Holds a clone of the
+/// request sender as a **lifecycle pin**: even if the [`Watcher`] is dropped
+/// first, the request channel stays open and the handler task continues to
+/// deliver events. Dropping `WatchStreaming` releases both sides, allowing
+/// the handler task and QUIC stream to close.
+///
+/// Use [`message()`](Self::message) to receive the next event, or the
+/// [`Stream`] impl for async iteration.
+///
+/// # Drop behavior
+///
+/// Dropping `WatchStreaming` (after or instead of `Watcher`) closes the
+/// request channel and allows the handler task to exit. The inner [`Streaming`]
+/// emits a `debug`-level trace log on drop.
 #[derive(Debug)]
 pub struct WatchStreaming {
     /// Inner QUIC stream
