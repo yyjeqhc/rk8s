@@ -461,7 +461,7 @@ grep -E "stream.*not stopped|No viable network path" quic-debug.log
 
 ---
 
-## 16. Connection Reuse Analysis
+## 17. Connection Reuse Analysis
 
 ### Current State: Connection Per RPC
 
@@ -535,7 +535,7 @@ Set `RUST_LOG=debug` to see drop events. Useful for diagnosing stream lifecycle 
 
 ---
 
-## 17. API Compatibility Note
+## 18. API Compatibility Note
 
 ### Breaking Change: `LeaseClient::keep_alive()` Return Type
 
@@ -567,7 +567,7 @@ let mut stream: LeaseStreaming = ...;
 
 ---
 
-## 18. Streaming API Examples
+## 19. Streaming API Examples
 
 ### Lease Keep-Alive
 
@@ -640,7 +640,7 @@ let resp = stream.message().await?;  // same API, no code change needed
 
 ---
 
-## 19. Cancellation Semantics
+## 20. Cancellation Semantics
 
 ### Watch Cancellation
 
@@ -722,7 +722,7 @@ No explicit server-side cancel API is needed for most use cases.
 
 ---
 
-## 20. Server-Side Cancellation Audit
+## 21. Server-Side Cancellation Audit
 
 ### Watch Server (`watch_server.rs`)
 
@@ -784,7 +784,7 @@ Set `RUST_LOG=xline=debug` to see these logs.
 
 ---
 
-## 21. Transport Observability / Metrics Readiness
+## 22. Transport Observability / Metrics Readiness
 
 ### Current Observability State
 
@@ -793,7 +793,7 @@ Set `RUST_LOG=xline=debug` to see these logs.
 - Server side: `server_name`, `local_port`, `client_ports`, `peer_ports`, `alias` fields
 - Debug level for normal lifecycle, warn for recoverable errors, error for failures
 
-**Metrics**: No QUIC/H3 transport metrics exist. Only general xline metrics:
+**Metrics**: QUIC/H3 transport metrics were implemented in §23 (see that section for actual OTel instrument names and crate locations). General xline metrics also exist:
 - `slow_read_index`, `read_index_failed`, `lease_expired` (counters)
 - `fd_used`, `fd_limit`, `current_version`, `current_rust_version` (gauges)
 
@@ -814,7 +814,7 @@ Set `RUST_LOG=xline=debug` to see these logs.
 | `xline_lease_keepalive_closed_total` | Counter | LeaseStreaming dropped or closed | `reason` (client_close, server_close, error) |
 | `xline_server_connection_accepted_total` | Counter | `accept_loop` accepts connection | `server_name`, `target` (ClientH3, PeerCurp) |
 
-> **Note**: Some of these were implemented in §22 but with different names and in different crates (see §22 for actual names). The `xline_` prefix in this table is aspirational only — the actual OTel instrument names do NOT use this prefix.
+> **Note**: Some of these were implemented in §23 but with different names and in different crates (see §23 for actual names). The `xline_` prefix in this table is aspirational only — the actual OTel instrument names do NOT use this prefix.
 
 ### Recommended Labels
 
@@ -890,7 +890,7 @@ grep -E "stream.*not stopped|No viable network path|connect failed|handshake fai
 
 ---
 
-## 22. Implemented Transport Metrics
+## 23. Implemented Transport Metrics
 
 ### Metrics Implemented
 
@@ -1045,7 +1045,7 @@ These fields are only in debug logs, not metrics.
 
 ---
 
-## §23 Configuration Validation and Deployment Checklist
+## §24 Configuration Validation and Deployment Checklist
 
 ### Startup Validation
 
@@ -1111,7 +1111,7 @@ View metrics: `curl http://127.0.0.1:9100/metrics`
 
 ---
 
-## §24 xlinectl Client-Side Configuration and Error UX
+## §25 xlinectl Client-Side Configuration and Error UX
 
 ### Client CLI Arguments
 
@@ -1204,7 +1204,7 @@ grep -E 'server[012]' /etc/hosts
 
 ---
 
-## §25 TLS Verification Policy
+## §26 TLS Verification Policy
 
 ### Default Security Posture
 
@@ -1246,7 +1246,7 @@ The QUIC server uses SNI (Server Name Indication) to route connections to the co
 
 When multiple servers share the same IP (e.g., `127.0.0.1:2379`, `127.0.0.1:2381`, `127.0.0.1:2383`), only the **first** server to register that IP as an SNI alias succeeds. Subsequent registrations fail silently. Additionally, the `ServerAuther` validates that the SNI-matched server is bound to the specific interface that received the packet. This means IP-based SNI only works for one server per IP address.
 
-See §26 for full root cause analysis and behavior.
+See §27 for full root cause analysis and behavior.
 
 ### CA Certificate Behavior by Component
 
@@ -1263,11 +1263,11 @@ See §26 for full root cause analysis and behavior.
 1. **Production**: Always specify `--ca_cert_pem_path` explicitly. Never rely on auto-discovery.
 2. **Development**: The `fixtures/ca.crt` auto-discovery is a convenience for developers running from source. It does NOT work in release builds.
 3. **mTLS**: Use `--peer-cert-path`, `--peer-key-path`, `--peer-ca-cert-path` for mutual TLS. The server verifies client certs against the peer CA.
-4. **IP endpoints**: Use DNS names (e.g., `server0`) instead of IP addresses for endpoints. IP endpoints fail at QUIC SNI routing level. See §26.
+4. **IP endpoints**: Use DNS names (e.g., `server0`) instead of IP addresses for endpoints. IP endpoints fail at QUIC SNI routing level. See §27.
 
 ---
 
-## §26 IP Endpoint and SNI Routing Analysis
+## §27 IP Endpoint and SNI Routing Analysis
 
 ### Root Cause
 
