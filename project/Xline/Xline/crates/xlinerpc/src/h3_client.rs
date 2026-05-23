@@ -307,6 +307,8 @@ impl H3Channel {
             }
         }
 
+        stream.stop_sending(h3::error::Code::H3_NO_ERROR);
+
         if buf.is_empty() {
             return Err(Status::internal("empty response body"));
         }
@@ -427,11 +429,14 @@ impl H3Channel {
                             "h3 server-streaming read failed path={} err={}",
                             path_owned, e
                         );
+                        stream.stop_sending(h3::error::Code::H3_NO_ERROR);
                         let _ = tx.send(Err(e)).await;
                         return;
                     }
                 }
             }
+
+            stream.stop_sending(h3::error::Code::H3_NO_ERROR);
 
             if !buf.is_empty() {
                 warn!(
@@ -597,6 +602,7 @@ impl H3Channel {
                                     "h3 client-streaming read failed path={} err={}",
                                     path_owned, e
                                 );
+                                stream.stop_sending(h3::error::Code::H3_NO_ERROR);
                                 let _ = tx.send(Err(h3_stream_error_to_status(e))).await;
                                 return;
                             }
@@ -604,6 +610,8 @@ impl H3Channel {
                     }
                 }
             }
+
+            stream.stop_sending(h3::error::Code::H3_NO_ERROR);
 
             if !buf.is_empty() {
                 warn!(

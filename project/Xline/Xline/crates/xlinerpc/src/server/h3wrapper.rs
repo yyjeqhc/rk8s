@@ -29,7 +29,7 @@ type RpcFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 /// An incoming HTTP/3 body.
 ///
 /// Implements [`http_body::Body`].
-pub struct QuicIncomingBody<S> {
+pub struct QuicIncomingBody<S: h3::quic::RecvStream> {
     stream: RequestStream<S, Bytes>,
     /// Body parsing state
     state: BodyState,
@@ -46,12 +46,20 @@ enum BodyState {
     Done,
 }
 
-impl<S> QuicIncomingBody<S> {
+impl<S: h3::quic::RecvStream> QuicIncomingBody<S> {
     /// Create a new incoming HTTP/3 body.
     pub fn new(stream: RequestStream<S, Bytes>, size_hint: Option<u64>) -> Self {
         Self {
             stream,
             state: BodyState::Data(size_hint),
+        }
+    }
+}
+
+impl<S: h3::quic::RecvStream> Drop for QuicIncomingBody<S> {
+    fn drop(&mut self) {
+        if self.state != BodyState::Done {
+            self.stream.stop_sending(h3::error::Code::H3_NO_ERROR);
         }
     }
 }

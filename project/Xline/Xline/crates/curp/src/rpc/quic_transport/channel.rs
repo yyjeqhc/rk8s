@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::rpc::CurpError;
 
-use super::codec::{Frame, FrameReader, FrameWriter, MethodId, status_error, status_ok};
+use super::codec::{Frame, FrameReader, FrameWriter, MethodId, StopOnDropReader, status_error, status_ok};
 
 /// Grace period for the send task to finish after receiving a cancel signal.
 /// If the task doesn't finish within this window, it is forcibly aborted.
@@ -229,7 +229,7 @@ impl QuicChannel {
             let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
 
             let mut writer = FrameWriter::new(send_stream);
-            let mut reader = FrameReader::new_unary_response(recv_stream);
+            let mut reader = FrameReader::new_unary_response(StopOnDropReader::new(recv_stream));
 
             // Write request header
             writer.write_request_header(method, &meta).await?;
@@ -322,7 +322,7 @@ impl QuicChannel {
             .map_err(|e| CurpError::internal(format!("shutdown stream error: {e}")))?;
 
         // Return stream that reads responses
-        let reader = FrameReader::new_server_streaming(recv_stream);
+        let reader = FrameReader::new_server_streaming(StopOnDropReader::new(recv_stream));
         Ok(Box::pin(ServerStreamingResponse::<Resp>::new(
             reader, conn, None, None,
         )))
@@ -365,7 +365,7 @@ impl QuicChannel {
             let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
 
             let mut writer = FrameWriter::new(send_stream);
-            let mut reader = FrameReader::new_unary_response(recv_stream);
+            let mut reader = FrameReader::new_unary_response(StopOnDropReader::new(recv_stream));
 
             // Write request header
             writer.write_request_header(method, &meta).await?;
@@ -513,7 +513,7 @@ impl QuicChannel {
             let _ = send_stream.shutdown().await;
         });
 
-        let reader = FrameReader::new_server_streaming(recv_stream);
+        let reader = FrameReader::new_server_streaming(StopOnDropReader::new(recv_stream));
         Ok(Box::pin(ServerStreamingResponse::<Resp>::new(
             reader,
             conn,
@@ -578,7 +578,7 @@ impl QuicChannel {
         tokio::time::timeout(timeout, async {
             let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
             let mut writer = FrameWriter::new(send_stream);
-            let mut reader = FrameReader::new_unary_response(recv_stream);
+            let mut reader = FrameReader::new_unary_response(StopOnDropReader::new(recv_stream));
 
             writer.write_raw_method_header(raw_method_id, &meta).await?;
             writer.write_frame(&Frame::Data(req_bytes)).await?;
@@ -653,9 +653,9 @@ struct ServerStreamingResponse<Resp> {
 /// Internal state for `ServerStreamingResponse`
 enum StreamResponseState {
     /// Idle — reader is available for the next read
-    Idle(FrameReader<StreamReader>),
+    Idle(FrameReader<StopOnDropReader>),
     /// Reading — a `read_frame` future is in flight
-    Reading(BoxFuture<'static, (Result<Frame, CurpError>, FrameReader<StreamReader>)>),
+    Reading(BoxFuture<'static, (Result<Frame, CurpError>, FrameReader<StopOnDropReader>)>),
     /// Poisoned — state was taken and not restored (should not happen)
     Poisoned,
 }
@@ -663,7 +663,7 @@ enum StreamResponseState {
 impl<Resp> ServerStreamingResponse<Resp> {
     /// Create a new server-streaming response
     fn new(
-        reader: FrameReader<StreamReader>,
+        reader: FrameReader<StopOnDropReader>,
         conn: Connection,
         cancel_tx: Option<oneshot::Sender<()>>,
         send_task: Option<JoinHandle<()>>,

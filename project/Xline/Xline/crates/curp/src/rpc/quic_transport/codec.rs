@@ -18,10 +18,75 @@
 //!   0x03 = STATUS → [1 byte status_code] + [4 bytes details_len] + [N bytes CurpErrorWrapper]
 //! ```
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use dquic::prelude::StreamReader;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 pub use xlinerpc::{ALL_METHOD_IDS, MethodId};
 
 use crate::rpc::CurpError;
+
+/// Wrapper that calls `stop(0)` on the underlying `StreamReader` when dropped
+/// **only if** the stream was not fully consumed (EOF not reached).
+///
+/// dquic's `Reader::drop()` emits a warning if the recv stream is in `Recv` or
+/// `SizeKnown` state without being explicitly stopped.  Wrapping the reader in
+/// `StopOnDropReader` ensures `stop(0)` is called on premature drops,
+/// suppressing the warning without disrupting in-flight bidi streams.
+///
+/// When the stream is read to completion (EOF), `stop(0)` is NOT called
+/// because the stream naturally transitions past `Recv`/`SizeKnown` states.
+pub(crate) struct StopOnDropReader {
+    reader: Option<StreamReader>,
+    /// Set to `true` once `poll_read` returns `Ok(0)` (EOF).
+    reached_eof: bool,
+}
+
+impl StopOnDropReader {
+    pub(crate) fn new(reader: StreamReader) -> Self {
+        Self {
+            reader: Some(reader),
+            reached_eof: false,
+        }
+    }
+}
+
+impl Drop for StopOnDropReader {
+    fn drop(&mut self) {
+        if let Some(mut reader) = self.reader.take() {
+            if !self.reached_eof {
+                use dquic::prelude::StopSending;
+                reader.stop(0);
+            }
+        }
+    }
+}
+
+impl AsyncRead for StopOnDropReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.reader.as_mut() {
+            Some(reader) => {
+                let before = buf.filled().len();
+                let result = Pin::new(reader).poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &result {
+                    if buf.filled().len() == before && buf.remaining() > 0 {
+                        // Zero bytes read with remaining capacity = EOF
+                        self.reached_eof = true;
+                    }
+                }
+                result
+            }
+            None => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl Unpin for StopOnDropReader {}
 
 /// Maximum frame length: 16 MB
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
