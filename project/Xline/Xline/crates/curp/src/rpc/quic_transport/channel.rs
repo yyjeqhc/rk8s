@@ -144,7 +144,11 @@ impl QuicChannel {
             match self.try_connect(addr_str).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
-                    tracing::debug!("QUIC connect failed for {addr_str}: {e:?}");
+                    tracing::debug!(
+                        endpoint = addr_str,
+                        error = ?e,
+                        "QUIC connect failed"
+                    );
                     last_err = Some(e);
                 }
             }
@@ -164,6 +168,20 @@ impl QuicChannel {
                     CurpError::internal(format!("{e} (dns_fallback={:?})", self.dns_fallback))
                 })?;
 
+        tracing::debug!(
+            endpoint = addr_str,
+            server_name = %resolved.server_name,
+            addr = %resolved.socket_addr,
+            "QUIC endpoint resolved"
+        );
+
+        tracing::debug!(
+            endpoint = addr_str,
+            server_name = %resolved.server_name,
+            addr = %resolved.socket_addr,
+            "QUIC connecting"
+        );
+
         match self
             .client
             .connected_to_with_source(
@@ -172,7 +190,15 @@ impl QuicChannel {
             )
             .await
         {
-            Ok(conn) => Ok(conn),
+            Ok(conn) => {
+                tracing::debug!(
+                    endpoint = addr_str,
+                    server_name = %resolved.server_name,
+                    addr = %resolved.socket_addr,
+                    "QUIC connect succeeded"
+                );
+                Ok(conn)
+            }
             Err(e) => match self.dns_fallback {
                 DnsFallback::Disabled => Err(CurpError::internal(format!(
                     "QUIC connect error: endpoint='{addr_str}', server_name='{}', addr={}: {e}",
@@ -183,9 +209,12 @@ impl QuicChannel {
                     let fallback_addr =
                         std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
                     tracing::warn!(
-                        "connected_to_with_source failed for {server_name}:{port} ({e}), \
-                         falling back to {fallback_addr} (test mode)",
-                        server_name = resolved.server_name,
+                        endpoint = addr_str,
+                        server_name = %resolved.server_name,
+                        original_addr = %resolved.socket_addr,
+                        fallback_addr = %fallback_addr,
+                        error = %e,
+                        "QUIC connect failed, falling back to localhost (test mode)"
                     );
                     self.client
                         .connected_to_with_source(

@@ -18,6 +18,16 @@
 # Usage:
 #   bash scripts/quic_ci_smoke.sh
 #   XLINE_QUIC_CI_LONG=1 bash scripts/quic_ci_smoke.sh
+#
+# Debug logging:
+#   To enable transport debug logs during CI:
+#   RUST_LOG=xline=debug,xlinerpc=debug,curp=debug bash scripts/quic_ci_smoke.sh
+#
+#   To filter specific components:
+#   RUST_LOG=xlinerpc::h3_client=debug bash scripts/quic_ci_smoke.sh
+#
+#   To collect logs on failure:
+#   RUST_LOG=xline=debug,xlinerpc=debug bash scripts/quic_ci_smoke.sh 2>&1 | tee quic-debug.log
 
 set -euo pipefail
 
