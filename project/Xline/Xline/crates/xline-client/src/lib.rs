@@ -332,7 +332,9 @@ impl Client {
                 })?;
             }
         } else {
-            tracing::warn!("No QUIC peer CA certificate configured; peer identity is not verified");
+            tracing::warn!(
+                "No QUIC peer CA certificate configured; connections will fail with UnknownIssuer unless a trusted CA is configured"
+            );
         }
 
         // Build client with proper interface binding

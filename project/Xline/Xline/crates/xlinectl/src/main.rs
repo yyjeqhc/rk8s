@@ -304,7 +304,7 @@ async fn main() -> Result<()> {
                 Some(QuicTlsConfig::default().with_peer_ca_cert_pem(ca_pem))
             } else {
                 eprintln!(
-                    "Warning: No CA certificate configured. TLS server identity will not be verified."
+                    "Warning: No CA certificate configured. QUIC connections will fail with UnknownIssuer unless a trusted CA is configured."
                 );
                 eprintln!("  Hint: Use --ca_cert_pem_path <PATH> to specify the CA certificate.");
                 None

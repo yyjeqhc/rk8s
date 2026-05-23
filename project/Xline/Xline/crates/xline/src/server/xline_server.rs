@@ -686,8 +686,8 @@ impl XlineServer {
     /// If `peer_ca_cert_path` is configured, the CA cert is loaded into the root
     /// store so the client verifies server identity. If `peer_cert_path` and
     /// `peer_key_path` are also set, mTLS client authentication is enabled.
-    /// Without any peer TLS config, the client uses an empty trust store (no
-    /// verification) and logs a warning.
+    /// Without any peer TLS config, the client uses an empty trust store and
+    /// connections will fail with UnknownIssuer unless a trusted CA is configured.
     async fn build_quic_client(tls_config: &TlsConfig) -> Result<dquic::prelude::QuicClient> {
         // Install the default crypto provider for rustls if not already installed.
         // This is required before any TLS operations (e.g., creating a QuicClient).
@@ -713,7 +713,7 @@ impl XlineServer {
             }
         } else {
             warn!(
-                "No peer CA certificate configured; QUIC peer connections will not verify server identity"
+                "No peer CA certificate configured; QUIC peer connections will fail with UnknownIssuer unless a trusted CA is configured"
             );
         }
 
