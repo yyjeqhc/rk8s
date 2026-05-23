@@ -19,6 +19,10 @@ define_metrics! {
     lease_expired_total: Counter<u64> = meter()
         .u64_counter("lease_expired")
         .with_description("The total number of expired leases.")
+        .init(),
+    port_router_unknown_total: Counter<u64> = meter()
+        .u64_counter("port_router_unknown")
+        .with_description("The total number of connections routed to Unknown target by PortRouter.")
         .init()
 }
 

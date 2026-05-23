@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
+use opentelemetry::KeyValue;
 use tracing::debug;
+
+use crate::metrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionTarget {
@@ -62,11 +65,25 @@ impl PortRouter {
                     ?routing.peer_ports,
                     "unknown port — not in client_ports or peer_ports"
                 );
+                metrics::get().port_router_unknown_total.add(
+                    1,
+                    &[
+                        KeyValue::new("component", "port_router"),
+                        KeyValue::new("reason", "unknown_port"),
+                    ],
+                );
                 ConnectionTarget::Unknown
             }
         } else {
             let known: Vec<&String> = servers.keys().collect();
             debug!(server_name, ?known, "server not found in routing table");
+            metrics::get().port_router_unknown_total.add(
+                1,
+                &[
+                    KeyValue::new("component", "port_router"),
+                    KeyValue::new("reason", "unknown_server_name"),
+                ],
+            );
             ConnectionTarget::Unknown
         }
     }

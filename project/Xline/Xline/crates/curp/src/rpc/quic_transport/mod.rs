@@ -6,6 +6,7 @@
 
 pub(crate) mod channel;
 pub(crate) mod codec;
+pub(crate) mod metrics;
 pub(crate) mod server;
 
 pub use channel::QuicChannel;

@@ -16,6 +16,7 @@ use std::{
 use dquic::prelude::{Connection, QuicClient, StreamReader, StreamWriter};
 use dquic::qresolve::Source;
 use futures::{Stream, future::BoxFuture};
+use opentelemetry::KeyValue;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, oneshot};
@@ -141,6 +142,10 @@ impl QuicChannel {
                 .or_else(|| addr.strip_prefix("http://"))
                 .unwrap_or(addr);
 
+            super::metrics::get()
+                .quic_connect_attempts_total
+                .add(1, &[KeyValue::new("component", "curp_channel")]);
+
             match self.try_connect(addr_str).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
@@ -153,6 +158,15 @@ impl QuicChannel {
                 }
             }
         }
+
+        // Record final failure only after all attempts exhausted
+        super::metrics::get().quic_connect_failures_total.add(
+            1,
+            &[
+                KeyValue::new("component", "curp_channel"),
+                KeyValue::new("error_type", "unavailable"),
+            ],
+        );
 
         Err(last_err.unwrap_or_else(|| CurpError::RpcTransport(())))
     }
