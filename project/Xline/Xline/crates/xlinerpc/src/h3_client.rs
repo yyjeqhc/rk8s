@@ -1,5 +1,4 @@
 use std::{
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -17,6 +16,7 @@ use prost::Message;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
+use crate::endpoint::{resolve_endpoint_with_fallback, DnsFallback};
 
 use crate::{Status, Streaming, grpc};
 
@@ -142,18 +142,19 @@ impl H3Channel {
         let client = self.pool.client();
         it_debug(format!("quic connect start endpoint={}", endpoint_str));
 
-        // Parse the endpoint to extract hostname (for SNI) and a resolved socket
-        // address. dquic 0.5 exposes the explicit endpoint API via
-        // connected_to_with_source(), which lets us keep the SNI as just the host.
-        let (server_name, socket_addr) =
-            self.parse_endpoint_for_quic(endpoint_str)
-                .await
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "failed to parse QUIC endpoint '{}': {e}",
-                        endpoint_str
-                    ))
-                })?;
+        // Use the unified endpoint resolver from `crate::endpoint`. This
+        // extracts the hostname (for TLS SNI) and resolves the socket address
+        // using the system DNS resolver.
+        let resolved = resolve_endpoint_with_fallback(endpoint_str, DnsFallback::Disabled)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to parse QUIC endpoint '{}': {e}",
+                    endpoint_str
+                ))
+            })?;
+        let server_name = resolved.server_name;
+        let socket_addr = resolved.socket_addr;
 
         it_debug(format!(
             "quic connect: endpoint={}, server_name={}, addr={}",
@@ -630,63 +631,7 @@ impl H3Channel {
         Ok(Streaming::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    /// Parse a QUIC endpoint string (e.g., "server0:46529" or "127.0.1.1:46529")
-    /// into a (server_name, SocketAddr) tuple suitable for `connected_to()`.
-    ///
-    /// The server_name is the hostname portion WITHOUT the port, which is required
-    /// for a valid TLS SNI. The SocketAddr is the actual network address to connect to.
-    ///
-    /// If the hostname is a DNS name, it is used as-is for SNI (e.g., "server0").
-    /// If the hostname is an IP address, it is used for both SNI and the SocketAddr.
-    ///
-    /// Uses the system DNS resolver for hostname resolution.
-    async fn parse_endpoint_for_quic(
-        &self,
-        endpoint: &str,
-    ) -> Result<(String, SocketAddr), String> {
-        // Strip bracket notation for IPv6: [::1]:port
-        let (host, port) = if endpoint.starts_with('[') {
-            let bracket_end = endpoint
-                .find(']')
-                .ok_or_else(|| format!("missing ']' in IPv6 endpoint: {endpoint}"))?;
-            let host = &endpoint[1..bracket_end];
-            let rest = &endpoint[bracket_end + 1..];
-            let port_str = rest
-                .strip_prefix(':')
-                .ok_or_else(|| format!("missing port after ']' in endpoint: {endpoint}"))?;
-            let port: u16 = port_str
-                .parse()
-                .map_err(|e| format!("invalid port in endpoint '{endpoint}': {e}"))?;
-            (host.to_string(), port)
-        } else {
-            // IPv4 or DNS hostname: host:port
-            let (host, port_str) = endpoint
-                .rsplit_once(':')
-                .ok_or_else(|| format!("missing ':' in endpoint: {endpoint}"))?;
-            let port: u16 = port_str
-                .parse()
-                .map_err(|e| format!("invalid port in endpoint '{endpoint}': {e}"))?;
-            (host.to_string(), port)
-        };
 
-        // Try to parse as IP address first
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            let addr = SocketAddr::new(ip, port);
-            return Ok((host, addr));
-        }
-
-        // Use system DNS resolver (async)
-        let host_str = host.clone();
-        let mut addrs = tokio::net::lookup_host((host_str.as_str(), port))
-            .await
-            .map_err(|e| format!("DNS lookup failed for '{host_str}:{port}': {e}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("DNS lookup returned no addresses for '{host_str}:{port}'"))?;
-
-        // server_name is the DNS hostname (without port) — this WILL be sent as SNI
-        Ok((host, addr))
-    }
 }
 
 async fn with_timeout<T>(

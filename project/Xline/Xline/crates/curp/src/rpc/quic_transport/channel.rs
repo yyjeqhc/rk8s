@@ -4,7 +4,6 @@
 //! and provides RPC call methods (unary, server-streaming, client-streaming).
 
 use std::{
-    net::IpAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -30,17 +29,7 @@ use super::codec::{Frame, FrameReader, FrameWriter, MethodId, status_error, stat
 /// If the task doesn't finish within this window, it is forcibly aborted.
 const SEND_TASK_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
-/// DNS fallback policy for QUIC connections
-///
-/// Controls what happens when DNS resolution fails for a hostname.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnsFallback {
-    /// DNS failure is a hard error (production default)
-    Disabled,
-    /// Fall back to 127.0.0.1 with the original hostname as SNI.
-    /// Only for testing with fake hostnames like "s0.test".
-    LocalhostForTest,
-}
+pub(crate) use xlinerpc::endpoint::DnsFallback;
 
 /// QUIC channel for managing connections and RPC calls
 pub struct QuicChannel {
@@ -166,12 +155,17 @@ impl QuicChannel {
     ///
     /// Strips the port from the address before using it as the TLS server_name.
     async fn try_connect(&self, addr_str: &str) -> Result<Connection, CurpError> {
-        // Parse endpoint to get hostname (for SNI) and SocketAddr (for connection)
-        let (server_name, socket_addr) = self.parse_endpoint(addr_str)?;
+        // Resolve endpoint via utils (handles DNS lookup with optional localhost fallback)
+        let resolved = xlinerpc::endpoint::resolve_endpoint_with_fallback(addr_str, self.dns_fallback)
+            .await
+            .map_err(|e| CurpError::internal(e))?;
 
         match self
             .client
-            .connected_to_with_source(&server_name, [(Source::System, socket_addr.into())])
+            .connected_to_with_source(
+                &resolved.server_name,
+                [(Source::System, resolved.socket_addr.into())],
+            )
             .await
         {
             Ok(conn) => Ok(conn),
@@ -181,79 +175,23 @@ impl QuicChannel {
                 ))),
                 DnsFallback::LocalhostForTest => {
                     // Test mode: fall back to 127.0.0.1 with the original server_name as SNI
-                    let port = socket_addr.port();
+                    let port = resolved.socket_addr.port();
                     let fallback_addr =
                         std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
                     tracing::warn!(
                         "connected_to_with_source failed for {server_name}:{port} ({e}), \
-                         falling back to {fallback_addr} (test mode)"
+                         falling back to {fallback_addr} (test mode)",
+                        server_name = resolved.server_name,
                     );
                     self.client
                         .connected_to_with_source(
-                            &server_name,
+                            &resolved.server_name,
                             [(Source::System, fallback_addr.into())],
                         )
                         .await
                         .map_err(|e2| {
                             CurpError::internal(format!("QUIC connect error: {e2} (original: {e})"))
                         })
-                }
-            },
-        }
-    }
-
-    /// Parse an endpoint string (e.g., "server0:46529" or "127.0.1.1:46529")
-    /// into a (server_name, SocketAddr) pair.
-    ///
-    /// The server_name is the hostname WITHOUT the port, which is required
-    /// for a valid TLS SNI when passed to `connected_to()`.
-    ///
-    /// Resolution order:
-    /// 1. If hostname is an IP address, use it directly.
-    /// 2. Try system DNS resolution (via /etc/hosts or DNS server).
-    /// 3. If DNS fails and `DnsFallback::LocalhostForTest`, fall back to 127.0.0.1.
-    fn parse_endpoint(&self, addr_str: &str) -> Result<(String, std::net::SocketAddr), CurpError> {
-        let (host, port_str) = addr_str
-            .rsplit_once(':')
-            .ok_or_else(|| CurpError::internal(format!("invalid address format: {addr_str}")))?;
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| CurpError::internal(format!("invalid port in address: {addr_str}")))?;
-
-        // Try to parse as IP address
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            let addr = std::net::SocketAddr::new(ip, port);
-            return Ok((host.to_string(), addr));
-        }
-
-        // DNS hostname: try system DNS resolution (via /etc/hosts or DNS server)
-        let dns_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { tokio::net::lookup_host((host, port)).await })
-        });
-
-        match dns_result {
-            Ok(addrs) => {
-                let addr = addrs.into_iter().next().ok_or_else(|| {
-                    CurpError::internal(format!(
-                        "DNS lookup returned no addresses for '{host}:{port}'"
-                    ))
-                })?;
-                Ok((host.to_string(), addr))
-            }
-            Err(dns_err) => match self.dns_fallback {
-                DnsFallback::Disabled => Err(CurpError::internal(format!(
-                    "DNS lookup failed for '{host}:{port}': {dns_err}"
-                ))),
-                DnsFallback::LocalhostForTest => {
-                    // Test mode: fall back to 127.0.0.1 with the original hostname as SNI
-                    let fallback_addr =
-                        std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
-                    tracing::warn!(
-                        "DNS lookup failed for '{host}:{port}' ({dns_err}), \
-                         falling back to {fallback_addr} (test mode)"
-                    );
-                    Ok((host.to_string(), fallback_addr))
                 }
             },
         }

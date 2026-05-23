@@ -183,11 +183,11 @@ mod revision_check;
 /// Xline server
 pub mod server;
 
-/// Reset the shared QUIC listeners state (for test teardown).
-/// Must be called after all servers are stopped so the next test
-/// can create a fresh QuicListeners instance.
-pub fn reset_shared_quic() {
-    server::h3_server::reset_shared_quic();
+/// Shutdown the shared QUIC listeners state (process-exit cleanup only).
+/// This shuts down the QuicListeners and clears the singleton.
+/// Not intended for between-test reset — tests should use unique ports.
+pub fn shutdown_shared_quic() {
+    server::quic_runtime::SharedQuicRuntime::shutdown();
 }
 /// State of current node
 mod state;

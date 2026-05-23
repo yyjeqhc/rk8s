@@ -475,9 +475,6 @@ impl Drop for Cluster {
                         let _ignore = tokio::fs::remove_dir_all(path).await;
                     }
                 }
-                // Reset the shared QUIC listeners so the next test
-                // can create a fresh QuicListeners instance.
-                xline::reset_shared_quic();
             });
         });
     }

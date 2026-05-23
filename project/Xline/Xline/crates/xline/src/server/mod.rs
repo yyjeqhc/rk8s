@@ -18,8 +18,14 @@ mod lease_server;
 mod lock_server;
 /// Xline maintenance client
 mod maintenance;
+/// Port-based connection routing
+pub(crate) mod port_router;
+/// Shared QUIC runtime singleton
+pub(crate) mod quic_runtime;
 /// Xline QUIC direct-RPC bridge
 pub(crate) mod quic_service;
+/// Server registration with QUIC listeners
+pub(crate) mod server_registry;
 /// Xline watch server
 mod watch_server;
 /// Xline server

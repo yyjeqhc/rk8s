@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
 pub mod codec;
+pub mod endpoint;
 pub mod envelope;
 pub mod grpc;
 pub mod h3_client;
