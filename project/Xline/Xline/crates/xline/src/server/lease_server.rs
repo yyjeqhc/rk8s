@@ -172,11 +172,12 @@ impl LeaseServer {
                         if let Some(Ok(keep_alive_req)) = res {
                             keep_alive_req
                         } else {
+                            debug!("lease keepalive request stream ended (client closed)");
                             break;
                         }
                     }
                 };
-                debug!("Receive LeaseKeepAliveRequest {:?}", keep_alive_req);
+                debug!(lease_id = keep_alive_req.id, "Receive LeaseKeepAliveRequest");
                 let ttl = if lease_storage.is_primary() {
                     tokio::select! {
                         _ = shutdown_listener.wait() => {
@@ -246,6 +247,7 @@ impl LeaseServer {
                         if let Some(Ok(keep_alive_req)) = res {
                             yield keep_alive_req;
                         } else {
+                            debug!("lease keepalive follower redirect stream ended (client closed)");
                             break;
                         }
                     }

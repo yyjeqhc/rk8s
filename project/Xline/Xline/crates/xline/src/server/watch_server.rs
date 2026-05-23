@@ -7,7 +7,7 @@ use std::{
 use event_listener::Event;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
-use tracing::{debug, warn};
+use tracing::debug;
 use utils::task_manager::{Listener, TaskManager, tasks::TaskName};
 use xlineapi::command::KeyRange;
 use xlinerpc::server::EndPoint as RouterEndpoint;
@@ -117,12 +117,12 @@ impl WatchServer {
                                 watch_handle.handle_watch_request(req).await;
                             }
                             Err(e) => {
-                                warn!("Receive WatchRequest error {:?}", e);
+                                debug!(error = %e, "watch request stream error");
                                 break;
                             }
                         }
                     } else {
-                        warn!("Watch client closes connection");
+                        debug!("watch request stream ended (client closed)");
                         break;
                     }
                 }
@@ -143,6 +143,7 @@ impl WatchServer {
                 }
             }
         }
+        debug!("watch handler task exited");
     }
 
     /// Watch watches for events happening or that have happened. Both input and output
