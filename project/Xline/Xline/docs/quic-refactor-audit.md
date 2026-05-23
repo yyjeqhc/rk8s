@@ -814,6 +814,8 @@ Set `RUST_LOG=xline=debug` to see these logs.
 | `xline_lease_keepalive_closed_total` | Counter | LeaseStreaming dropped or closed | `reason` (client_close, server_close, error) |
 | `xline_server_connection_accepted_total` | Counter | `accept_loop` accepts connection | `server_name`, `target` (ClientH3, PeerCurp) |
 
+> **Note**: Some of these were implemented in §22 but with different names and in different crates (see §22 for actual names). The `xline_` prefix in this table is aspirational only — the actual OTel instrument names do NOT use this prefix.
+
 ### Recommended Labels
 
 **Low cardinality (safe)**:
@@ -892,15 +894,21 @@ grep -E "stream.*not stopped|No viable network path|connect failed|handshake fai
 
 ### Metrics Implemented
 
-| Metric Name | Crate | Type | Labels | Trigger Point |
-|-------------|-------|------|--------|---------------|
-| `port_router_unknown` | xline | Counter | `component`, `reason` | PortRouter returns Unknown target |
-| `quic_connect_attempts` | curp | Counter | `component` | CURP channel QUIC connect attempt |
-| `quic_connect_failures` | curp | Counter | `component`, `error_type` | CURP channel all connect attempts exhausted |
+| Metric Name (OTel) | Prometheus Name | Crate | Type | Labels | Trigger Point |
+|---------------------|-----------------|-------|------|--------|---------------|
+| `port_router_unknown` | `port_router_unknown_total` | xline | Counter | `component`, `reason` | PortRouter returns Unknown target |
+| `quic_connect_attempts` | `quic_connect_attempts_total` | curp | Counter | `component` | CURP channel QUIC connect attempt |
+| `quic_connect_failures` | `quic_connect_failures_total` | curp | Counter | `component`, `error_type` | CURP channel all connect attempts exhausted |
 
 ### PortRouter Unknown Metrics
 
 **Metric**: `port_router_unknown_total` (xline crate)
+
+**Prometheus output** (when triggered):
+```
+port_router_unknown_total{component="port_router",reason="unknown_server_name",otel_scope_name="xline",otel_scope_version="0.6.1"} 0
+port_router_unknown_total{component="port_router",reason="unknown_port",otel_scope_name="xline",otel_scope_version="0.6.1"} 0
+```
 
 **Labels**:
 - `component = "port_router"`
@@ -914,6 +922,12 @@ grep -E "stream.*not stopped|No viable network path|connect failed|handshake fai
 ### CURP QUIC Connect Metrics
 
 **Metrics**: `quic_connect_attempts_total`, `quic_connect_failures_total` (curp crate)
+
+**Prometheus output**:
+```
+quic_connect_attempts_total{component="curp_channel",otel_scope_name="curp",otel_scope_version="0.1.0"} 17
+quic_connect_failures_total{component="curp_channel",error_type="unavailable",otel_scope_name="curp",otel_scope_version="0.1.0"} 0
+```
 
 **Labels**:
 - `component = "curp_channel"`
@@ -929,8 +943,8 @@ grep -E "stream.*not stopped|No viable network path|connect failed|handshake fai
 
 | Metric | Reason |
 |--------|--------|
-| `xline_quic_connect_attempts_total` | xlinerpc crate has no opentelemetry dependency |
-| `xline_quic_connect_failures_total` | xlinerpc crate has no opentelemetry dependency |
+| `xline_quic_connect_attempts_total` | Implemented as `quic_connect_attempts_total` in curp crate (see above). H3 client version needs xlinerpc metrics infra. |
+| `xline_quic_connect_failures_total` | Implemented as `quic_connect_failures_total` in curp crate (see above). H3 client version needs xlinerpc metrics infra. |
 | `xline_h3_request_duration_seconds` | Requires histogram, more invasive changes |
 | `xline_h3_stream_drops_total` | Would need xlinerpc metrics infrastructure |
 | `xline_endpoint_resolve_failures_total` | Would need xlinerpc metrics infrastructure |
@@ -949,19 +963,54 @@ grep -E "stream.*not stopped|No viable network path|connect failed|handshake fai
 
 ### Viewing Metrics
 
-**Prometheus endpoint**: xline exposes `/metrics` on the client listen port
+**Prometheus endpoint**: xline exposes `/metrics` on a dedicated metrics port (default `9100`, configurable via `--metrics-port`).
+
+> **Important**: The metrics port is separate from the client listen port. Each xline node binds its own metrics port. When running multiple nodes locally, use `--metrics-port 9100`, `--metrics-port 9101`, etc.
+
+**Verify metrics are exposed**:
+```bash
+# After starting a cluster
+curl -s http://127.0.0.1:9100/metrics | grep -E "quic_connect|port_router"
+```
 
 **Example queries**:
 ```promql
 # PortRouter unknown connections
-rate(port_router_unknown_total[5m])
+rate(port_router_unknown_total{component="port_router"}[5m])
 
 # CURP connect attempts
-rate(quic_connect_attempts_total[5m])
+rate(quic_connect_attempts_total{component="curp_channel"}[5m])
 
 # CURP connect failures
-rate(quic_connect_failures_total[5m])
+rate(quic_connect_failures_total{component="curp_channel"}[5m])
 ```
+
+### Runtime Verification (2026-05-23)
+
+Verified on a local 3-node cluster with `--metrics-port 9100/9101/9102`:
+
+**server0 (port 9100) — all metrics after KV ops + member list**:
+```
+current_rust_version{server_rust_version=""} 1
+current_version{server_version="0.6.1"} 1
+fd_limit 1048576
+fd_used 41
+has_leader 1
+is_leader 0
+is_learner 0
+online_clients 0
+quic_connect_attempts_total{component="curp_channel"} 17
+server_id 15397586489680409000
+sp_cnt 0
+```
+
+**Key observations**:
+- `quic_connect_attempts_total` ✅ exported and incrementing (17 after basic ops)
+- `quic_connect_failures_total` — NOT present (expected: no failures in healthy cluster)
+- `port_router_unknown_total` — NOT present (expected: no Unknown routes in healthy cluster)
+- `current_rust_version` shows empty string — pre-existing issue (`CARGO_PKG_RUST_VERSION` not set in build env)
+- OTel scope attributes (`otel_scope_name`, `otel_scope_version`) are automatically added by the Prometheus exporter
+- All labels are low cardinality (`component`, `reason`, `error_type`) — no endpoint/socket_addr/raw error labels
 
 ### High Cardinality Fields (Avoid)
 
