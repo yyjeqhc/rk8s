@@ -98,13 +98,7 @@ impl<'a> ServerRegistry<'a> {
                     debug!("Registering server_name '{}' as SNI alias", server_name);
                     if let Err(e) = self
                         .listeners
-                        .add_server(
-                            server_name,
-                            cert_path,
-                            key_path,
-                            bind_uris,
-                            None,
-                        )
+                        .add_server(server_name, cert_path, key_path, bind_uris, None)
                         .await
                     {
                         warn!(
@@ -139,7 +133,10 @@ impl<'a> ServerRegistry<'a> {
                     .await
                 {
                     Ok(()) => {
-                        info!("Registered SNI alias '{}' for server '{}'", host, server_name);
+                        info!(
+                            "Registered SNI alias '{}' for server '{}'",
+                            host, server_name
+                        );
                     }
                     Err(e) => {
                         warn!(
@@ -182,8 +179,15 @@ impl<'a> ServerRegistry<'a> {
         let mut servers = self.handle.servers.write().await;
 
         let existing = servers.insert(server_name.to_string(), routing_info.clone());
-        if existing.is_some() {
-            warn!(server_name, "server routing info already existed, replaced");
+        if let Some(ref old) = existing {
+            warn!(
+                server_name,
+                old_client_ports = ?old.client_ports,
+                old_peer_ports = ?old.peer_ports,
+                new_client_ports = ?routing_info.client_ports,
+                new_peer_ports = ?routing_info.peer_ports,
+                "server routing info replaced (was already registered)"
+            );
         }
         info!(
             server_name,
@@ -202,7 +206,11 @@ impl<'a> ServerRegistry<'a> {
                         grpc_server: std::sync::Arc::clone(&routing_info.grpc_server),
                     };
                     let _ = servers.insert(host.to_string(), alias_info);
-                    debug!(alias = host, server = server_name, "SNI routing alias added");
+                    debug!(
+                        alias = host,
+                        server = server_name,
+                        "SNI routing alias added"
+                    );
                 }
             }
         }

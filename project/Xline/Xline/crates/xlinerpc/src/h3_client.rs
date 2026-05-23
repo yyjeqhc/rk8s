@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::endpoint::{DnsFallback, resolve_endpoint_with_fallback};
 use bytes::{Buf, Bytes};
 use dquic::prelude::{Connection as GmConnection, QuicClient};
 use dquic::qresolve::Source;
@@ -16,7 +17,6 @@ use prost::Message;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
-use crate::endpoint::{resolve_endpoint_with_fallback, DnsFallback};
 
 use crate::{Status, Streaming, grpc};
 
@@ -140,22 +140,16 @@ impl H3Channel {
 
     async fn create_connection(&self, endpoint_str: &str) -> Result<GmConnection, Status> {
         let client = self.pool.client();
+        debug!(endpoint = endpoint_str, "H3 create_connection start");
         it_debug(format!("quic connect start endpoint={}", endpoint_str));
 
-        // Use the unified endpoint resolver from `crate::endpoint`. This
-        // extracts the hostname (for TLS SNI) and resolves the socket address
-        // using the system DNS resolver.
         let resolved = resolve_endpoint_with_fallback(endpoint_str, DnsFallback::Disabled)
             .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "failed to parse QUIC endpoint '{}': {e}",
-                    endpoint_str
-                ))
-            })?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         let server_name = resolved.server_name;
         let socket_addr = resolved.socket_addr;
 
+        debug!(endpoint = endpoint_str, %server_name, %socket_addr, "H3 endpoint resolved");
         it_debug(format!(
             "quic connect: endpoint={}, server_name={}, addr={}",
             endpoint_str, server_name, socket_addr
@@ -167,25 +161,26 @@ impl H3Channel {
         {
             Ok(conn) => conn,
             Err(e) => {
+                warn!(endpoint = endpoint_str, %server_name, %socket_addr, error = %e, "H3 connect failed");
                 it_debug(format!(
                     "connected_to_with_source failed for server_name={}: {}",
                     server_name, e
                 ));
                 return Err(Status::unavailable(format!(
-                    "QUIC connect error to {endpoint_str}: {e}"
+                    "QUIC connect error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}"
                 )));
             }
         };
+        debug!(endpoint = endpoint_str, %server_name, "H3 QUIC connected");
         it_debug(format!(
             "quic connect established endpoint={}",
             endpoint_str
         ));
 
-        // gm-quic connect() may return before handshake fully finishes; wait explicitly
-        // so transport errors surface as handshake errors instead of opaque h3 init failures.
         with_timeout(effective_timeout(self.timeout), "quic handshake", async {
             match conn.handshaked().await {
                 Ok(_) => {
+                    debug!(endpoint = endpoint_str, %server_name, "H3 handshake ok");
                     it_debug(format!(
                         "quic handshake ok endpoint={} server_name={}",
                         endpoint_str, server_name
@@ -193,19 +188,42 @@ impl H3Channel {
                     Ok(())
                 }
                 Err(e) => {
+                    warn!(endpoint = endpoint_str, %server_name, error = %e, "H3 handshake failed");
                     it_debug(format!(
                         "quic handshake FAILED endpoint={} server_name={}: {}",
                         endpoint_str, server_name, e
                     ));
                     Err(Status::unavailable(format!(
-                        "QUIC handshake error to {endpoint_str}: {e}"
+                        "QUIC handshake error: endpoint='{endpoint_str}', server_name='{server_name}', addr={socket_addr}: {e}"
                     )))
                 }
             }
         })
         .await?;
+        debug!(endpoint = endpoint_str, %server_name, "H3 connection ready");
         it_debug(format!("quic handshake ok endpoint={}", endpoint_str));
         Ok(conn)
+    }
+
+    /// Connect with one retry on `Status::unavailable`. Retries use the next
+    /// endpoint from the round-robin pool, so a transient single-server failure
+    /// does not fail the entire RPC.
+    async fn connect_with_retry(&self) -> Result<(String, GmConnection), Status> {
+        const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+        let endpoint_str = self.get_endpoint().await?;
+        match self.create_connection(&endpoint_str).await {
+            Ok(conn) => Ok((endpoint_str, conn)),
+            Err(e) if e.code() == crate::Code::Unavailable => {
+                debug!(first_endpoint = endpoint_str, error = %e, "H3 connect failed, retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+                let next_endpoint = self.get_endpoint().await?;
+                debug!(retry_endpoint = next_endpoint, "H3 retry connect");
+                let conn = self.create_connection(&next_endpoint).await?;
+                Ok((next_endpoint, conn))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn unary<Req, Resp>(
@@ -219,8 +237,7 @@ impl H3Channel {
         Req: Message,
         Resp: Message + Default,
     {
-        let endpoint_str = self.get_endpoint().await?;
-        let conn = self.create_connection(&endpoint_str).await?;
+        let (endpoint_str, conn) = self.connect_with_retry().await?;
         it_debug(format!(
             "h3 init start endpoint={} path={}",
             endpoint_str, path
@@ -328,8 +345,7 @@ impl H3Channel {
         Req: Message,
         Resp: Message + Default + Send + Unpin + 'static,
     {
-        let endpoint_str = self.get_endpoint().await?;
-        let conn = self.create_connection(&endpoint_str).await?;
+        let (endpoint_str, conn) = self.connect_with_retry().await?;
 
         let (mut h3_driver, mut send_req) =
             with_timeout(effective_timeout(self.timeout), "h3 init", async {
@@ -476,8 +492,7 @@ impl H3Channel {
         Resp: Message + Default + Send + Unpin + 'static,
         St: Stream<Item = Req> + Send + 'static,
     {
-        let endpoint_str = self.get_endpoint().await?;
-        let conn = self.create_connection(&endpoint_str).await?;
+        let (endpoint_str, conn) = self.connect_with_retry().await?;
 
         let (mut h3_driver, mut send_req) =
             with_timeout(effective_timeout(self.timeout), "h3 init", async {
@@ -638,8 +653,6 @@ impl H3Channel {
 
         Ok(Streaming::new(Box::pin(ReceiverStream::new(rx))))
     }
-
-
 }
 
 async fn with_timeout<T>(

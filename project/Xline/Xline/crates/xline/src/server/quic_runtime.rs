@@ -91,9 +91,9 @@ impl SharedQuicRuntime {
             false
         };
 
-        let state = guard.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("SHARED_QUIC not initialized (should not happen)")
-        })?;
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SHARED_QUIC not initialized (should not happen)"))?;
 
         let listeners = Arc::clone(&state.listeners);
         let servers = Arc::clone(&state.servers);

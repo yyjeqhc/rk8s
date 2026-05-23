@@ -133,14 +133,16 @@ impl XlineH3Server {
 
         let grpc_server = Arc::new(grpc_server);
         for (server_name, (router_builder, peer_urls)) in &self.routers {
-            registry.register_server(
-                server_name,
-                router_builder.clone(),
-                peer_urls.clone(),
-                &self.client_ports,
-                &self.peer_ports,
-                Arc::clone(&grpc_server),
-            ).await?;
+            registry
+                .register_server(
+                    server_name,
+                    router_builder.clone(),
+                    peer_urls.clone(),
+                    &self.client_ports,
+                    &self.peer_ports,
+                    Arc::clone(&grpc_server),
+                )
+                .await?;
         }
 
         if is_first {
@@ -183,9 +185,9 @@ impl XlineH3Server {
                 }
                 ConnectionTarget::ClientH3 => {
                     debug!(server_name, local_port, "dispatching to client h3 router");
-                    let h3_conn = match h3::server::Connection::new(
-                        h3_shim::QuicConnection::new(Arc::new(new_conn)),
-                    )
+                    let h3_conn = match h3::server::Connection::new(h3_shim::QuicConnection::new(
+                        Arc::new(new_conn),
+                    ))
                     .await
                     {
                         Ok(h3_conn) => h3_conn,
@@ -194,17 +196,19 @@ impl XlineH3Server {
                             continue;
                         }
                     };
-                    let router = port_router
-                        .get_h3_router(&server_name)
-                        .await
-                        .ok_or_else(|| anyhow::anyhow!("server {} not found for h3", server_name))?;
+                    let router =
+                        port_router
+                            .get_h3_router(&server_name)
+                            .await
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("server {} not found for h3", server_name)
+                            })?;
                     let _ = tokio::spawn(Self::handle_connection(router, h3_conn));
                 }
                 ConnectionTarget::Unknown => {
                     error!(
                         server_name,
-                        local_port,
-                        "received connection on unknown local port"
+                        local_port, "received connection on unknown local port"
                     );
                 }
             }

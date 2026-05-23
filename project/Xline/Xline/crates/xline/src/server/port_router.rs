@@ -60,20 +60,18 @@ impl PortRouter {
                     local_port,
                     ?routing.client_ports,
                     ?routing.peer_ports,
-                    "unknown port"
+                    "unknown port — not in client_ports or peer_ports"
                 );
                 ConnectionTarget::Unknown
             }
         } else {
-            debug!(server_name, "server not found in routing table");
+            let known: Vec<&String> = servers.keys().collect();
+            debug!(server_name, ?known, "server not found in routing table");
             ConnectionTarget::Unknown
         }
     }
 
-    pub(crate) async fn get_routing_info(
-        &self,
-        server_name: &str,
-    ) -> Option<ServerRoutingInfo> {
+    pub(crate) async fn get_routing_info(&self, server_name: &str) -> Option<ServerRoutingInfo> {
         let servers = self.servers.read().await;
         servers.get(server_name).cloned()
     }

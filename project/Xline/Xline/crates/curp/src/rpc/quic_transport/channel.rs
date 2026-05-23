@@ -23,7 +23,9 @@ use tokio::task::JoinHandle;
 
 use crate::rpc::CurpError;
 
-use super::codec::{Frame, FrameReader, FrameWriter, MethodId, StopOnDropReader, status_error, status_ok};
+use super::codec::{
+    Frame, FrameReader, FrameWriter, MethodId, StopOnDropReader, status_error, status_ok,
+};
 
 /// Grace period for the send task to finish after receiving a cancel signal.
 /// If the task doesn't finish within this window, it is forcibly aborted.
@@ -155,10 +157,12 @@ impl QuicChannel {
     ///
     /// Strips the port from the address before using it as the TLS server_name.
     async fn try_connect(&self, addr_str: &str) -> Result<Connection, CurpError> {
-        // Resolve endpoint via utils (handles DNS lookup with optional localhost fallback)
-        let resolved = xlinerpc::endpoint::resolve_endpoint_with_fallback(addr_str, self.dns_fallback)
-            .await
-            .map_err(|e| CurpError::internal(e))?;
+        let resolved =
+            xlinerpc::endpoint::resolve_endpoint_with_fallback(addr_str, self.dns_fallback)
+                .await
+                .map_err(|e| {
+                    CurpError::internal(format!("{e} (dns_fallback={:?})", self.dns_fallback))
+                })?;
 
         match self
             .client
@@ -171,10 +175,10 @@ impl QuicChannel {
             Ok(conn) => Ok(conn),
             Err(e) => match self.dns_fallback {
                 DnsFallback::Disabled => Err(CurpError::internal(format!(
-                    "QUIC connect error for {addr_str}: {e}"
+                    "QUIC connect error: endpoint='{addr_str}', server_name='{}', addr={}: {e}",
+                    resolved.server_name, resolved.socket_addr,
                 ))),
                 DnsFallback::LocalhostForTest => {
-                    // Test mode: fall back to 127.0.0.1 with the original server_name as SNI
                     let port = resolved.socket_addr.port();
                     let fallback_addr =
                         std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
@@ -190,7 +194,10 @@ impl QuicChannel {
                         )
                         .await
                         .map_err(|e2| {
-                            CurpError::internal(format!("QUIC connect error: {e2} (original: {e})"))
+                            CurpError::internal(format!(
+                                "QUIC connect error (with fallback): endpoint='{addr_str}', server_name='{}', original_addr={}, fallback_addr={fallback_addr}: {e2} (original: {e})",
+                                resolved.server_name, resolved.socket_addr,
+                            ))
                         })
                 }
             },

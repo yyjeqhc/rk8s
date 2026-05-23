@@ -5,7 +5,8 @@
 **Commits Audited**:
 - `e7199407d` — QUIC/H3 architecture refactoring (15 files, +1369/-453)
 - `a7f8a450c` — Stream drop warning fix (4 files, +93/-12)
-- (pending) — Clean shutdown + CI script + docs
+- `5b0b8ade6` — Clean shutdown + CI script + docs (+880 lines)
+- (pending) — Transport hardening: error model, retry, observability
 
 ---
 
@@ -360,8 +361,8 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 
 | Limitation | Why it exists | Workaround |
 |-----------|---------------|------------|
-| ~120 stream drop warnings per restart | h3/dquic internal stream lifecycle. Sources: h3-shim RecvStream drops on connection close, `h3_driver.wait_idle()` internal stream drops, server accept queue drops. | Benign in production (debug-level). Would require dquic PR to eliminate. |
-| No H3 connection pooling | Not yet implemented | Each request creates new connection. QuicChannel has retry but no pooling. |
+| ~120 stream drop warnings per restart | h3/dquic internal stream lifecycle. Sources: h3-shim RecvStream drops on connection close, `h3_driver.wait_idle()` internal stream drops, server accept queue drops. CURP server recv intentionally NOT wrapped (wrapping breaks election). | Benign in production (debug-level). Would require dquic PR to eliminate. |
+| No H3 connection pooling | Not yet implemented | Each request creates new connection. H3Channel has retry (max 2, unavailable-only). QuicChannel has round-robin retry. |
 | etcd-client as dev-dependency | Used in integration tests and benchmarks | Not a production dependency. Zero `use tonic` in production code. |
 | Process-level QUIC singleton | dquic design choice | Tests must use unique ports. Cannot run parallel cluster tests in same process. |
 | `quic_restart_stress.sh` modifies `/etc/hosts` | Required for DNS name → IP resolution | CI script (`quic_ci_smoke.sh`) checks first, fails with clear error. |
@@ -376,6 +377,9 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 |--------|--------|-------|--------|
 | Stream drop warnings/round | ~200 | ~120 | -40% |
 | Endpoint resolver duplication | 2 copies | 1 | -50% |
+| Endpoint error model | `Result<_, String>` | `EndpointError` enum (3 variants, 7 fields) | Structured |
+| H3 client retry | None | Max 2, unavailable-only, next-endpoint | New |
+| H3 connection tracing | `it_debug` only | `tracing::debug/warn` + `it_debug` | Dual |
 | Singleton detection | `strong_count == 2` | `AtomicBool` | Reliable |
 | Test cleanup | `reset_shared_quic` (Drop) | None needed | Fixed |
 | Clean shutdown | Not wired | `main.rs` calls it | Fixed |
@@ -385,16 +389,18 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 
 ## 14. Verification Matrix
 
-### This commit (commit 3)
+### This commit (transport hardening)
 
 | Test | Result | Notes |
 |------|--------|-------|
 | `cargo check` (full workspace) | ✅ | |
 | `cargo build --bin xline --bin xlinectl` | ✅ | |
+| `cargo test -p xlinerpc -- endpoint` | ✅ | 7 tests pass |
 | `bash scripts/quic_ci_smoke.sh` (short) | ✅ | ALL PASSED: smoke + 3-round restart stress |
-| `XLINE_QUIC_CI_LONG=1 bash scripts/quic_ci_smoke.sh` | ⏱️ | Timed out (>15 min). Requires longer CI timeout. |
+| `bash scripts/quic_restart_stress.sh 5` | ✅ | All 5 rounds PASSED, 0 panics, 0 NoViablePath |
+| `bash scripts/quic_fault_smoke.sh` | ✅ | Kill follower, kill leader, restart — all passed |
 
-### Previously verified (commits 1 and 2)
+### Previously verified (commits 1, 2, 3)
 
 | Test | Result | Notes |
 |------|--------|-------|
@@ -413,9 +419,10 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 ## 15. Suggested Next Steps
 
 1. **H3 connection pooling** — Reuse connections across requests (like QuicChannel)
-2. **Evaluate dquic stream drop suppression** — If upstream accepts PR, remaining warnings can be eliminated
+2. **Evaluate dquic stream drop suppression** — If upstream accepts PR, remaining ~120 warnings can be eliminated
 3. **Remove etcd-client dev-dependency** — Rewrite integration tests to use xline's own client (optional, low priority)
 4. **CI integration** — Add `scripts/quic_ci_smoke.sh` to CI pipeline
+5. **CURP channel error context** — Already improved with structured endpoint/server_name/addr in error messages
 
 ---
 

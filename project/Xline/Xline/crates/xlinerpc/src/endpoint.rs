@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 /// DNS resolution fallback policy.
@@ -8,6 +9,62 @@ pub enum DnsFallback {
     /// Fall back to 127.0.0.1 with the original hostname as SNI.
     LocalhostForTest,
 }
+
+/// Structured error for endpoint resolution, preserving all context needed
+/// for diagnostics.
+#[derive(Debug)]
+pub enum EndpointError {
+    /// Endpoint format is invalid (missing port, bad IPv6 bracket, etc).
+    ParseError { endpoint: String, reason: String },
+    /// DNS resolution failed.
+    DnsError {
+        endpoint: String,
+        host: String,
+        port: u16,
+        fallback: DnsFallback,
+        source: String,
+    },
+    /// DNS lookup succeeded but returned no addresses.
+    NoAddresses {
+        endpoint: String,
+        host: String,
+        port: u16,
+    },
+}
+
+impl fmt::Display for EndpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParseError { endpoint, reason } => {
+                write!(f, "invalid endpoint '{endpoint}': {reason}")
+            }
+            Self::DnsError {
+                endpoint,
+                host,
+                port,
+                fallback,
+                source,
+            } => {
+                write!(
+                    f,
+                    "DNS lookup failed for '{host}:{port}' (endpoint='{endpoint}', fallback={fallback:?}): {source}"
+                )
+            }
+            Self::NoAddresses {
+                endpoint,
+                host,
+                port,
+            } => {
+                write!(
+                    f,
+                    "DNS lookup returned no addresses for '{host}:{port}' (endpoint='{endpoint}')"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EndpointError {}
 
 /// A fully resolved endpoint ready for QUIC connection.
 #[derive(Debug, Clone)]
@@ -32,52 +89,60 @@ pub fn strip_scheme(endpoint: &str) -> &str {
 ///
 /// # Errors
 ///
-/// Returns error if format is invalid or port is missing.
-pub fn parse_host_port(endpoint: &str) -> Result<(String, u16), String> {
+/// Returns `EndpointError::ParseError` if format is invalid or port is missing.
+pub fn parse_host_port(endpoint: &str) -> Result<(String, u16), EndpointError> {
     let stripped = strip_scheme(endpoint);
 
     if stripped.starts_with('[') {
         let bracket_end = stripped
             .find(']')
-            .ok_or_else(|| format!("missing ']' in IPv6 endpoint: {endpoint}"))?;
+            .ok_or_else(|| EndpointError::ParseError {
+                endpoint: endpoint.to_string(),
+                reason: "missing ']' in IPv6 endpoint".to_string(),
+            })?;
         let host = &stripped[1..bracket_end];
         let rest = &stripped[bracket_end + 1..];
         let port_str = rest
             .strip_prefix(':')
-            .ok_or_else(|| format!("missing port after ']' in endpoint: {endpoint}"))?;
-        let port: u16 = port_str
-            .parse()
-            .map_err(|e| format!("invalid port in endpoint '{endpoint}': {e}"))?;
+            .ok_or_else(|| EndpointError::ParseError {
+                endpoint: endpoint.to_string(),
+                reason: "missing port after ']'".to_string(),
+            })?;
+        let port: u16 =
+            port_str
+                .parse()
+                .map_err(|e: std::num::ParseIntError| EndpointError::ParseError {
+                    endpoint: endpoint.to_string(),
+                    reason: format!("invalid port: {e}"),
+                })?;
         Ok((host.to_string(), port))
     } else {
-        let (host, port_str) = stripped
-            .rsplit_once(':')
-            .ok_or_else(|| format!("missing ':' in endpoint: {endpoint}"))?;
-        let port: u16 = port_str
-            .parse()
-            .map_err(|e| format!("invalid port in endpoint '{endpoint}': {e}"))?;
+        let (host, port_str) =
+            stripped
+                .rsplit_once(':')
+                .ok_or_else(|| EndpointError::ParseError {
+                    endpoint: endpoint.to_string(),
+                    reason: "missing ':' separator and port".to_string(),
+                })?;
+        let port: u16 =
+            port_str
+                .parse()
+                .map_err(|e: std::num::ParseIntError| EndpointError::ParseError {
+                    endpoint: endpoint.to_string(),
+                    reason: format!("invalid port: {e}"),
+                })?;
         Ok((host.to_string(), port))
     }
 }
 
-/// Resolve endpoint with DNS lookup (production: DNS failure = error).
-///
-/// # Errors
-///
-/// Returns error if DNS resolution fails.
-pub async fn resolve_endpoint(endpoint: &str) -> Result<ResolvedEndpoint, String> {
+pub async fn resolve_endpoint(endpoint: &str) -> Result<ResolvedEndpoint, EndpointError> {
     resolve_endpoint_with_fallback(endpoint, DnsFallback::Disabled).await
 }
 
-/// Resolve endpoint with configurable DNS fallback.
-///
-/// # Errors
-///
-/// Returns error if DNS resolution fails and fallback is disabled.
 pub async fn resolve_endpoint_with_fallback(
     endpoint: &str,
     fallback: DnsFallback,
-) -> Result<ResolvedEndpoint, String> {
+) -> Result<ResolvedEndpoint, EndpointError> {
     let (host, port) = parse_host_port(endpoint)?;
 
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -90,20 +155,27 @@ pub async fn resolve_endpoint_with_fallback(
     let host_lookup = host.clone();
     match tokio::net::lookup_host((host_lookup.as_str(), port)).await {
         Ok(mut addrs) => {
-            let addr = addrs
-                .next()
-                .ok_or_else(|| format!("DNS lookup returned no addresses for '{host}:{port}'"))?;
+            let addr = addrs.next().ok_or_else(|| EndpointError::NoAddresses {
+                endpoint: endpoint.to_string(),
+                host: host.clone(),
+                port,
+            })?;
             Ok(ResolvedEndpoint {
                 server_name: host,
                 socket_addr: addr,
             })
         }
         Err(dns_err) => match fallback {
-            DnsFallback::Disabled => Err(format!(
-                "DNS lookup failed for '{host}:{port}': {dns_err}"
-            )),
+            DnsFallback::Disabled => Err(EndpointError::DnsError {
+                endpoint: endpoint.to_string(),
+                host: host.clone(),
+                port,
+                fallback,
+                source: dns_err.to_string(),
+            }),
             DnsFallback::LocalhostForTest => {
-                let fallback_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+                let fallback_addr =
+                    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
                 tracing::warn!(
                     "DNS lookup failed for '{host}:{port}' ({dns_err}), \
                      falling back to {fallback_addr} (test mode)"
@@ -160,7 +232,10 @@ mod tests {
     async fn test_resolve_ip_endpoint() {
         let ep = resolve_endpoint("127.0.0.1:2379").await.unwrap();
         assert_eq!(ep.server_name, "127.0.0.1");
-        assert_eq!(ep.socket_addr, "127.0.0.1:2379".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            ep.socket_addr,
+            "127.0.0.1:2379".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
