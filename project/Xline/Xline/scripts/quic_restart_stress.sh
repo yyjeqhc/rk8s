@@ -23,6 +23,12 @@ log_fail() { echo "  ❌ $1"; PASS=false; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 log_warn() { echo "  ⚠️  $1"; WARN_COUNT=$((WARN_COUNT + 1)); }
 log_info() { echo "  ℹ️  $1"; }
 
+cleanup() {
+    pkill -9 -f "xline --name server" 2>/dev/null || true
+    rm -rf /tmp/xline-stress-* 2>/dev/null || true
+}
+trap cleanup EXIT
+
 ensure_hosts() {
     for name in server0 server1 server2; do
         if ! grep -q "$name" /etc/hosts 2>/dev/null; then

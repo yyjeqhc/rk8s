@@ -1045,7 +1045,7 @@ These fields are only in debug logs, not metrics.
 
 ---
 
-## §24 Configuration Validation and Deployment Checklist
+## 24. Configuration Validation and Deployment Checklist
 
 ### Startup Validation
 
@@ -1111,7 +1111,7 @@ View metrics: `curl http://127.0.0.1:9100/metrics`
 
 ---
 
-## §25 xlinectl Client-Side Configuration and Error UX
+## 25. xlinectl Client-Side Configuration and Error UX
 
 ### Client CLI Arguments
 
@@ -1204,7 +1204,7 @@ grep -E 'server[012]' /etc/hosts
 
 ---
 
-## §26 TLS Verification Policy
+## 26. TLS Verification Policy
 
 ### Default Security Posture
 
@@ -1267,7 +1267,7 @@ See §27 for full root cause analysis and behavior.
 
 ---
 
-## §27 IP Endpoint and SNI Routing Analysis
+## 27. IP Endpoint and SNI Routing Analysis
 
 ### Root Cause
 
