@@ -43,13 +43,20 @@ fn it_debug(msg: impl AsRef<str>) {
 /// Type alias for h3 request stream with BidiStream
 pub type H3RequestStream = RequestStream<BidiStream<Bytes>, Bytes>;
 
-/// H3 connection pool only keeps a client reference for new connections.
+/// Factory for creating new QUIC/H3 connections.
+///
+/// This is NOT a connection pool — each RPC creates a fresh QUIC connection,
+/// H3 session, and driver task. Connection reuse is architecturally feasible
+/// (h3 `SendRequest` is `Clone`, QUIC supports multiplexed streams) but would
+/// require a session cache with lifecycle management, health eviction, and
+/// shutdown hooks. See `docs/quic-refactor-audit.md` §Connection Reuse for the
+/// full analysis and future design.
 #[derive(Clone)]
-struct H3ConnectionPool {
+struct H3ClientFactory {
     client: Arc<QuicClient>,
 }
 
-impl H3ConnectionPool {
+impl H3ClientFactory {
     #[inline]
     fn new(client: Arc<QuicClient>) -> Self {
         Self { client }
@@ -63,7 +70,7 @@ impl H3ConnectionPool {
 
 #[derive(Clone)]
 pub struct H3Channel {
-    pool: Arc<H3ConnectionPool>,
+    pool: Arc<H3ClientFactory>,
     addrs: Arc<RwLock<Vec<String>>>,
     index: Arc<AtomicUsize>,
     timeout: Duration,
@@ -82,7 +89,7 @@ impl H3Channel {
     #[inline]
     pub fn new(client: Arc<QuicClient>, addrs: Vec<String>, timeout: Duration) -> Self {
         Self {
-            pool: Arc::new(H3ConnectionPool::new(client)),
+            pool: Arc::new(H3ClientFactory::new(client)),
             addrs: Arc::new(RwLock::new(addrs)),
             index: Arc::new(AtomicUsize::new(0)),
             timeout,
@@ -226,6 +233,10 @@ impl H3Channel {
         }
     }
 
+    // Each RPC creates a new QUIC connection, H3 session, and driver task.
+    // This is intentional: h3 SendRequest is Clone (connection reuse is feasible)
+    // but the current design prioritizes simplicity over performance.
+    // See H3ClientFactory doc for the connection reuse analysis.
     pub async fn unary<Req, Resp>(
         &self,
         path: &str,

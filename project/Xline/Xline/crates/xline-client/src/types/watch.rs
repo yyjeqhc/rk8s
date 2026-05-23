@@ -237,7 +237,11 @@ impl From<WatchFilterType> for i32 {
 pub struct WatchStreaming {
     /// Inner QUIC stream
     inner: Streaming<WatchResponse>,
-    /// A sender of `WatchResponse`, used to keep response stream alive
+    /// Lifecycle pin: keeps the request channel open so the handler task stays
+    /// alive even if the `Watcher` is dropped first. Without this, dropping
+    /// `Watcher` would close the request channel, causing the handler task to
+    /// exit and the QUIC stream to close — even if the user still wants to
+    /// receive events from `WatchStreaming`.
     _sender: Sender<xlineapi::WatchRequest>,
 }
 
