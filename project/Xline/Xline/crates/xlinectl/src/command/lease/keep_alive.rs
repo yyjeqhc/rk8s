@@ -3,11 +3,10 @@ use std::time::Duration;
 use clap::{ArgMatches, Command, arg, value_parser};
 use tokio::signal::ctrl_c;
 use xline_client::{
-    Client, Streaming,
+    Client,
     error::{Result, XlineClientError},
-    types::lease::LeaseKeeper,
+    types::lease::{LeaseKeeper, LeaseStreaming},
 };
-use xlineapi::LeaseKeepAliveResponse;
 
 use crate::utils::printer::Printer;
 
@@ -55,7 +54,7 @@ pub(super) async fn execute(client: &mut Client, matches: &ArgMatches) -> Result
 /// keep alive forever unless encounter error
 async fn keep_alive_loop(
     mut keeper: LeaseKeeper,
-    mut stream: Streaming<LeaseKeepAliveResponse>,
+    mut stream: LeaseStreaming,
     verbose: bool,
 ) -> Result<()> {
     loop {

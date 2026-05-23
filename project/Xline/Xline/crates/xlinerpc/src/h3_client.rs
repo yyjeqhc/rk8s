@@ -488,7 +488,10 @@ impl H3Channel {
             debug!("h3 server-streaming reader finished path={}", path_owned);
         });
 
-        Ok(Streaming::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Streaming::new(
+            Box::pin(ReceiverStream::new(rx)),
+            "server_streaming",
+        ))
     }
 
     pub async fn client_streaming<Req, Resp, St>(
@@ -662,7 +665,10 @@ impl H3Channel {
             debug!("h3 client-streaming handler finished path={}", path_owned);
         });
 
-        Ok(Streaming::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Streaming::new(
+            Box::pin(ReceiverStream::new(rx)),
+            "client_streaming",
+        ))
     }
 }
 

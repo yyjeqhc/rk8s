@@ -12,7 +12,7 @@ use crate::{
     error::{Result, XlineClientError},
     lease_gen::LeaseIdGenerator,
     transport::{Channel, Streaming},
-    types::lease::LeaseKeeper,
+    types::lease::{LeaseKeeper, LeaseStreaming},
 };
 
 /// Client for Lease operations.
@@ -182,10 +182,7 @@ impl LeaseClient {
     /// }
     /// ```
     #[inline]
-    pub async fn keep_alive(
-        &mut self,
-        id: i64,
-    ) -> Result<(LeaseKeeper, Streaming<LeaseKeepAliveResponse>)> {
+    pub async fn keep_alive(&mut self, id: i64) -> Result<(LeaseKeeper, LeaseStreaming)> {
         let (mut sender, receiver) = channel::<xlineapi::LeaseKeepAliveRequest>(100);
 
         sender
@@ -206,7 +203,10 @@ impl LeaseClient {
             }
         };
 
-        Ok((LeaseKeeper::new(resp_id, sender), stream))
+        Ok((
+            LeaseKeeper::new(resp_id, sender.clone()),
+            LeaseStreaming::new(stream, sender),
+        ))
     }
 
     /// Retrieves lease information.

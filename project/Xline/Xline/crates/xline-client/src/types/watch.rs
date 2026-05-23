@@ -8,6 +8,7 @@ use super::range_end::RangeOption;
 use crate::error::{Result, XlineClientError};
 use crate::transport::Streaming;
 use futures::{Stream, channel::mpsc::Sender};
+use tracing::debug;
 pub use xlineapi::{Event, EventType, KeyValue, WatchResponse};
 use xlineapi::{RequestUnion, WatchCancelRequest, WatchProgressRequest};
 
@@ -276,6 +277,12 @@ impl Stream for WatchStreaming {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Drop for WatchStreaming {
+    fn drop(&mut self) {
+        debug!("WatchStreaming dropped");
     }
 }
 

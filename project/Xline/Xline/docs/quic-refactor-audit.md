@@ -517,12 +517,53 @@ This is a significant refactor that violates the "no large-scale refactoring" co
 - Keeps request channel open even if `Watcher` dropped
 - Drop `WatchStreaming` → both channels close → handler task exits → QUIC stream closes
 
-**Lease** (`Streaming<LeaseKeepAliveResponse>`):
-- No lifecycle pin — `LeaseKeeper` holds sender, `Streaming` holds response
-- Drop `Streaming` but keep `LeaseKeeper` → handler task stays alive (reads requests, can't send responses)
-- User must drop `LeaseKeeper` to fully close the stream
+**Lease** (`LeaseStreaming`):
+- Now has `_sender: Sender<LeaseKeepAliveRequest>` lifecycle pin (same pattern as WatchStreaming)
+- Drop `LeaseStreaming` → both channels close → handler task exits → QUIC stream closes
+- Previously was `Streaming<LeaseKeepAliveResponse>` without lifecycle pin — dropping it while keeping `LeaseKeeper` would leak the handler task
 
 **Unary**: Stream consumed in same call. No lifecycle concerns.
+
+### Stream Drop Diagnostics
+
+All stream types now log at `debug` level when dropped:
+- `Streaming<T>` — logs label (e.g., "server_streaming", "client_streaming", "server_request")
+- `WatchStreaming` — logs "WatchStreaming dropped"
+- `LeaseStreaming` — inherits from `Streaming<T>` label
+
+Set `RUST_LOG=debug` to see drop events. Useful for diagnosing stream lifecycle issues.
+
+---
+
+## 17. API Compatibility Note
+
+### Breaking Change: `LeaseClient::keep_alive()` Return Type
+
+**Before**: `Result<(LeaseKeeper, Streaming<LeaseKeepAliveResponse>)>`
+**After**: `Result<(LeaseKeeper, LeaseStreaming)>`
+
+**Reason**: `LeaseStreaming` adds a lifecycle pin (`_sender: Sender<LeaseKeepAliveRequest>`) that prevents handler task leaks when the response stream is dropped before the `LeaseKeeper`. Without this pin, dropping `Streaming` while keeping `LeaseKeeper` alive would leave the handler task running indefinitely.
+
+**Migration**: All callers that use destructuring + `.message()` require no changes:
+```rust
+// This pattern works unchanged with both old and new types:
+let (mut keeper, mut stream) = client.keep_alive(id).await?;
+keeper.keep_alive()?;
+let resp = stream.message().await?;
+```
+
+Only code with explicit type annotations needs updating:
+```rust
+// Old:
+let mut stream: Streaming<LeaseKeepAliveResponse> = ...;
+// New:
+let mut stream: LeaseStreaming = ...;
+```
+
+**Public API surface of `LeaseStreaming`**:
+- `.message() -> Result<Option<LeaseKeepAliveResponse>>` — same as `Streaming<T>`
+- `impl Stream<Item = Result<LeaseKeepAliveResponse>>` — same as `Streaming<T>`
+- No `Deref<Target = Streaming<LeaseKeepAliveResponse>>` — explicit methods preferred
 
 ---
 

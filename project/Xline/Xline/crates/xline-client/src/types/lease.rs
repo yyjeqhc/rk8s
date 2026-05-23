@@ -1,10 +1,16 @@
-use futures::channel::mpsc::Sender;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use futures::{Stream, channel::mpsc::Sender};
 pub use xlineapi::{
     LeaseGrantResponse, LeaseKeepAliveResponse, LeaseLeasesResponse, LeaseRevokeResponse,
     LeaseStatus, LeaseTimeToLiveResponse,
 };
 
 use crate::error::{Result, XlineClientError};
+use crate::transport::Streaming;
 
 /// The lease keep alive handle.
 #[derive(Debug)]
@@ -40,5 +46,55 @@ impl LeaseKeeper {
         self.sender
             .try_send(xlineapi::LeaseKeepAliveRequest { id: self.id })
             .map_err(|e| XlineClientError::LeaseError(e.to_string()))
+    }
+}
+
+/// Lease keep-alive response stream.
+///
+/// Holds a clone of the request sender as a lifecycle pin: even if the
+/// `LeaseKeeper` is dropped first, the request channel stays open and the
+/// handler task continues to receive responses. Dropping `LeaseStreaming`
+/// releases both sides, allowing the handler task and QUIC stream to close.
+#[derive(Debug)]
+pub struct LeaseStreaming {
+    inner: Streaming<LeaseKeepAliveResponse>,
+    _sender: Sender<xlineapi::LeaseKeepAliveRequest>,
+}
+
+impl LeaseStreaming {
+    /// Creates a new `LeaseStreaming`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn new(
+        inner: Streaming<LeaseKeepAliveResponse>,
+        sender: Sender<xlineapi::LeaseKeepAliveRequest>,
+    ) -> Self {
+        Self {
+            inner,
+            _sender: sender,
+        }
+    }
+
+    /// Receive the next keep-alive response from the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream encounters a transport error.
+    #[inline]
+    pub async fn message(&mut self) -> Result<Option<LeaseKeepAliveResponse>> {
+        self.inner.message().await.map_err(Into::into)
+    }
+}
+
+impl Stream for LeaseStreaming {
+    type Item = Result<LeaseKeepAliveResponse>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(resp))) => Poll::Ready(Some(Ok(resp))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

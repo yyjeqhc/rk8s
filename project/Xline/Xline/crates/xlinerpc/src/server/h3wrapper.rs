@@ -359,7 +359,10 @@ where
         }
     });
 
-    XlineStreaming::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    XlineStreaming::new(
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        "server_request",
+    )
 }
 
 /// Service adapter for unary RPC calls
