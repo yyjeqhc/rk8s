@@ -264,6 +264,15 @@ fn cli() -> Command {
 #[tokio::main]
 #[allow(clippy::unwrap_in_result)] // Required clap arguments
 async fn main() -> Result<()> {
+    // Initialize tracing subscriber if RUST_LOG is set.
+    // This enables debug logging for CURP connection cache diagnostics:
+    //   RUST_LOG=curp::rpc::quic_transport::channel=debug xlinectl ...
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let matches = cli().get_matches();
     let user_opt = parse_user(&matches)?;
     let endpoints: Vec<String> = matches

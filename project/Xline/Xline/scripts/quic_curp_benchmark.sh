@@ -66,6 +66,29 @@ CA_CERT="$FIXTURES_DIR/ca.crt"
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# Parse cache stats from a debug log file.
+# Counts occurrences of curp_conn_cache_hit, curp_conn_cache_miss, curp_conn_cache_evict.
+parse_cache_stats() {
+    local logfile="$1"
+    if [[ ! -f "$logfile" ]]; then
+        echo "0 0 0"
+        return
+    fi
+    local hits misses evictions
+    hits=$(grep -c "curp_conn_cache_hit" "$logfile" 2>/dev/null || echo 0)
+    misses=$(grep -c "curp_conn_cache_miss" "$logfile" 2>/dev/null || echo 0)
+    evictions=$(grep -c "curp_conn_cache_evict" "$logfile" 2>/dev/null || echo 0)
+    echo "$hits $misses $evictions"
+}
+
+# Build RUST_LOG value for cache diagnostics.
+# Returns empty string if cache is not enabled.
+cache_rust_log() {
+    if [[ "${XLINE_CURP_CONN_CACHE:-}" == "1" ]]; then
+        echo "curp::rpc::quic_transport::channel=debug"
+    fi
+}
+
 cleanup() {
     if [[ $KEEP_CLUSTER -eq 1 ]]; then
         log "Keeping cluster (--keep-cluster)"
@@ -178,6 +201,11 @@ bench_xlinectl_sequential() {
     local csv="$OUTPUT_DIR/xlinectl_sequential.csv"
     echo "op,latency_ns" > "$csv"
 
+    local cache_log="$OUTPUT_DIR/xlinectl_sequential_debug.log"
+    : > "$cache_log"
+    local rust_log
+    rust_log=$(cache_rust_log)
+
     local start_attempts=$(scrape_all_metrics "before sequential")
 
     local success=0
@@ -186,21 +214,39 @@ bench_xlinectl_sequential() {
     for i in $(seq 1 "$n"); do
         local key="bench-seq-$i"
         local t0=$(date +%s%N)
-        if "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" put "$key" "value-$i" >/dev/null 2>&1; then
-            success=$((success + 1))
+        if [[ -n "$rust_log" ]]; then
+            if RUST_LOG="$rust_log" "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" put "$key" "value-$i" 2>>"$cache_log" >/dev/null; then
+                success=$((success + 1))
+            else
+                failure=$((failure + 1))
+                log "  WARN: put $key failed"
+            fi
         else
-            failure=$((failure + 1))
-            log "  WARN: put $key failed"
+            if "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" put "$key" "value-$i" >/dev/null 2>&1; then
+                success=$((success + 1))
+            else
+                failure=$((failure + 1))
+                log "  WARN: put $key failed"
+            fi
         fi
         local t1=$(date +%s%N)
         echo "put,$((t1 - t0))" >> "$csv"
 
         t0=$(date +%s%N)
-        if "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" get "$key" >/dev/null 2>&1; then
-            success=$((success + 1))
+        if [[ -n "$rust_log" ]]; then
+            if RUST_LOG="$rust_log" "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" get "$key" 2>>"$cache_log" >/dev/null; then
+                success=$((success + 1))
+            else
+                failure=$((failure + 1))
+                log "  WARN: get $key failed"
+            fi
         else
-            failure=$((failure + 1))
-            log "  WARN: get $key failed"
+            if "$XLINECTL_BIN" --endpoints "$ENDPOINT" --ca_cert_pem_path "$CA_CERT" get "$key" >/dev/null 2>&1; then
+                success=$((success + 1))
+            else
+                failure=$((failure + 1))
+                log "  WARN: get $key failed"
+            fi
         fi
         t1=$(date +%s%N)
         echo "get,$((t1 - t0))" >> "$csv"
@@ -214,8 +260,15 @@ bench_xlinectl_sequential() {
     local conns_per_op=$(awk "BEGIN{printf \"%.2f\", $conn_delta / $ops}")
     log "  Total: ${total_ms}ms for $ops ops ($n put + $n get)"
     log "  Success: $success  Failure: $failure"
-    log "  QUIC connections: $conn_delta ($conns_per_op per op)"
+    log "  QUIC connections (server-side): $conn_delta ($conns_per_op per op)"
     log "  Throughput: $(awk "BEGIN{printf \"%.1f\", $ops * 1000 / $total_ms}") ops/s"
+
+    if [[ -n "$rust_log" ]]; then
+        local cache_stats
+        cache_stats=$(parse_cache_stats "$cache_log")
+        read -r hits misses evictions <<< "$cache_stats"
+        log "  Client cache stats: hits=$hits misses=$misses evictions=$evictions"
+    fi
 
     return $failure
 }
@@ -289,11 +342,21 @@ bench_long_running() {
 
     local start_attempts=$(scrape_all_metrics "before long-running")
 
+    local rust_log
+    rust_log=$(cache_rust_log)
+    local stderr_log="$OUTPUT_DIR/long_running_stderr.log"
+
     local rc=0
     local start_ns=$(date +%s%N)
-    timeout 300 "$PROJECT_ROOT/target/debug/examples/client_kv_benchmark" \
-        --requests "$n" \
-        2>"$OUTPUT_DIR/long_running_stderr.log" || rc=$?
+    if [[ -n "$rust_log" ]]; then
+        RUST_LOG="$rust_log" timeout 300 "$PROJECT_ROOT/target/debug/examples/client_kv_benchmark" \
+            --requests "$n" \
+            2>"$stderr_log" || rc=$?
+    else
+        timeout 300 "$PROJECT_ROOT/target/debug/examples/client_kv_benchmark" \
+            --requests "$n" \
+            > /dev/null 2>/dev/null || rc=$?
+    fi
     local end_ns=$(date +%s%N)
     local total_ms=$(( (end_ns - start_ns) / 1000000 ))
 
@@ -311,8 +374,15 @@ bench_long_running() {
 
     log "  Total: ${total_ms}ms for $ops ops"
     log "  Exit code: $rc"
-    log "  QUIC connections: $conn_delta ($conns_per_op per op)"
+    log "  QUIC connections (server-side): $conn_delta ($conns_per_op per op)"
     log "  Throughput: $(awk "BEGIN{printf \"%.1f\", $ops * 1000 / $total_ms}") ops/s"
+
+    if [[ -n "$rust_log" ]]; then
+        local cache_stats
+        cache_stats=$(parse_cache_stats "$stderr_log")
+        read -r hits misses evictions <<< "$cache_stats"
+        log "  Client cache stats: hits=$hits misses=$misses evictions=$evictions"
+    fi
 
     return $rc
 }
