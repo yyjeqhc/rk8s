@@ -213,6 +213,8 @@ pub struct ClientBuilder {
     config: ClientConfig,
     /// Transport configuration (QUIC)
     transport: Option<crate::rpc::transport::TransportConfig>,
+    /// Whether to enable CURP connection cache (applied when transport is set)
+    cache_enabled: bool,
 }
 
 /// A client builder with bypass with local server
@@ -239,6 +241,7 @@ impl ClientBuilder {
             all_members: None,
             leader_state: None,
             transport: None,
+            cache_enabled: false,
         }
     }
 
@@ -288,6 +291,7 @@ impl ClientBuilder {
         self.transport = Some(crate::rpc::transport::TransportConfig {
             client: quic_client,
             dns_fallback: crate::rpc::quic_transport::channel::DnsFallback::Disabled,
+            cache_enabled: self.cache_enabled,
         });
         self
     }
@@ -304,7 +308,21 @@ impl ClientBuilder {
         self.transport = Some(crate::rpc::transport::TransportConfig {
             client: quic_client,
             dns_fallback: crate::rpc::quic_transport::channel::DnsFallback::LocalhostForTest,
+            cache_enabled: self.cache_enabled,
         });
+        self
+    }
+
+    /// Enable CURP connection cache for this client builder.
+    ///
+    /// When enabled, QUIC connections are reused across RPCs within the same QuicChannel.
+    /// This is an experimental feature gated by this method and the `XLINE_CURP_CONN_CACHE` env var.
+    ///
+    /// Can be called before or after `quic_transport()` / `quic_transport_for_test()`.
+    #[inline]
+    #[must_use]
+    pub fn enable_connection_cache(mut self) -> Self {
+        self.cache_enabled = true;
         self
     }
 
@@ -326,6 +344,7 @@ impl ClientBuilder {
         })?;
         let quic_client = Arc::clone(&transport.client);
         let dns_fallback = transport.dns_fallback;
+        let cache_enabled = transport.cache_enabled;
 
         let propose_timeout = *self.config.propose_timeout();
         let mut futs: FuturesUnordered<_> = addrs
@@ -334,7 +353,8 @@ impl ClientBuilder {
                 let client = Arc::clone(&quic_client);
                 let addr = addr.clone();
                 async move {
-                    let channel = QuicChannel::with_addrs(client, vec![addr], dns_fallback);
+                    let channel =
+                        QuicChannel::with_addrs(client, vec![addr], dns_fallback, cache_enabled);
                     let resp: FetchClusterResponse = channel
                         .unary_call(
                             MethodId::FetchCluster,

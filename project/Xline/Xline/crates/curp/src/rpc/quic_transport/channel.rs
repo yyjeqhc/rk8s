@@ -153,13 +153,13 @@ impl std::fmt::Debug for QuicChannel {
 impl QuicChannel {
     /// Create a new QUIC channel (production: DNS failure = hard error)
     #[inline]
-    pub fn new(client: Arc<QuicClient>) -> Self {
+    pub fn new(client: Arc<QuicClient>, cache_enabled: bool) -> Self {
         Self {
             client,
             addrs: Arc::new(RwLock::new(Vec::new())),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback: DnsFallback::Disabled,
-            cache: if conn_cache_enabled() {
+            cache: if cache_enabled || conn_cache_enabled() {
                 Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
             } else {
                 None
@@ -173,13 +173,14 @@ impl QuicChannel {
         client: Arc<QuicClient>,
         addrs: Vec<String>,
         dns_fallback: DnsFallback,
+        cache_enabled: bool,
     ) -> Self {
         Self {
             client,
             addrs: Arc::new(RwLock::new(addrs)),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback,
-            cache: if conn_cache_enabled() {
+            cache: if cache_enabled || conn_cache_enabled() {
                 Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
             } else {
                 None
@@ -192,13 +193,13 @@ impl QuicChannel {
     /// When DNS resolution fails, falls back to 127.0.0.1 with the original
     /// server name as SNI. This is needed for fake hostnames like "s0.test".
     #[inline]
-    pub fn new_for_test(client: Arc<QuicClient>) -> Self {
+    pub fn new_for_test(client: Arc<QuicClient>, cache_enabled: bool) -> Self {
         Self {
             client,
             addrs: Arc::new(RwLock::new(Vec::new())),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback: DnsFallback::LocalhostForTest,
-            cache: if conn_cache_enabled() {
+            cache: if cache_enabled || conn_cache_enabled() {
                 Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
             } else {
                 None
@@ -755,7 +756,7 @@ impl QuicChannel {
 
     /// Connect to a single address (for discovery)
     pub async fn connect_single(addr: &str, client: Arc<QuicClient>) -> Result<Self, CurpError> {
-        let channel = Self::new(client);
+        let channel = Self::new(client, false);
         channel.add_addr(addr).await?;
         Ok(channel)
     }
@@ -765,7 +766,7 @@ impl QuicChannel {
         addr: &str,
         client: Arc<QuicClient>,
     ) -> Result<Self, CurpError> {
-        let channel = Self::new_for_test(client);
+        let channel = Self::new_for_test(client, false);
         channel.add_addr(addr).await?;
         Ok(channel)
     }

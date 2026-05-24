@@ -12,11 +12,18 @@ pub struct TransportConfig {
     pub client: Arc<QuicClient>,
     /// DNS fallback mode
     pub dns_fallback: super::quic_transport::channel::DnsFallback,
+    /// Whether to enable CURP connection cache for this transport.
+    /// When true, QUIC connections are reused across RPCs within the same QuicChannel.
+    pub cache_enabled: bool,
 }
 
 impl std::fmt::Debug for TransportConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TransportConfig::Quic(..)")
+        write!(
+            f,
+            "TransportConfig::Quic(.., cache_enabled={})",
+            self.cache_enabled
+        )
     }
 }
 
@@ -25,6 +32,7 @@ impl Clone for TransportConfig {
         Self {
             client: Arc::clone(&self.client),
             dns_fallback: self.dns_fallback,
+            cache_enabled: self.cache_enabled,
         }
     }
 }

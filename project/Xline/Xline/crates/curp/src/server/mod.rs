@@ -96,6 +96,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> Rpc<C, CE, RC> {
             crate::rpc::TransportConfig {
                 client: quic_client,
                 dns_fallback: crate::rpc::quic_transport::channel::DnsFallback::Disabled,
+                cache_enabled: false,
             },
         )
     }
@@ -131,6 +132,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> Rpc<C, CE, RC> {
             crate::rpc::TransportConfig {
                 client: quic_client,
                 dns_fallback: crate::rpc::quic_transport::channel::DnsFallback::LocalhostForTest,
+                cache_enabled: false,
             },
         )
     }

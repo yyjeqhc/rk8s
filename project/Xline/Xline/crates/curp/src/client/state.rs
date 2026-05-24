@@ -103,6 +103,7 @@ impl State {
                 transport: TransportConfig {
                     client: quic_client,
                     dns_fallback: DnsFallback::Disabled,
+                    cache_enabled: false,
                 },
             },
             // Sets the client id to non-zero to avoid waiting for client id in tests
@@ -345,6 +346,7 @@ impl State {
                     addrs,
                     &self.immutable.transport.client,
                     self.immutable.transport.dns_fallback,
+                    self.immutable.transport.cache_enabled,
                 );
                 let _ig = e.insert(new_conn);
             } else {
@@ -492,6 +494,7 @@ impl StateBuilder {
             self.all_members.clone(),
             &self.transport.client,
             self.transport.dns_fallback,
+            self.transport.cache_enabled,
         )
         .collect()
     }

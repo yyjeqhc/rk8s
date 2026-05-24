@@ -291,11 +291,16 @@ QUIC+TLS handshake overhead for long-running clients.
 - **Default: OFF** — the cache is not enabled unless explicitly activated
 - **Experimental** — suitable for benchmarking and evaluation
 - **Env gate**: `XLINE_CURP_CONN_CACHE=1` enables the cache
+- **CLI flag**: `--experimental-curp-connection-cache` enables the cache
+- Either one activates the cache; `xlinectl doctor` shows the active source
 
 ### Usage
 
 ```bash
-# Enable cache for a single command
+# Enable cache via CLI flag
+xlinectl --experimental-curp-connection-cache --endpoints https://server0:2379 put foo bar
+
+# Enable cache via env var
 XLINE_CURP_CONN_CACHE=1 xlinectl --endpoints https://server0:2379 put foo bar
 
 # Enable cache for a benchmark run

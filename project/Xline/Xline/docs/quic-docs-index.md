@@ -30,14 +30,14 @@ This document is the central index for all QUIC/H3-related documentation in Xlin
 | Document | Focus | Key Content |
 |----------|-------|-------------|
 | [H3 Benchmark](quic-h3-benchmark.md) | H3 client lifecycle | Connection per RPC, KV bypasses H3Channel, pool feasibility |
-| [CURP Benchmark](quic-curp-benchmark.md) | CURP connection cost | 3 connections per KV op, env-gated cache, server vs client metrics |
+| [CURP Benchmark](quic-curp-benchmark.md) | CURP connection cost | 3 connections per KV op, env/CLI-gated cache, server vs client metrics |
 | [CURP Cache Soak](quic-curp-cache-soak.md) | Cache stability verification | 120s long run, restart stress, fault injection, metrics |
 
 ## Experimental Features
 
-| Feature | Env Var | Default | Doc |
-|---------|---------|---------|-----|
-| CURP connection cache | `XLINE_CURP_CONN_CACHE` | off | [CURP Benchmark §8](quic-curp-benchmark.md) |
+| Feature | Env Var | CLI Flag | Default | Doc |
+|---------|---------|----------|---------|-----|
+| CURP connection cache | `XLINE_CURP_CONN_CACHE=1` | `--experimental-curp-connection-cache` | off | [CURP Benchmark §8](quic-curp-benchmark.md) |
 
 ## Scripts
 

@@ -234,6 +234,7 @@ impl LeaseServer {
             Arc::clone(&self.quic_client),
             leader_addrs.to_vec(),
             DnsFallback::Disabled,
+            false,
         );
 
         let redirect_stream = stream! {
@@ -402,6 +403,7 @@ impl LeaseServer {
                     Arc::clone(&self.quic_client),
                     leader_addrs.to_vec(),
                     DnsFallback::Disabled,
+                    false,
                 );
                 let res = channel
                     .unary_call::<LeaseTimeToLiveRequest, LeaseTimeToLiveResponse>(

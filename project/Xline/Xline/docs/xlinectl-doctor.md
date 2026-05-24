@@ -34,7 +34,7 @@ xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doc
 | CA file non-empty | Yes | Zero-byte CA file is rejected |
 | Development fixture CA | Info | In dev builds, `fixtures/ca.crt` is used automatically |
 | SNI routing compatibility | Warning | IP/localhost endpoints break SNI routing |
-| `XLINE_CURP_CONN_CACHE` | Info | Reports if CURP connection cache is enabled |
+| `XLINE_CURP_CONN_CACHE` / `--experimental-curp-connection-cache` | Info | Reports if CURP connection cache is enabled and the source (env/CLI/both) |
 | `RUST_LOG` | Warning | Reports if debug logging is active |
 | Connection check | Yes (optional) | Attempts a real QUIC connection to the cluster |
 
@@ -154,7 +154,7 @@ Xline does **not** silently skip TLS verification:
 
 | Feature | Description |
 |---------|-------------|
-| `XLINE_CURP_CONN_CACHE=1` | Enables the CURP per-channel connection cache (experimental, default off) |
+| `XLINE_CURP_CONN_CACHE=1` or `--experimental-curp-connection-cache` | Enables the CURP per-channel connection cache (experimental, default off). Either one activates it. |
 | `RUST_LOG=<filter>` | Enables debug-level tracing (e.g., `RUST_LOG=xlinerpc=debug`) |
 
 `doctor` only reports these values — it does not enable or disable them.

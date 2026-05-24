@@ -246,9 +246,13 @@ impl Client {
         let peer_addrs = Self::discover_peer_addrs(&channel).await?;
         // Use discover_from to connect via QUIC and discover cluster topology
         // Use is_raw_curp=true so state refresh uses peer URLs (not client URLs)
+        let mut builder =
+            CurpClientBuilder::new(options.client_config, true).quic_transport(quic_client);
+        if options.enable_curp_connection_cache {
+            builder = builder.enable_connection_cache();
+        }
         let curp_client = Arc::new(
-            CurpClientBuilder::new(options.client_config, true)
-                .quic_transport(quic_client)
+            builder
                 .discover_from(peer_addrs)
                 .await?
                 .build::<xlineapi::command::Command>()?,
@@ -473,6 +477,8 @@ pub struct ClientOptions {
     quic_tls_config: Option<QuicTlsConfig>,
     /// config for the curp client
     client_config: ClientConfig,
+    /// Whether to enable CURP connection cache (experimental)
+    enable_curp_connection_cache: bool,
 }
 
 impl ClientOptions {
@@ -488,6 +494,7 @@ impl ClientOptions {
             user,
             quic_tls_config,
             client_config,
+            enable_curp_connection_cache: false,
         }
     }
 
@@ -553,6 +560,7 @@ impl ClientOptions {
             user,
             quic_tls_config,
             client_config,
+            enable_curp_connection_cache,
         } = self;
         let quic_tls_config = quic_tls_config
             .unwrap_or_default()
@@ -561,6 +569,7 @@ impl ClientOptions {
             user,
             quic_tls_config: Some(quic_tls_config),
             client_config,
+            enable_curp_connection_cache,
         }
     }
 
@@ -576,6 +585,7 @@ impl ClientOptions {
             user,
             quic_tls_config,
             client_config,
+            enable_curp_connection_cache,
         } = self;
         let quic_tls_config = quic_tls_config
             .unwrap_or_default()
@@ -584,6 +594,20 @@ impl ClientOptions {
             user,
             quic_tls_config: Some(quic_tls_config),
             client_config,
+            enable_curp_connection_cache,
+        }
+    }
+
+    /// Enable CURP connection cache (experimental).
+    ///
+    /// When enabled, QUIC connections are reused across RPCs within the same QuicChannel.
+    /// Also enabled by the `XLINE_CURP_CONN_CACHE=1` environment variable.
+    #[inline]
+    #[must_use]
+    pub fn with_curp_connection_cache(self, enabled: bool) -> Self {
+        Self {
+            enable_curp_connection_cache: enabled,
+            ..self
         }
     }
 }

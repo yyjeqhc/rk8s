@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-24
 **Branch**: `omo-quality-next`
-**Cache version**: env-gated (`XLINE_CURP_CONN_CACHE=1`), default OFF
+**Cache version**: env-gated (`XLINE_CURP_CONN_CACHE=1`) or CLI flag (`--experimental-curp-connection-cache`), default OFF
 
 ## 1. Scope
 

@@ -692,6 +692,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
                                 Arc::clone(&curp.transport().client),
                                 change.address,
                                 curp.transport().dns_fallback,
+                                curp.transport().cache_enabled,
                             )),
                         ),
                     ));
@@ -857,6 +858,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
             cluster_info.peers_addrs(),
             &transport.client,
             transport.dns_fallback,
+            transport.cache_enabled,
         )
         .collect();
         let cmd_board = Arc::new(RwLock::new(CommandBoard::new()));

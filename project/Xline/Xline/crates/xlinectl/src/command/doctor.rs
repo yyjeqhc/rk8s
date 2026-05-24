@@ -143,6 +143,7 @@ pub(crate) async fn execute(
     matches: &ArgMatches,
     endpoints: Vec<String>,
     ca_path: Option<PathBuf>,
+    curp_cache_cli_flag: bool,
 ) -> Result<()> {
     let check_connection = matches.get_flag("check_connection");
 
@@ -175,7 +176,7 @@ pub(crate) async fn execute(
     println!();
 
     println!("── Experimental Features ──");
-    check_experimental_features(&mut warnings);
+    check_experimental_features(&mut warnings, curp_cache_cli_flag);
     println!();
 
     if check_connection {
@@ -356,16 +357,31 @@ fn curp_cache_enabled_from_env_value(value: Option<&str>) -> bool {
     matches!(value, Some("1") | Some("true"))
 }
 
+fn cache_source_label(env_enabled: bool, cli_flag: bool) -> Option<&'static str> {
+    match (env_enabled, cli_flag) {
+        (true, true) => Some("env + CLI flag"),
+        (true, false) => Some("env var"),
+        (false, true) => Some("CLI flag"),
+        (false, false) => None,
+    }
+}
+
 fn rust_log_enabled_from_env_value(value: Option<&str>) -> bool {
     value.is_some()
 }
 
-fn check_experimental_features(warnings: &mut u32) {
+fn check_experimental_features(warnings: &mut u32, curp_cache_cli_flag: bool) {
     let cache_var = std::env::var("XLINE_CURP_CONN_CACHE").ok();
-    if curp_cache_enabled_from_env_value(cache_var.as_deref()) {
-        println!("  ℹ️  XLINE_CURP_CONN_CACHE=1 (CURP connection cache enabled)");
+    let env_enabled = curp_cache_enabled_from_env_value(cache_var.as_deref());
+    let effective = env_enabled || curp_cache_cli_flag;
+    if effective {
+        let source = cache_source_label(env_enabled, curp_cache_cli_flag)
+            .expect("at least one source is enabled");
+        println!("  ℹ️  CURP connection cache enabled ({source}) — experimental");
     } else {
-        println!("  ℹ️  XLINE_CURP_CONN_CACHE not set (CURP connection cache disabled)");
+        println!(
+            "  ℹ️  CURP connection cache disabled (use --experimental-curp-connection-cache or XLINE_CURP_CONN_CACHE=1 to enable)"
+        );
     }
 
     let rust_log = std::env::var("RUST_LOG").ok();
@@ -603,6 +619,26 @@ mod tests {
         assert!(!curp_cache_enabled_from_env_value(None));
         assert!(!curp_cache_enabled_from_env_value(Some("0")));
         assert!(!curp_cache_enabled_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn cache_source_label_disabled() {
+        assert_eq!(cache_source_label(false, false), None);
+    }
+
+    #[test]
+    fn cache_source_label_env_only() {
+        assert_eq!(cache_source_label(true, false), Some("env var"));
+    }
+
+    #[test]
+    fn cache_source_label_cli_only() {
+        assert_eq!(cache_source_label(false, true), Some("CLI flag"));
+    }
+
+    #[test]
+    fn cache_source_label_both() {
+        assert_eq!(cache_source_label(true, true), Some("env + CLI flag"));
     }
 
     #[test]

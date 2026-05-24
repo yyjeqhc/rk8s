@@ -434,9 +434,14 @@ pub async fn get_cluster_info_from_remote(
 ) -> Option<ClusterInfo> {
     let peers = init_cluster_info.peers_addrs();
     let self_client_urls = init_cluster_info.self_client_urls();
-    let connects = rpc::quic_connects(peers, &transport.client, transport.dns_fallback)
-        .map(|pair| pair.1)
-        .collect_vec();
+    let connects = rpc::quic_connects(
+        peers,
+        &transport.client,
+        transport.dns_fallback,
+        transport.cache_enabled,
+    )
+    .map(|pair| pair.1)
+    .collect_vec();
     let mut futs = connects
         .iter()
         .map(|c| {

@@ -289,7 +289,7 @@ The connection cache provides dramatic reduction in QUIC connections (98-100%) w
 
 For long-running clients (e.g., a persistent service using `xline-client`), the client-side cache would provide meaningful savings by reusing connections across operations within the same process.
 
-**Status**: Implemented, behind `XLINE_CURP_CONN_CACHE=1` env gate, all verification passed.
+**Status**: Implemented, behind `XLINE_CURP_CONN_CACHE=1` env var or `--experimental-curp-connection-cache` CLI flag, all verification passed.
 
 ## 9. Semantic Safety Audit
 

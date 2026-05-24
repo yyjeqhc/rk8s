@@ -247,6 +247,10 @@ fn cli() -> Command {
             .global(true)
             .value_parser(value_parser!(PathBuf))
             .help_heading(GLOBAL_HEADING))
+        .arg(arg!(--"experimental-curp-connection-cache" "Enable CURP connection cache (experimental). Also enabled by XLINE_CURP_CONN_CACHE=1 env var.")
+            .global(true)
+            .action(clap::ArgAction::SetTrue)
+            .help_heading(GLOBAL_HEADING))
 
         .subcommand(get::command())
         .subcommand(put::command())
@@ -286,7 +290,8 @@ async fn main() -> Result<()> {
     let ca_path: Option<PathBuf> = matches.get_one("ca_cert_pem_path").cloned();
 
     if let Some(("doctor", sub_matches)) = matches.subcommand() {
-        return doctor::execute(sub_matches, endpoints, ca_path).await;
+        let curp_cache_cli = matches.get_flag("experimental-curp-connection-cache");
+        return doctor::execute(sub_matches, endpoints, ca_path, curp_cache_cli).await;
     }
 
     let user_opt = parse_user(&matches)?;
@@ -329,7 +334,8 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let options = ClientOptions::new(user_opt, quic_tls_config, client_config);
+    let options = ClientOptions::new(user_opt, quic_tls_config, client_config)
+        .with_curp_connection_cache(matches.get_flag("experimental-curp-connection-cache"));
     let printer_type = match matches
         .get_one::<String>("printer_type")
         .expect("Required")

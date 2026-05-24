@@ -674,11 +674,13 @@ mod quic_connect_impl {
         addrs: Vec<String>,
         client: &Arc<QuicClient>,
         dns_fallback: DnsFallback,
+        cache_enabled: bool,
     ) -> Arc<dyn ConnectApi> {
         let channel = Arc::new(QuicChannel::with_addrs(
             Arc::clone(client),
             addrs,
             dns_fallback,
+            cache_enabled,
         ));
         Arc::new(QuicConnect::new(id, channel))
     }
@@ -688,11 +690,15 @@ mod quic_connect_impl {
         members: std::collections::HashMap<ServerId, Vec<String>>,
         client: &Arc<QuicClient>,
         dns_fallback: DnsFallback,
+        cache_enabled: bool,
     ) -> impl Iterator<Item = (ServerId, Arc<dyn ConnectApi>)> + use<> {
         let client = Arc::clone(client);
-        members
-            .into_iter()
-            .map(move |(id, addrs)| (id, quic_connect(id, addrs, &client, dns_fallback)))
+        members.into_iter().map(move |(id, addrs)| {
+            (
+                id,
+                quic_connect(id, addrs, &client, dns_fallback, cache_enabled),
+            )
+        })
     }
 
     /// Create QUIC inner connects for all members
@@ -700,6 +706,7 @@ mod quic_connect_impl {
         members: std::collections::HashMap<ServerId, Vec<String>>,
         client: &Arc<QuicClient>,
         dns_fallback: DnsFallback,
+        cache_enabled: bool,
     ) -> impl Iterator<Item = (ServerId, InnerConnectApiWrapper)> + use<> {
         let client = Arc::clone(client);
         members.into_iter().map(move |(id, addrs)| {
@@ -707,6 +714,7 @@ mod quic_connect_impl {
                 Arc::clone(&client),
                 addrs,
                 dns_fallback,
+                cache_enabled,
             ));
             (
                 id,

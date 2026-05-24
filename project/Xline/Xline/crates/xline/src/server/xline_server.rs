@@ -132,6 +132,7 @@ impl XlineServer {
         let transport = TransportConfig {
             client: Arc::clone(&quic_client),
             dns_fallback: curp::rpc::DnsFallback::LocalhostForTest,
+            cache_enabled: false,
         };
 
         let cluster_info = Arc::new(
