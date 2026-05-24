@@ -14,7 +14,8 @@ and provides actionable troubleshooting steps.
 6. [Metrics and Debug Logs](#6-metrics-and-debug-logs)
 7. [CURP Connection Cache](#7-curp-connection-cache)
 8. [Benchmark Docs](#8-benchmark-docs)
-9. [Related Docs Map](#9-related-docs-map)
+9. [QUIC Stream Drop Warnings](#9-quic-stream-drop-warnings)
+10. [Related Docs Map](#10-related-docs-map)
 
 ---
 
@@ -352,7 +353,64 @@ The cache reduces server-side connections by 98-100% when enabled.
 
 ---
 
-## 9. Related Docs Map
+## 9. QUIC Stream Drop Warnings
+
+When running with debug logging (`RUST_LOG=debug` or debug builds), dquic may emit
+stream drop warnings. These are diagnostic messages from dquic's internal stream
+lifecycle tracking.
+
+### Observed warning categories
+
+Sampled from smoke, restart stress, and fault tests on a local 3-node cluster:
+
+| Category | Example Message | Observed Count (per round) | Source |
+|----------|----------------|---------------------------|--------|
+| Client connection dropped | `connection is still active when dropped` | ~45 | dquic Connection Drop impl |
+| Client bidi stream not closed | `sending client side bidi stream not closed` | ~9 | dquic StreamWriter Drop impl |
+| Server uni stream not stopped | `receiving server side unidirectional stream not stopped` | ~3 | dquic StreamReader Drop impl |
+| Client uni stream not closed | `sending client side unidirectional stream not closed` | ~1 | dquic StreamWriter Drop impl |
+
+> **Note**: Counts vary by workload, connection count, and dquic version.
+> The "server uni stream" warnings come from H3 control streams (QPACK encoder/decoder/control),
+> not application data streams.
+
+### Current validation status
+
+In current smoke, restart stress, and fault tests:
+- Warnings are observed **without** accompanying panics, `No viable network path`, or operation failures
+- KV put/get/delete, member list, lease grant/revoke, and watch all succeed
+- Warnings appear during normal shutdown (xlinectl process exit) and cluster restart
+
+### Why server-side CURP recv is NOT wrapped in StopOnDropReader
+
+Wrapping server-side CURP recv streams in `StopOnDropReader` (which calls `STOP_SENDING` on drop)
+was tested and found to **break leader election**. `STOP_SENDING` resets the peer's send half,
+causing vote requests to fail with "stream was reset with app error code: 0".
+
+Client-side CURP recv streams ARE wrapped in `StopOnDropReader` (EOF-aware — only fires if
+stream was not fully consumed). This is safe because the client is the initiator.
+
+### How to filter warnings
+
+```bash
+# Count warning categories in server logs
+grep -c "connection is still active when dropped" server*/stdout.log
+grep -c "stream not closed" server*/stdout.log
+grep -c "not stopped with error before dropped" server*/stdout.log
+
+# In release builds, some dquic warnings may downgrade to debug level
+# (depends on dquic's build configuration)
+```
+
+### When to investigate
+
+If warning counts change sharply (e.g., 10x increase) or warnings accompany operation
+failures, investigate the specific stream lifecycle path. Stable warning counts across
+runs indicate consistent behavior, not regressions.
+
+---
+
+## 10. Related Docs Map
 
 | Document | When to Read |
 |----------|-------------|

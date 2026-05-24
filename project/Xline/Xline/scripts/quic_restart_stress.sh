@@ -18,6 +18,12 @@ PASS=true
 FAIL_COUNT=0
 WARN_COUNT=0
 
+# Accumulated warning category counts across all rounds
+TOTAL_CONN_DROPPED=0
+TOTAL_STREAM_NOT_CLOSED=0
+TOTAL_STREAM_NOT_STOPPED=0
+TOTAL_NO_VIABLE=0
+
 log_pass() { echo "  ✅ $1"; }
 log_fail() { echo "  ❌ $1"; PASS=false; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 log_warn() { echo "  ⚠️  $1"; WARN_COUNT=$((WARN_COUNT + 1)); }
@@ -201,15 +207,21 @@ run_round() {
         log_warn "Round $round: $no_viable 'No viable network path' warnings"
     fi
 
-    # Check for stream drop warnings
-    local stream_warn=0
+    local conn_dropped=0
+    local stream_not_closed=0
+    local stream_not_stopped=0
     for f in "$data_dir"/server*/stdout.log; do
-        local s
-        s=$(grep -c "is not stopped with error before dropped" "$f" 2>/dev/null || true)
-        stream_warn=$((stream_warn + s))
+        conn_dropped=$((conn_dropped + $(grep -c "connection is still active when dropped" "$f" 2>/dev/null || true)))
+        stream_not_closed=$((stream_not_closed + $(grep -c "stream not closed before dropped" "$f" 2>/dev/null || true)))
+        stream_not_stopped=$((stream_not_stopped + $(grep -c "not stopped with error before dropped" "$f" 2>/dev/null || true)))
     done
+    local stream_warn=$((conn_dropped + stream_not_closed + stream_not_stopped))
+    TOTAL_CONN_DROPPED=$((TOTAL_CONN_DROPPED + conn_dropped))
+    TOTAL_STREAM_NOT_CLOSED=$((TOTAL_STREAM_NOT_CLOSED + stream_not_closed))
+    TOTAL_STREAM_NOT_STOPPED=$((TOTAL_STREAM_NOT_STOPPED + stream_not_stopped))
+    TOTAL_NO_VIABLE=$((TOTAL_NO_VIABLE + no_viable))
     if [ "$stream_warn" -gt 0 ]; then
-        log_warn "Round $round: $stream_warn stream drop warnings"
+        log_warn "Round $round: $stream_warn stream warnings (conn=$conn_dropped, not_closed=$stream_not_closed, not_stopped=$stream_not_stopped)"
     fi
 
     log_pass "Round $round: Complete (panics=$panics, no_viable=$no_viable, stream_warn=$stream_warn)"
@@ -246,6 +258,11 @@ echo "  Stress Test Summary"
 echo "  Rounds: $ROUNDS"
 echo "  Failures: $FAIL_COUNT"
 echo "  Warnings: $WARN_COUNT"
+echo "  --- Warning Categories ---"
+echo "  connection dropped:       $TOTAL_CONN_DROPPED"
+echo "  stream not closed:        $TOTAL_STREAM_NOT_CLOSED"
+echo "  stream not stopped:       $TOTAL_STREAM_NOT_STOPPED"
+echo "  no viable network path:   $TOTAL_NO_VIABLE"
 if [ "$PASS" = true ]; then
     echo "  RESULT: ALL ROUNDS PASSED"
 else
