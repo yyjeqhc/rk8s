@@ -473,11 +473,22 @@ impl QuicChannel {
         let (conn, cache_key) = self.get_connection().await?;
 
         let (recv_stream, send_stream): (StreamReader, StreamWriter) = if timeout.is_zero() {
-            Self::open_bi_stream(&conn).await?
+            Self::open_bi_stream(&conn).await.map_err(|e| {
+                self.evict_cache_entry(&cache_key);
+                e
+            })?
         } else {
-            tokio::time::timeout(timeout, Self::open_bi_stream(&conn))
-                .await
-                .map_err(|_| CurpError::RpcTransport(()))??
+            match tokio::time::timeout(timeout, Self::open_bi_stream(&conn)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    self.evict_cache_entry(&cache_key);
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.evict_cache_entry(&cache_key);
+                    return Err(CurpError::RpcTransport(()));
+                }
+            }
         };
 
         let mut writer = FrameWriter::new(send_stream);
