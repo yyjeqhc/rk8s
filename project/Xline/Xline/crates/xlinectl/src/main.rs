@@ -166,7 +166,9 @@ use xline_client::{Client, ClientOptions};
 use xlinerpc::QuicTlsConfig;
 
 use crate::{
-    command::{auth, delete, get, lease, lock, member, put, role, snapshot, txn, user, watch},
+    command::{
+        auth, delete, doctor, get, lease, lock, member, put, role, snapshot, txn, user, watch,
+    },
     utils::{
         parser::parse_user,
         printer::{PrinterType, set_printer_type},
@@ -259,6 +261,7 @@ fn cli() -> Command {
         .subcommand(watch::command())
         .subcommand(lock::command())
         .subcommand(member::command())
+        .subcommand(doctor::command())
 }
 
 #[tokio::main]
@@ -274,12 +277,19 @@ async fn main() -> Result<()> {
             .init();
     }
     let matches = cli().get_matches();
-    let user_opt = parse_user(&matches)?;
+
     let endpoints: Vec<String> = matches
         .get_many::<String>("endpoints")
         .expect("Required")
         .map(|s| s.to_string())
         .collect();
+    let ca_path: Option<PathBuf> = matches.get_one("ca_cert_pem_path").cloned();
+
+    if let Some(("doctor", sub_matches)) = matches.subcommand() {
+        return doctor::execute(sub_matches, endpoints, ca_path).await;
+    }
+
+    let user_opt = parse_user(&matches)?;
 
     validate_endpoints(&endpoints)?;
 
@@ -292,7 +302,6 @@ async fn main() -> Result<()> {
         true,
         Duration::from_millis(*matches.get_one("keep_alive_interval").expect("Required")),
     );
-    let ca_path: Option<PathBuf> = matches.get_one("ca_cert_pem_path").cloned();
     let quic_tls_config = match ca_path {
         Some(path) => {
             if !path.exists() {

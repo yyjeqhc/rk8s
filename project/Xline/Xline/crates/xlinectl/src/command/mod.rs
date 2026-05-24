@@ -4,6 +4,8 @@ pub(crate) mod auth;
 pub(crate) mod compaction;
 /// Delete command
 pub(crate) mod delete;
+/// Doctor command
+pub(crate) mod doctor;
 /// Get command
 pub(crate) mod get;
 /// Lease command
