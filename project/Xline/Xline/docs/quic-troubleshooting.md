@@ -356,27 +356,26 @@ The cache reduces server-side connections by 98-100% when enabled.
 
 | Document | When to Read |
 |----------|-------------|
+| [QUIC Docs Index](quic-docs-index.md) | Central index for all QUIC/H3 documentation |
 | [xlinectl doctor](xlinectl-doctor.md) | Diagnosing endpoint, DNS, TLS, and SNI issues |
-| [QUIC Refactor Audit](quic-refactor-audit.md) | Full QUIC/H3 architecture analysis, §1-§27 |
+| [QUIC Refactor Audit](quic-refactor-audit.md) | Core QUIC/H3 architecture analysis |
 | [H3 Benchmark](quic-h3-benchmark.md) | H3 connection lifecycle and pool feasibility |
 | [CURP Benchmark](quic-curp-benchmark.md) | CURP connection cost and cache feasibility |
 
 ### QUIC Refactor Audit sections by topic
 
-| Topic | Section |
-|-------|---------|
-| Architecture overview | §1-§4 |
-| Endpoint resolver | §5-§6 |
-| Stream lifecycle (StopOnDropReader) | §7-§8 |
-| Clean shutdown | §9 |
-| CI smoke script | §10 |
-| H3 client factory + streaming lifecycle | §11-§13 |
-| Cancellation semantics (watch/lease) | §14-§15 |
-| Connection reuse analysis | §17 |
-| Transport observability | §18-§19 |
-| Transport metrics (implemented) | §20-§22 |
-| Deployment checklist | §23 |
-| Client-side config (xlinectl) | §24 |
-| TLS verification policy | §25 |
-| IP endpoint / SNI routing | §26 |
-| CURP connection cache | §27 |
+| Topic | Section | Status |
+|-------|---------|--------|
+| Architecture overview | §1-§6 | Core (full content) |
+| Verification scripts | §7-§9 | Summary → [Troubleshooting §1](#1-quick-start-local-3-node-quic-cluster) |
+| Clean shutdown | §10 | Core (full content) |
+| dquic singleton / test strategy | §11 | Core (full content) |
+| Known limitations | §12 | Core (full content) |
+| Quality metrics / verification | §13-§14 | Summary |
+| Roadmap | §15 | Core (full content) |
+| API compatibility (LeaseStreaming) | §18 | Core (full content) |
+| Streaming / cancellation | §19-§21 | Summary → [xlinectl doctor](xlinectl-doctor.md) |
+| Metrics / observability | §22-§23 | Summary → [CURP Benchmark §10](quic-curp-benchmark.md) |
+| Deployment / client config | §24-§25 | Summary → [xlinectl doctor](xlinectl-doctor.md) |
+| TLS verification policy | §26 | Summary → [§4 TLS/CA Policy](#4-tls--ca-policy) |
+| IP endpoint / SNI routing | §27 | Summary → [§5 SNI Routing](#5-sni-routing-and-ip-endpoints) |

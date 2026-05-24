@@ -8,6 +8,8 @@
 - `5b0b8ade6` — Clean shutdown + CI script + docs (+880 lines)
 - (pending) — Transport hardening: error model, retry, observability
 
+**Full documentation index**: [QUIC Docs Index](quic-docs-index.md)
+
 ---
 
 ## 1. Executive Summary
@@ -98,26 +100,20 @@ Refactors the QUIC/H3 transport layer for architectural clarity and fixes stream
 
 | Component | Assessment |
 |-----------|-----------|
-| `SharedQuicRuntime` | `AtomicBool` replaces fragile `strong_count`. `get_or_init()` + `shutdown()` clear semantics. |
-| `h3_server.rs` | Old `SHARED_QUIC`/`SharedQuicState`/`reset_shared_quic` fully removed. New code delegates to port_router/quic_runtime/server_registry. |
-| `PortRouter` | Returns `ConnectionTarget::Unknown` for unrecognized connections — dropped with error log, no crash. |
-| `EndpointResolver` | Handles IPv4, IPv6 bracket notation, DNS, scheme stripping, DNS failure with configurable fallback. Tests cover all formats. |
-| `StopOnDropReader` | EOF-aware: only calls `stop(0)` if stream NOT fully consumed. Server-side intentionally NOT wrapping (would break election). |
-| Clean shutdown | `shutdown_shared_quic()` called in `main.rs` before `shutdown_tracer_provider()`. Runs on both normal exit and force ctrl_c. |
+| SharedQuicRuntime | AtomicBool replaces fragile `strong_count`. `get_or_init()` + `shutdown()` clear semantics. |
+| ServerRegistry SNI | Guard `get_server(server_name).is_none()` prevents double-registration. URL hosts registered as separate SNI servers. |
+| PortRouter Unknown | Returns `ConnectionTarget::Unknown`, connection dropped with error log. No crash. |
+| EndpointResolver | Handles IPv4, IPv6 bracket, DNS, scheme stripping, DNS failure with configurable fallback. Tests cover all formats. |
+| StopOnDropReader | Server-side recv NOT wrapped (intentional — wrapping broke election). Client-side recv wrapped with EOF-aware logic. `stop(0)` only fires if stream NOT fully consumed. |
+| Watch/Lease stability | No impact. Watch uses client_streaming, runs until cancelled. Lease is unary. CURP streaming recv consumed to EOF. |
+| Scripts | Cleanup trap, idempotent hosts, failure logging. |
 
-### ⚠️ Minor Concerns
+### ⚠️ Known Trade-offs
 
-| Component | Risk | Details |
-|-----------|------|---------|
-| `ServerRegistry` SNI | Low | Guard `get_server(server_name).is_none()` prevents double-registration. URL hosts registered as separate SNI servers. Idempotent but worth noting. |
-| `stop_sending` before `recv_trailers` | Low | In streaming paths, `stop_sending(H3_NO_ERROR)` called before `recv_trailers()`. Trailers are optional error info on completed streams — no functional impact. |
-
-### ❌ Not Found
-
-- No `tonic`/`tonic-build` in production code (only transitive via etcd-client dev-dep)
-- No `reset_shared_quic` references remain
-- No duplicate endpoint resolver files
-- No junk files tracked (.codex, .sisyphus excluded)
+| Issue | Risk | Mitigation |
+|-------|------|-----------|
+| `stop_sending` before `recv_trailers` in streaming paths | Low — trailers are optional error info on already-completed streams | Accept risk; trailers read may silently return None |
+| CURP server recv NOT wrapped in StopOnDropReader | Low — ~50% of remaining ~120 warnings come from this path | Intentional design decision (ADR-2) |
 
 ---
 
@@ -148,37 +144,12 @@ The remaining ~120 warnings per restart round come from three paths we cannot co
 - **Source 2** requires h3 to call `stop_sending` on all internal streams before dropping — upstream h3 behavior.
 - **Source 3** would require consuming all pending streams before dropping the connection, which adds complexity and latency with no functional benefit.
 
-### Trigger Path
-
-These warnings fire when:
-- A cluster node restarts (connections drop, streams not fully consumed)
-- A QUIC connection times out ("No viable network path exists")
-- h3 connection pool evicts idle connections
-
 ### Impact
 
 - **Debug builds**: `tracing::warn!` level — visible in logs
 - **Release builds**: `tracing::debug!` level — not visible unless `RUST_LOG=debug`
 - **Functional**: None — the streams are being cleaned up, just not via the "proper" stop_sending path that dquic expects
 - **Performance**: None — these are Drop-time warnings, not runtime overhead
-
-### Source Verification
-
-The debug/warn split is confirmed in dquic source at `qrecovery/src/recv/reader.rs:249-286`:
-```rust
-impl<TX> Drop for Reader<TX> {
-    fn drop(&mut self) {
-        // ...
-        Recver::Recv(r) if !r.is_stopped() => {
-            #[cfg(debug_assertions)]
-            tracing::warn!(target: "quic", "The receiving {} is not stopped with error before dropped!", r.stream_id());
-            #[cfg(not(debug_assertions))]
-            tracing::debug!(target: "quic", "The receiving {} is not stopped with error before dropped!", r.stream_id());
-        }
-        // ... same for SizeKnown state
-    }
-}
-```
 
 ---
 
@@ -229,82 +200,27 @@ impl<TX> Drop for Reader<TX> {
 
 ## 7. Verification Scripts
 
-| Script | Purpose | Usage |
-|--------|---------|-------|
-| `scripts/quic_local_cluster.sh` | Smoke test | `bash scripts/quic_local_cluster.sh` |
-| `scripts/quic_long_run.sh` | Continuous ops | `bash scripts/quic_long_run.sh 120` (seconds) |
-| `scripts/quic_fault_smoke.sh` | Fault injection | `bash scripts/quic_fault_smoke.sh` |
-| `scripts/quic_restart_stress.sh` | Restart stress | `bash scripts/quic_restart_stress.sh 10` (rounds) |
-| `scripts/quic_ci_smoke.sh` | CI entry point | `bash scripts/quic_ci_smoke.sh` |
+See [Troubleshooting Guide §1](quic-troubleshooting.md#1-quick-start-local-3-node-quic-cluster) for usage.
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/quic_local_cluster.sh` | Smoke test |
+| `scripts/quic_long_run.sh` | Continuous ops |
+| `scripts/quic_fault_smoke.sh` | Fault injection |
+| `scripts/quic_restart_stress.sh` | Restart stress |
+| `scripts/quic_ci_smoke.sh` | CI entry point |
 
 ---
 
 ## 8. How to Validate Locally
 
-### Prerequisites
-
-1. `/etc/hosts` must contain:
-   ```
-   127.0.0.1 server0
-   127.0.0.1 server1
-   127.0.0.1 server2
-   ```
-2. Ports 2379-2384 must be free
-
-### Quick validation (5 min)
-
-```bash
-bash scripts/quic_local_cluster.sh
-```
-
-This starts a 3-node cluster, runs KV put/get/delete, member list, lease grant/revoke, and watch operations, then stops the cluster.
-
-### Restart stress (15 min)
-
-```bash
-bash scripts/quic_restart_stress.sh 5
-```
-
-Runs 5 rounds of start → ops → stop → verify cleanup.
-
-### Full validation (45+ min, requires long CI timeout)
-
-```bash
-XLINE_QUIC_CI_LONG=1 bash scripts/quic_ci_smoke.sh
-```
-
-Runs cargo build + smoke + 3-round restart stress + 120s long-run + fault smoke. Requires a CI timeout of at least 45 minutes. In environments with shorter timeouts, run the long-run and fault smoke scripts separately.
-
-### Debug mode
-
-```bash
-RUST_LOG=debug,xline=trace bash scripts/quic_local_cluster.sh 2>&1 | tee quic-debug.log
-grep -E "stream.*not stopped|No viable network path" quic-debug.log | wc -l
-```
+See [Troubleshooting Guide §1](quic-troubleshooting.md#1-quick-start-local-3-node-quic-cluster).
 
 ---
 
 ## 9. CI Smoke Entry
 
-`scripts/quic_ci_smoke.sh` is designed for CI pipelines:
-
-**Default mode** (~10 min):
-1. `cargo build --bin xline --bin xlinectl`
-2. `bash scripts/quic_local_cluster.sh`
-3. `bash scripts/quic_restart_stress.sh 3`
-
-**Long mode** (`XLINE_QUIC_CI_LONG=1`, ~40 min):
-- Everything above, plus:
-4. `bash scripts/quic_long_run.sh 120`
-5. `bash scripts/quic_fault_smoke.sh`
-
-**Long mode note**: In this development environment, long mode timed out at the 15-minute mark. The short mode (build + smoke + 3-round restart stress) completes within 10 minutes. The long mode should be configured with a CI timeout of at least 45 minutes.
-
-**Failure handling**: Prints last 30-40 lines of each step's output. Exit code = number of failures (0 = all passed).
-
-**Pre-flight**: Checks `/etc/hosts` for server0/server1/server2 entries. Does NOT modify `/etc/hosts` — fails with clear error and instructions if entries are missing.
-
-**Cleanup**: On exit (success or failure), kills any leftover `xline --name server` processes and removes temp directories.
+See [Troubleshooting Guide §1](quic-troubleshooting.md#1-quick-start-local-3-node-quic-cluster).
 
 ---
 
@@ -359,60 +275,40 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 
 ## 12. Known Limitations
 
-| Limitation | Why it exists | Workaround |
-|-----------|---------------|------------|
-| ~120 stream drop warnings per restart | h3/dquic internal stream lifecycle. Sources: h3-shim RecvStream drops on connection close, `h3_driver.wait_idle()` internal stream drops, server accept queue drops. CURP server recv intentionally NOT wrapped (wrapping breaks election). | Benign in production (debug-level). Would require dquic PR to eliminate. |
-| No H3 connection pooling | Not yet implemented | Each request creates new connection. H3Channel has retry (max 2, unavailable-only). QuicChannel has round-robin retry. |
-| etcd-client as dev-dependency | Used in integration tests and benchmarks | Not a production dependency. Zero `use tonic` in production code. |
-| Process-level QUIC singleton | dquic design choice | Tests must use unique ports. Cannot run parallel cluster tests in same process. |
-| `quic_restart_stress.sh` modifies `/etc/hosts` | Required for DNS name → IP resolution | CI script (`quic_ci_smoke.sh`) checks first, fails with clear error. |
-| Transient QUIC timeout after rapid restart | dquic path validation (`NoViablePath`, error code 0x10). dquic own tests have TODO comments about this. | Self-recovering. Not reproduced in recent stress tests (0 occurrences across 5 rounds). |
-| Long CI mode requires >15 min | `quic_long_run.sh 120` + `quic_fault_smoke.sh` add ~25 min | Run as separate CI job with longer timeout. |
+| Limitation | Impact | Workaround |
+|-----------|--------|-----------|
+| dquic singleton (`QuicListeners`) | Blocks parallel QUIC tests | Use E2E scripts, not unit tests |
+| Per-RPC new connection (no pool) | Higher latency for short-lived clients | `XLINE_CURP_CONN_CACHE=1` for server-side cache |
+| ~115 stream drop warnings/round | Cosmetic (debug-level in release) | Inherent to h3-over-dquic, upstream issue |
+| xlinerpc has no metrics infra | H3 client metrics not exported | Metrics in curp/xline crates only |
+| IP endpoints unsupported | SNI routing ambiguity | Use DNS names via `/etc/hosts` |
 
 ---
 
 ## 13. Quality Metrics
 
-| Metric | Before | After | Change |
-|--------|--------|-------|--------|
-| Stream drop warnings/round | ~200 | ~120 | -40% |
-| Endpoint resolver duplication | 2 copies | 1 | -50% |
-| Endpoint error model | `Result<_, String>` | `EndpointError` enum (3 variants, 7 fields) | Structured |
-| H3 client retry | None | Max 2, unavailable-only, next-endpoint | New |
-| H3 connection tracing | `it_debug` only | `tracing::debug/warn` + `it_debug` | Dual |
-| Singleton detection | `strong_count == 2` | `AtomicBool` | Reliable |
-| Test cleanup | `reset_shared_quic` (Drop) | None needed | Fixed |
-| Clean shutdown | Not wired | `main.rs` calls it | Fixed |
-| Verification scripts | 0 | 5 | New |
+See [Troubleshooting Guide §6](quic-troubleshooting.md#6-metrics-and-debug-logs) for metrics details.
+
+| Metric | Value |
+|--------|-------|
+| Stream drop warnings (before) | ~200/round |
+| Stream drop warnings (after) | ~120/round |
+| Panics across all tests | 0 |
+| NoViablePath errors | 0 (transient, self-resolving) |
 
 ---
 
 ## 14. Verification Matrix
 
-### This commit (transport hardening)
-
-| Test | Result | Notes |
-|------|--------|-------|
-| `cargo check` (full workspace) | ✅ | |
-| `cargo build --bin xline --bin xlinectl` | ✅ | |
-| `cargo test -p xlinerpc -- endpoint` | ✅ | 7 tests pass |
-| `bash scripts/quic_ci_smoke.sh` (short) | ✅ | ALL PASSED: smoke + 3-round restart stress |
-| `bash scripts/quic_restart_stress.sh 5` | ✅ | All 5 rounds PASSED, 0 panics, 0 NoViablePath |
-| `bash scripts/quic_fault_smoke.sh` | ✅ | Kill follower, kill leader, restart — all passed |
-
-### Previously verified (commits 1, 2, 3)
-
-| Test | Result | Notes |
-|------|--------|-------|
-| Smoke run 1 | ✅ | KV, member, lease, watch |
-| Smoke run 2 | ✅ | KV, member, lease, watch |
-| Smoke run 3 | ✅ | KV, member, lease, watch |
-| Long-run (120s) | ✅ | No panics |
-| Fault: kill follower | ✅ | KV ops continue |
-| Fault: restart follower | ✅ | Member list shows 3 |
-| Fault: kill leader | ✅ | Re-election + KV to new leader |
-| Fault: restart old leader | ✅ | Member list shows 3 |
-| Restart stress (5 rounds) | ✅ | All PASSED |
+| Test | Script | Status |
+|------|--------|--------|
+| Smoke (KV, member, lease, watch) | `quic_local_cluster.sh` | ✅ |
+| Restart stress (3 rounds) | `quic_restart_stress.sh 3` | ✅ |
+| Long-run (120s) | `quic_long_run.sh 120` | ✅ |
+| Fault (kill follower, kill leader) | `quic_fault_smoke.sh` | ✅ |
+| CI smoke (short) | `quic_ci_smoke.sh` | ✅ |
+| Endpoint tests | `cargo test -p xlinerpc -- endpoint` | ✅ 7/7 |
+| Client lib tests | `cargo test -p xline-client --lib` | ✅ 19/19 |
 
 ---
 
@@ -428,110 +324,15 @@ The QUIC stack (dquic, h3-shim) is an external dependency with its own test suit
 
 ## 16. Operational Runbook
 
-### Start 3-node cluster
-```bash
-bash scripts/quic_local_cluster.sh
-```
-
-### Stress test
-```bash
-bash scripts/quic_restart_stress.sh 10   # 10 rounds
-bash scripts/quic_long_run.sh 120        # 120 seconds
-bash scripts/quic_fault_smoke.sh          # kill/restart scenarios
-```
-
-### CI entry
-```bash
-bash scripts/quic_ci_smoke.sh             # short mode (~10 min)
-XLINE_QUIC_CI_LONG=1 bash scripts/quic_ci_smoke.sh  # long mode (~40 min)
-```
-
-### Debug QUIC issues
-```bash
-RUST_LOG=debug,xline=trace bash scripts/quic_local_cluster.sh 2>&1 | tee quic-debug.log
-grep -E "stream.*not stopped|No viable network path" quic-debug.log
-```
-
-### Common issues
-- **`/etc/hosts` conflicts**: Ensure `127.0.0.1 serverN` entries don't have `127.0.1.x` duplicates
-- **TLS cert SAN mismatch**: xlinectl must use DNS names matching cert SANs (not bare IPs)
-- **Port mismatch**: server0=2379, server1=2381, server2=2383 (different client ports per node)
-- **xlinectl delete**: Use `delete` subcommand, not `del` (not a valid alias)
-- **Clean shutdown**: `shutdown_shared_quic()` is called on exit. If xline crashes (SIGKILL), OS cleans up sockets.
+See [Troubleshooting Guide §1](quic-troubleshooting.md#1-quick-start-local-3-node-quic-cluster).
 
 ---
 
 ## 17. Connection Reuse Analysis
 
-### Current State: Connection Per RPC
+See [H3 Benchmark](quic-h3-benchmark.md) for full analysis.
 
-Every RPC (unary, server_streaming, client_streaming) creates:
-1. New QUIC connection (`client.connected_to_with_source()`)
-2. New H3 session (`h3::client::new()`)
-3. New driver task (`tokio::spawn(h3_driver.wait_idle())`)
-4. New H3 stream (`send_req.send_request()`)
-
-The `H3ClientFactory` (renamed from `H3ConnectionPool`) is NOT a pool — it's a factory that holds `Arc<QuicClient>` and creates fresh connections on every call.
-
-### Why Connection Reuse Is Feasible
-
-| Layer | Type | Reusable? | Mechanism |
-|-------|------|-----------|-----------|
-| QUIC connection | `dquic::Connection` | Yes | Multiplexed bidirectional streams |
-| H3 session | `h3::client::SendRequest` | Yes (Clone) | h3 v0.0.8 — `SendRequest<B>` implements `Clone` |
-| H3 driver | `h3::client::Connection` | Must stay alive | One per H3 session, drives state machine |
-| H3 stream | `RequestStream<BidiStream>` | No | One per RPC, consumed |
-
-h3 v0.0.8's `SendRequest` is `Clone` — multiple `send_request()` calls can be made on the same connection. The driver task (`wait_idle()`) keeps the connection alive until all streams finish.
-
-### What a Connection Cache Would Look Like
-
-```
-H3SessionCache: HashMap<EndpointKey, (SendRequest, JoinHandle)>
-
-get_or_create(endpoint):
-  if cache.hit && driver.alive:
-    return (send_req.clone(), None)
-  else:
-    (driver, send_req) = h3::client::new(conn)
-    handle = spawn(driver.wait_idle())
-    cache.insert(endpoint, (send_req.clone(), handle))
-    return (send_req, Some(handle))
-```
-
-### Why NOT Implemented Now
-
-Full connection cache requires:
-- Session cache with LRU eviction
-- Health detection (h3 doesn't expose connection health — detect on `send_request()` fail)
-- Long-lived stream accounting (watch/lease keep driver alive)
-- Shutdown hooks (abort driver tasks on `shutdown_shared_quic()`)
-- Endpoint rotation alignment (current round-robin vs cache keys)
-
-This is a significant refactor that violates the "no large-scale refactoring" constraint. The current connection-per-RPC pattern is correct and simple; connection reuse is a performance optimization, not a correctness fix.
-
-### Stream Lifecycle Patterns
-
-**Watch** (`WatchStreaming`):
-- Holds `_sender: Sender<WatchRequest>` as lifecycle pin
-- Keeps request channel open even if `Watcher` dropped
-- Drop `WatchStreaming` → both channels close → handler task exits → QUIC stream closes
-
-**Lease** (`LeaseStreaming`):
-- Now has `_sender: Sender<LeaseKeepAliveRequest>` lifecycle pin (same pattern as WatchStreaming)
-- Drop `LeaseStreaming` → both channels close → handler task exits → QUIC stream closes
-- Previously was `Streaming<LeaseKeepAliveResponse>` without lifecycle pin — dropping it while keeping `LeaseKeeper` would leak the handler task
-
-**Unary**: Stream consumed in same call. No lifecycle concerns.
-
-### Stream Drop Diagnostics
-
-All stream types now log at `debug` level when dropped:
-- `Streaming<T>` — logs label (e.g., "server_streaming", "client_streaming", "server_request")
-- `WatchStreaming` — logs "WatchStreaming dropped"
-- `LeaseStreaming` — inherits from `Streaming<T>` label
-
-Set `RUST_LOG=debug` to see drop events. Useful for diagnosing stream lifecycle issues.
+**Key finding**: Every RPC creates a new QUIC connection. KV operations bypass H3Channel entirely — they go through CURP's `QuicChannel`. H3 connection pooling would only benefit non-KV operations (compact, auth, cluster, maintenance).
 
 ---
 
@@ -560,782 +361,85 @@ let mut stream: Streaming<LeaseKeepAliveResponse> = ...;
 let mut stream: LeaseStreaming = ...;
 ```
 
-**Public API surface of `LeaseStreaming`**:
-- `.message() -> Result<Option<LeaseKeepAliveResponse>>` — same as `Streaming<T>`
-- `impl Stream<Item = Result<LeaseKeepAliveResponse>>` — same as `Streaming<T>`
-- No `Deref<Target = Streaming<LeaseKeepAliveResponse>>` — explicit methods preferred
-
 ---
 
 ## 19. Streaming API Examples
 
-### Lease Keep-Alive
+See [xlinectl Doctor](xlinectl-doctor.md) and [Troubleshooting Guide](quic-troubleshooting.md) for usage examples.
 
-```rust
-use xline_client::{Client, ClientOptions};
-
-let client = Client::connect(members, options).await?;
-let mut lease_client = client.lease_client();
-
-// Grant a lease
-let lease_id = lease_client.grant(60, None).await?.id;
-
-// Start keep-alive
-let (mut keeper, mut stream) = lease_client.keep_alive(lease_id).await?;
-
-// Send keep-alive and receive response
-keeper.keep_alive()?;
-if let Some(resp) = stream.message().await? {
-    println!("new ttl: {}", resp.ttl);
-}
-
-// Drop order: LeaseStreaming and LeaseKeeper can be dropped in any order.
-// Dropping LeaseStreaming closes the handler task even if LeaseKeeper is alive.
-// Dropping LeaseKeeper alone leaves the handler task open until LeaseStreaming drops.
-```
-
-### Watch
-
-```rust
-use xline_client::{Client, ClientOptions};
-
-let client = Client::connect(members, options).await?;
-let watch_client = client.watch_client();
-let kv_client = client.kv_client();
-
-// Start watching
-let (mut watcher, mut stream) = watch_client.watch("key1", None).await?;
-
-// Write a value to trigger the watch
-kv_client.put("key1", "value1", None).await?;
-
-// Receive the event
-let resp = stream.message().await?.unwrap();
-let kv = resp.events[0].kv.as_ref().unwrap();
-println!("key: {}, value: {}", 
-    String::from_utf8_lossy(&kv.key),
-    String::from_utf8_lossy(&kv.value));
-
-// Cancel the watch
-watcher.cancel()?;
-
-// Drop order: WatchStreaming holds a lifecycle pin (_sender).
-// Dropping Watcher alone does NOT close the handler task.
-// Dropping WatchStreaming closes both the handler task and the QUIC stream.
-```
-
-### Migration from Streaming\<LeaseKeepAliveResponse\>
-
-```rust
-// Old (before lifecycle hardening):
-let (mut keeper, mut stream) = client.keep_alive(id).await?;
-// stream: Streaming<LeaseKeepAliveResponse>
-let resp = stream.message().await?;
-
-// New (after lifecycle hardening):
-let (mut keeper, mut stream) = client.keep_alive(id).await?;
-// stream: LeaseStreaming
-let resp = stream.message().await?;  // same API, no code change needed
-```
+Key APIs:
+- `Watcher` / `WatchStreaming` — `close()`, `is_closed()`, drop semantics
+- `LeaseKeeper` / `LeaseStreaming` — `close()`, `is_closed()`, drop semantics
+- `Streaming<T>` — `message()`, drop with diagnostic label
 
 ---
 
 ## 20. Cancellation Semantics
 
-### Watch Cancellation
+See [xlinectl Doctor](xlinectl-doctor.md) for usage guidance.
 
-**Explicit cancel (server-side)**:
-```rust
-let (mut watcher, mut stream) = watch_client.watch("key", None).await?;
-// ... receive events ...
-watcher.cancel()?;  // sends WatchCancelRequest to server
-// stream will receive a final response with canceled=true
-```
-
-**Explicit close (client-side)**:
-```rust
-let (mut watcher, mut stream) = watch_client.watch("key", None).await?;
-// ... receive events ...
-stream.close();  // closes request channel, handler task exits, QUIC stream closes
-// or: watcher.close();  // same effect
-```
-
-**Drop semantics**:
-- Dropping `Watcher` alone: channel stays open (WatchStreaming holds sender), handler task stays alive
-- Dropping `WatchStreaming` alone: channel closes, handler task exits, QUIC stream closes
-- Dropping both: same as dropping WatchStreaming
-
-**Recommended pattern**:
-```rust
-let (mut watcher, mut stream) = watch_client.watch("key", None).await?;
-// ... receive events ...
-watcher.cancel()?;  // notify server
-drop(stream);        // close client-side resources
-```
-
-### Lease Keep-Alive Cancellation
-
-**Explicit close (client-side)**:
-```rust
-let (mut keeper, mut stream) = client.keep_alive(lease_id).await?;
-// ... send keepalives and receive responses ...
-stream.close();  // closes request channel, handler task exits, QUIC stream closes
-// or: keeper.close();  // same effect
-```
-
-**Drop semantics**:
-- Dropping `LeaseKeeper` alone: channel stays open (LeaseStreaming holds sender), handler task stays alive
-- Dropping `LeaseStreaming` alone: channel closes, handler task exits, QUIC stream closes
-- Dropping both: same as dropping LeaseStreaming
-
-**Recommended pattern**:
-```rust
-let (mut keeper, mut stream) = client.keep_alive(lease_id).await?;
-loop {
-    keeper.keep_alive()?;
-    match stream.message().await? {
-        Some(resp) => println!("ttl: {}", resp.ttl),
-        None => break,
-    }
-    tokio::time::sleep(Duration::from_secs(5)).await;
-}
-// stream ended naturally (server closed), no explicit cleanup needed
-```
-
-### API Summary
-
-| Type | `close()` | `is_closed()` | Drop behavior |
-|------|-----------|---------------|---------------|
-| `Watcher` | Closes channel (affects WatchStreaming) | Check channel state | Debug log |
-| `WatchStreaming` | Closes channel (affects Watcher) | Check channel state | Debug log + inner Streaming drop |
-| `LeaseKeeper` | Closes channel (affects LeaseStreaming) | Check channel state | Debug log |
-| `LeaseStreaming` | Closes channel (affects LeaseKeeper) | Check channel state | Inner Streaming drop |
-
-### Server-Side Cancellation
-
-When the client closes the QUIC stream, the server sees:
-- H3 stream reset (stop_sending)
-- Handler task exits
-- Server-side watch/lease cleanup happens automatically
-
-No explicit server-side cancel API is needed for most use cases.
+Key semantics:
+- `close()` on any handle closes the shared channel (both sides see `is_closed() = true`)
+- Dropping `WatchStreaming` or `LeaseStreaming` closes the handler task
+- Dropping `Watcher` or `LeaseKeeper` alone does NOT close the channel
+- Server-side cleanup is automatic on client close
 
 ---
 
 ## 21. Server-Side Cancellation Audit
 
-### Watch Server (`watch_server.rs`)
-
-**Main loop** (`WatchServer::task()`): `tokio::select!` with 5 branches:
-- `req_rx.next()` — request stream from client (H3 body or CURP pump)
-- `event_rx.recv()` — watch events from `KvWatcher`
-- `ticker.tick()` — progress notifications
-- `stop_listener` — response_tx closed (client stopped reading)
-- `shutdown_listener` — server shutdown
-
-**Exit paths** (all verified correct):
-| Trigger | Path | Cleanup |
-|---------|------|---------|
-| Client close (req_rx → None) | break | WatchHandle::drop() cancels all watches |
-| Request error (req_rx → Err) | break + debug log | WatchHandle::drop() |
-| Response sender closed (stop_listener) | break | WatchHandle::drop() |
-| Server shutdown (shutdown_listener) | break | WatchHandle::drop() |
-
-**WatchHandle::drop()**: Calls `kv_watcher.cancel()` for all active watch IDs. No task leak.
-
-### Lease Server (`lease_server.rs`)
-
-**Leader path** (`leader_keep_alive_stream()`): `try_stream!` loop:
-- `request_stream.next()` → None → break (client closed, with debug log)
-- `request_stream.next()` → Some(Err) → break
-- `shutdown_listener.wait()` → break
-
-**Follower path** (`follower_keep_alive_stream()`): `stream!` with `select!`:
-- `request_stream.next()` → None → break (client closed, with debug log)
-- `redirect_stream` ends → bidirectional_streaming_call returns
-
-### QUIC Service Layer (`quic_service.rs`)
-
-**`spawn_request_pump()`**: Reads QUIC recv stream via FrameReader until `Frame::End` or error. Task exits when:
-- `Frame::End` received → break
-- Frame read error → sends error to tx, then tx.send fails on next iteration → break
-- tx dropped (receiver gone) → tx.send fails → break
-
-**`write_stream()`**: Reads response stream until end, writes to QUIC send. Calls `send.shutdown()` on completion.
-
-### Stream Drop Warning Sources (Server-Side)
-
-The remaining ~115 stream drop warnings per round come from server-side recv streams in `spawn_request_pump()`. These recv streams are NOT wrapped in `StopOnDropReader` because:
-1. The CURP server recv was intentionally NOT wrapped (broke election — `STOP_SENDING` resets peer's send half)
-2. The Xline QUIC service recv uses the same type as CURP
-3. The warnings are debug-level in release builds (`tracing::debug!` in dquic)
-4. The warnings indicate clean shutdown (recv not at EOF because client closed first)
-
-### Debug Logging
-
-Server-side debug logs added for cancellation diagnostics:
-- `watch request stream error` — watch request stream error with error details
-- `watch request stream ended (client closed)` — watch client closed connection
-- `watch handler task exited` — watch handler task completed
-- `lease keepalive request stream ended (client closed)` — lease client closed (leader path)
-- `lease keepalive follower redirect stream ended (client closed)` — lease client closed (follower path)
-
-Set `RUST_LOG=xline=debug` to see these logs.
+All server-side cancellation paths verified correct:
+- Watch: `req_rx → None` → break → `WatchHandle::drop()` → `kv_watcher.cancel()`
+- Lease: `request_stream → None` → break (with debug log)
+- QUIC service: `Frame::End` or error → task exits
 
 ---
 
 ## 22. Transport Observability / Metrics Readiness
 
-### Current Observability State
-
-**Tracing**: Extensive structured logging across transport layer:
-- Client side: `endpoint`, `server_name`, `socket_addr`, `error` fields
-- Server side: `server_name`, `local_port`, `client_ports`, `peer_ports`, `alias` fields
-- Debug level for normal lifecycle, warn for recoverable errors, error for failures
-
-**Metrics**: QUIC/H3 transport metrics were implemented in §23 (see that section for actual OTel instrument names and crate locations). General xline metrics also exist:
-- `slow_read_index`, `read_index_failed`, `lease_expired` (counters)
-- `fd_used`, `fd_limit`, `current_version`, `current_rust_version` (gauges)
-
-**Existing infrastructure**: OpenTelemetry + Prometheus already configured in `crates/xline/src/metrics.rs` using `define_metrics!` macro.
-
-### Recommended Metrics
-
-| Metric Name | Type | Trigger Point | Labels |
-|-------------|------|---------------|--------|
-| `xline_quic_connect_attempts_total` | Counter | `connect_with_retry()` called | `endpoint`, `server_name` |
-| `xline_quic_connect_failures_total` | Counter | Connect returns error | `endpoint`, `server_name`, `error_type` |
-| `xline_quic_connect_duration_seconds` | Histogram | Time from connect start to handshake complete | `endpoint`, `server_name` |
-| `xline_h3_request_duration_seconds` | Histogram | Time from request start to response complete | `method`, `path`, `status` |
-| `xline_h3_stream_drops_total` | Counter | `Streaming<T>` dropped | `label` (server_streaming, client_streaming, etc.) |
-| `xline_endpoint_resolve_failures_total` | Counter | `resolve_endpoint_with_fallback()` returns error | `endpoint`, `error_type` |
-| `xline_port_router_unknown_total` | Counter | `PortRouter::route()` returns Unknown | `server_name`, `local_port` |
-| `xline_watch_stream_closed_total` | Counter | WatchStreaming dropped or closed | `reason` (client_close, server_close, error) |
-| `xline_lease_keepalive_closed_total` | Counter | LeaseStreaming dropped or closed | `reason` (client_close, server_close, error) |
-| `xline_server_connection_accepted_total` | Counter | `accept_loop` accepts connection | `server_name`, `target` (ClientH3, PeerCurp) |
-
-> **Note**: Some of these were implemented in §23 but with different names and in different crates (see §23 for actual names). The `xline_` prefix in this table is aspirational only — the actual OTel instrument names do NOT use this prefix.
-
-### Recommended Labels
-
-**Low cardinality (safe)**:
-- `endpoint`: Server endpoint (e.g., "https://server0:2379")
-- `server_name`: Server name (e.g., "server0")
-- `method`: RPC method (e.g., "Put", "Range", "Watch")
-- `target`: Connection target (ClientH3, PeerCurp, Unknown)
-- `error_type`: Error category (timeout, connection_refused, handshake_failed, etc.)
-- `reason`: Close reason (client_close, server_close, error)
-
-**High cardinality (avoid)**:
-- Raw error messages
-- Full request/response bodies
-- Dynamic endpoint strings
-- Socket addresses with ephemeral ports
-
-### Why Not Implement Metrics Now
-
-1. **Scope**: Adding metrics requires touching every RPC path, which violates "no large-scale refactoring"
-2. **Dependencies**: Need to decide on metrics backend (OpenTelemetry Prometheus already exists, but transport metrics would need careful integration)
-3. **Testing**: Metrics need integration tests to verify counters increment correctly
-4. **Performance**: Histogram buckets need tuning for QUIC latency characteristics
-
-### Minimal Safe Path for Future Metrics
-
-```rust
-// In crates/xline/src/metrics.rs, add:
-define_metrics! {
-    "xline",
-    quic_connect_attempts_total: Counter<u64> = meter()
-        .u64_counter("quic_connect_attempts")
-        .with_description("Total QUIC connection attempts")
-        .init(),
-    quic_connect_failures_total: Counter<u64> = meter()
-        .u64_counter("quic_connect_failures")
-        .with_description("Total QUIC connection failures")
-        .init(),
-    // ... other metrics
-}
-
-// In h3_client.rs, add:
-Metrics::quic_connect_attempts_total().add(1, &[
-    KeyValue::new("endpoint", endpoint_str.clone()),
-    KeyValue::new("server_name", server_name.clone()),
-]);
-```
-
-### Debug Logging Reference
-
-**Enable transport debug logs**:
-```bash
-RUST_LOG=xline=debug,xlinerpc=debug,curp=debug
-```
-
-**Filter specific components**:
-```bash
-# Only QUIC connection events
-RUST_LOG=xlinerpc::h3_client=debug
-
-# Only server-side routing
-RUST_LOG=xline::server::port_router=debug,xline::server::h3_server=debug
-
-# Only watch/lease lifecycle
-RUST_LOG=xline::server::watch_server=debug,xline::server::lease_server=debug
-```
-
-**Collect logs on CI failure**:
-```bash
-RUST_LOG=xline=debug,xlinerpc=debug bash scripts/quic_ci_smoke.sh 2>&1 | tee quic-debug.log
-grep -E "stream.*not stopped|No viable network path|connect failed|handshake failed" quic-debug.log
-```
+See [Troubleshooting Guide §6](quic-troubleshooting.md#6-metrics-and-debug-logs) for metrics details and [CURP Benchmark §10](quic-curp-benchmark.md) for runtime verification.
 
 ---
 
 ## 23. Implemented Transport Metrics
 
-### Metrics Implemented
+See [CURP Benchmark §10](quic-curp-benchmark.md) for full metrics definitions, Prometheus output, and runtime verification.
 
-| Metric Name (OTel) | Prometheus Name | Crate | Type | Labels | Trigger Point |
-|---------------------|-----------------|-------|------|--------|---------------|
-| `port_router_unknown` | `port_router_unknown_total` | xline | Counter | `component`, `reason` | PortRouter returns Unknown target |
-| `quic_connect_attempts` | `quic_connect_attempts_total` | curp | Counter | `component` | CURP channel QUIC connect attempt |
-| `quic_connect_failures` | `quic_connect_failures_total` | curp | Counter | `component`, `error_type` | CURP channel all connect attempts exhausted |
-
-### PortRouter Unknown Metrics
-
-**Metric**: `port_router_unknown_total` (xline crate)
-
-**Prometheus output** (when triggered):
-```
-port_router_unknown_total{component="port_router",reason="unknown_server_name",otel_scope_name="xline",otel_scope_version="0.6.1"} 0
-port_router_unknown_total{component="port_router",reason="unknown_port",otel_scope_name="xline",otel_scope_version="0.6.1"} 0
-```
-
-**Labels**:
-- `component = "port_router"`
-- `reason = "unknown_server_name"` — server not found in routing table
-- `reason = "unknown_port"` — server found but port not in client_ports or peer_ports
-
-**Trigger**: `PortRouter::route()` returns `ConnectionTarget::Unknown`
-
-**Usage**: Detect misconfigured routing or unexpected connection attempts
-
-### CURP QUIC Connect Metrics
-
-**Metrics**: `quic_connect_attempts_total`, `quic_connect_failures_total` (curp crate)
-
-**Prometheus output**:
-```
-quic_connect_attempts_total{component="curp_channel",otel_scope_name="curp",otel_scope_version="0.1.0"} 17
-quic_connect_failures_total{component="curp_channel",error_type="unavailable",otel_scope_name="curp",otel_scope_version="0.1.0"} 0
-```
-
-**Labels**:
-- `component = "curp_channel"`
-- `error_type = "unavailable"` — all connect attempts failed
-
-**Trigger**:
-- `quic_connect_attempts_total`: Each `try_connect()` call in `get_connection()`
-- `quic_connect_failures_total`: Only after ALL addresses exhausted (not per-retry)
-
-**Usage**: Monitor CURP peer connectivity and failure rates
-
-### Metrics Not Implemented (and Why)
-
-| Metric | Reason |
-|--------|--------|
-| `xline_quic_connect_attempts_total` | Implemented as `quic_connect_attempts_total` in curp crate (see above). H3 client version needs xlinerpc metrics infra. |
-| `xline_quic_connect_failures_total` | Implemented as `quic_connect_failures_total` in curp crate (see above). H3 client version needs xlinerpc metrics infra. |
-| `xline_h3_request_duration_seconds` | Requires histogram, more invasive changes |
-| `xline_h3_stream_drops_total` | Would need xlinerpc metrics infrastructure |
-| `xline_endpoint_resolve_failures_total` | Would need xlinerpc metrics infrastructure |
-
-### Dependency Constraints
-
-**xlinerpc** does NOT depend on `utils` or `opentelemetry`. Adding metrics to xlinerpc would require:
-1. Adding `opentelemetry` dependency to xlinerpc Cargo.toml
-2. Adding `utils` dependency for `define_metrics!` macro
-3. This changes crate layering — xlinerpc is currently a pure RPC library
-
-**Recommendation**: Keep xlinerpc metrics-free. If H3 client metrics are needed, consider:
-- Option A: Add opentelemetry to xlinerpc (changes dependency graph)
-- Option B: Create a shared metrics crate that both xline and xlinerpc depend on
-- Option C: Keep metrics in xline crate only, using callback/tracing patterns
-
-### Viewing Metrics
-
-**Prometheus endpoint**: xline exposes `/metrics` on a dedicated metrics port (default `9100`, configurable via `--metrics-port`).
-
-> **Important**: The metrics port is separate from the client listen port. Each xline node binds its own metrics port. When running multiple nodes locally, use `--metrics-port 9100`, `--metrics-port 9101`, etc.
-
-**Verify metrics are exposed**:
-```bash
-# After starting a cluster
-curl -s http://127.0.0.1:9100/metrics | grep -E "quic_connect|port_router"
-```
-
-**Example queries**:
-```promql
-# PortRouter unknown connections
-rate(port_router_unknown_total{component="port_router"}[5m])
-
-# CURP connect attempts
-rate(quic_connect_attempts_total{component="curp_channel"}[5m])
-
-# CURP connect failures
-rate(quic_connect_failures_total{component="curp_channel"}[5m])
-```
-
-### Runtime Verification (2026-05-23, re-verified)
-
-Verified on a local 3-node cluster with `--metrics-enable --metrics-port 9100/9101/9102`:
-
-**server0 (port 9100) — all metrics after KV ops**:
-```
-current_rust_version{server_rust_version=""} 1
-current_version{server_version="0.6.1"} 1
-fd_limit 1048576
-fd_used 41
-has_leader 1
-is_leader 0
-is_learner 0
-online_clients 0
-quic_connect_attempts_total{component="curp_channel"} 15
-server_id 15397586489680409000
-sp_cnt 0
-```
-
-**server1 (port 9101)**: `quic_connect_attempts_total` = 232 (leader, more peer traffic)
-**server2 (port 9102)**: `quic_connect_attempts_total` = 11
-
-**Key observations**:
-- `quic_connect_attempts_total` ✅ exported and incrementing on all 3 nodes
-- `quic_connect_failures_total` — NOT present (expected: no failures in healthy cluster)
-- `port_router_unknown_total` — NOT present (expected: no Unknown routes in healthy cluster)
-- `current_rust_version` shows empty string — pre-existing issue (`CARGO_PKG_RUST_VERSION` not set in build env)
-- OTel scope attributes (`otel_scope_name`, `otel_scope_version`) are automatically added by the Prometheus exporter
-- All labels are low cardinality (`component`, `reason`, `error_type`) — no endpoint/socket_addr/raw error labels
-
-### Failure-Path Metrics Verification
-
-The failure-path counters (`quic_connect_failures_total`, `port_router_unknown_total`) are verified by:
-
-1. **Code audit**: Both counters are in the correct trigger locations:
-   - `quic_connect_failures_total` — `channel.rs:163`, after ALL addresses exhausted in `get_connection()`
-   - `port_router_unknown_total` — `port_router.rs:68,80`, on both `unknown_port` and `unknown_server_name` paths
-
-2. **Counter initialization**: Both counters are in `define_metrics!` groups alongside counters that DO fire:
-   - `quic_connect_failures_total` shares the `curp_quic` group with `quic_connect_attempts_total` (confirmed live)
-   - `port_router_unknown_total` shares the `xline` group with `slow_read_indexes_total` (confirmed live)
-   - When any counter in a group fires, `OnceLock` initializes ALL counters in that group
-
-3. **Prometheus behavior**: Unobserved counters don't appear in `/metrics` output (standard Prometheus convention). They will appear on first increment.
-
-4. **Cannot safely trigger**: Both metrics require cluster failure (all peers unreachable or unknown port routing). Triggering them would break the running cluster. They are inherently failure-path metrics meant for production monitoring, not CI smoke tests.
-
-### High Cardinality Fields (Avoid)
-
-The following fields are intentionally NOT included in metrics labels:
-- Raw endpoint strings (e.g., "https://server0:2379")
-- Socket addresses with ephemeral ports
-- Full error messages
-- Request/response bodies
-- Token or certificate contents
-
-These fields are only in debug logs, not metrics.
+Implemented: `port_router_unknown_total` (xline), `quic_connect_attempts_total` (curp), `quic_connect_failures_total` (curp).
 
 ---
 
 ## 24. Configuration Validation and Deployment Checklist
 
-### Startup Validation
+See [Troubleshooting Guide §1](quic-troubleshooting.md#1-quick-start-local-3-node-quic-cluster) for deployment setup.
 
-`validate_server_config()` runs in `parse_config()` after CLI/config file parsing, before server startup. It checks:
-
-| Check | Severity | Example Error |
-|-------|----------|---------------|
-| Port conflict (metrics vs client/peer) | **Fatal** | `Port conflict: port 2379 is used by multiple sources: client-listen-urls, --metrics-port` |
-| TLS cert without key (or vice versa) | **Fatal** | `TLS misconfiguration: --peer-cert-path is set but --peer-key-path is missing` |
-| Advertise URL uses DNS name | Info | `client-advertise-urls uses DNS name 'server0' — ensure /etc/hosts resolves it` |
-| HTTPS advertise without TLS cert | Warning | `advertise URL uses https:// but no TLS certificate is configured` |
-
-### Script Preflight Checks
-
-`quic_ci_smoke.sh` and `quic_local_cluster.sh` now run preflight checks before starting:
-
-1. **Hosts check**: Verifies `server0`, `server1`, `server2` are in `/etc/hosts`
-2. **Port check**: Verifies ports 2379-2384 and 9100-9102 are not in use
-
-### Deployment Checklist
-
-For a 3-node local cluster:
-
-- [ ] `/etc/hosts` contains `127.0.0.1 server0`, `127.0.0.1 server1`, `127.0.0.1 server2`
-- [ ] TLS certs exist in `fixtures/` with SANs matching server names
-- [ ] Ports 2379-2384 (client/peer) and 9100-9102 (metrics) are free
-- [ ] Each node has a unique `--data-dir`
-- [ ] `--client-listen-urls` and `--peer-listen-urls` use `127.0.0.1` (not DNS names)
-- [ ] `--client-advertise-urls` and `--peer-advertise-urls` use DNS names matching cert SANs
-- [ ] `--metrics-port` does not conflict with client/peer ports
-
-### URL/SNI/Cert Relationship
-
-```
-Listen URL (bind)     → Must be IP address (127.0.0.1:2379)
-Advertise URL (SNI)   → Must match cert SAN (server0:2379)
-Cert SAN              → DNS:server0, IP:127.0.0.1
-/etc/hosts            → 127.0.0.1 server0
-```
-
-The server listens on `127.0.0.1:2379` (IP bind). Clients connect to `server0:2379` (DNS name). TLS SNI sends `server0` as the server name. The cert must have `DNS:server0` in its SAN. `/etc/hosts` must resolve `server0` to `127.0.0.1`.
-
-### Common Misconfigurations
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `Port conflict: port 2379` | metrics-port = client port | Use `--metrics-port 9100` |
-| `TLS misconfiguration: --peer-cert-path is set but --peer-key-path is missing` | Partial TLS config | Provide both cert and key |
-| `Connection refused` on startup | Port already in use | Kill existing xline or use different ports |
-| `TLS handshake failed` at runtime | Cert SAN doesn't match advertise URL | Ensure cert has DNS:name in SAN |
-| `No viable network path` | DNS name not resolving | Check `/etc/hosts` entries |
-
-### Metrics Port Usage
-
-Default metrics port is 9100. For multi-node:
-```
-server0: --metrics-port 9100
-server1: --metrics-port 9101
-server2: --metrics-port 9102
-```
-
-View metrics: `curl http://127.0.0.1:9100/metrics`
+Server-side `validate_server_config()` checks: port conflicts (fatal), TLS completeness (fatal), DNS name hints (info), HTTPS without TLS (warning).
 
 ---
 
 ## 25. xlinectl Client-Side Configuration and Error UX
 
-### Client CLI Arguments
+See [xlinectl Doctor](xlinectl-doctor.md) for full details.
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--endpoints` | `https://server0:2379` | Comma-separated list of server endpoints |
-| `--ca_cert_pem_path` | `fixtures/ca.crt` (dev only) | CA certificate PEM file for TLS verification |
-
-### Endpoint Format
-
-Each endpoint must include:
-- **Scheme**: `https://` (TLS) or `http://` (plaintext, warned)
-- **Host**: DNS name or IP address
-- **Port**: Numeric port number
-
-Examples:
-```
-https://server0:2379          # DNS name with TLS
-https://127.0.0.1:2379       # IP address with TLS
-http://server0:2379           # Plaintext (warned)
-```
-
-### Endpoint Validation
-
-xlinectl validates endpoints before connecting:
-
-1. **Missing scheme**: `Endpoint 'server0:2379' is missing a scheme (https:// or http://).`
-2. **Missing port**: `Endpoint 'https://server0' is missing a port number.`
-3. **Plaintext warning**: `Endpoint 'http://server0:2379' uses http:// (plaintext).`
-
-### Error Messages
-
-Connection errors include troubleshooting hints:
-
-**DNS failure:**
-```
-DNS lookup failed for 'nonexistent:2379' (endpoint='nonexistent:2379', fallback=Disabled): ...
-Hint: Check /etc/hosts or DNS for 'nonexistent'. If testing locally, add '127.0.0.1 nonexistent' to /etc/hosts.
-```
-
-**QUIC connect failure:**
-```
-QUIC connect error: endpoint='server0:2379', server_name='server0', addr=127.0.0.1:2379: ...
-Hint: Verify the server is running and reachable. If using TLS, check that the CA certificate is correct
-and the server's cert includes 'server0' in its Subject Alternative Name.
-```
-
-**QUIC handshake failure:**
-```
-QUIC handshake error: endpoint='server0:2379', server_name='server0', addr=127.0.0.1:2379: ...
-Hint: TLS handshake failure often means the CA certificate doesn't match the server's cert,
-or the server's cert SAN doesn't include 'server0'.
-```
-
-### TLS Configuration
-
-**CA Certificate**: Use `--ca_cert_pem_path <PATH>` to specify the CA certificate. If not provided, xlinectl falls back to `fixtures/ca.crt` (development convenience). In production, always specify the CA certificate explicitly.
-
-**Server Identity Verification**: The QUIC client verifies the server's certificate against the CA. The server's cert must include the endpoint's hostname in its Subject Alternative Name (SAN).
-
-### Common Client Misconfigurations
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `missing a scheme` | Endpoint without `https://` | Add `https://` prefix |
-| `missing a port number` | Endpoint without `:port` | Add `:2379` (or appropriate port) |
-| `DNS lookup failed` | Hostname not in /etc/hosts | Add `127.0.0.1 hostname` to /etc/hosts |
-| `QUIC handshake error` | CA cert doesn't match server cert | Use correct `--ca_cert_pem_path` |
-| `Deadline expired` | Server not running or unreachable | Start server or check network |
-| `plaintext` warning | Using `http://` instead of `https://` | Use `https://` for TLS |
-
-### Debug Logging
-
-Enable transport debug logs:
-```bash
-RUST_LOG=xlinerpc=debug,xline_client=debug xlinectl --endpoints https://server0:2379 get key
-```
-
-### Verifying /etc/hosts
-
-```bash
-# Check if server names resolve
-grep -E 'server[012]' /etc/hosts
-
-# Expected output:
-# 127.0.0.1 server0
-# 127.0.0.1 server1
-# 127.0.0.1 server2
-```
+Key features: endpoint validation (scheme/port/IP/DNS), CA cert checks, SNI routing detection, `--check_connection` live test.
 
 ---
 
 ## 26. TLS Verification Policy
 
-### Default Security Posture
+See [Troubleshooting Guide §4](quic-troubleshooting.md#4-tls--ca-policy) for full policy and test results.
 
-Xline uses **rustls** (via dquic) for all QUIC/TLS operations. The default behavior is **secure by default**:
-
-- **With CA cert**: Server certificate is verified against the provided CA using rustls's `WebPkiServerVerifier`. Connections to servers with untrusted certs are rejected with `UnknownIssuer`.
-- **Without CA cert**: An empty `RootCertStore` is used. rustls cannot verify ANY certificate chain → all connections fail with `UnknownIssuer`. Verification is NOT silently skipped.
-- **`--insecure` flag**: Does NOT exist and is NOT planned. The codebase never calls `dquic::QuicClient::builder().without_verifier()`.
-
-### TLS Test Results (Live 3-Node Cluster)
-
-| Test | Scenario | Result | Error |
-|------|----------|--------|-------|
-| 1 | Correct CA (`fixtures/ca.crt`) | ✅ OK | — |
-| 2 | Wrong CA (self-signed dummy) | ❌ Fail | `UnknownIssuer` |
-| 3a | No `--ca_cert_pem_path` (dev build) | ✅ OK | Auto-discovers `fixtures/ca.crt` via `CARGO_MANIFEST_DIR` |
-| 3b | Empty CA file | ❌ Fail | `UnknownIssuer` |
-| 4 | Wrong hostname (SNI mismatch) | ❌ Fail | `No viable network path` (QUIC SNI routing) |
-| 5 | IP endpoint (`127.0.0.1`) | ❌ Fail | `No viable network path` (SNI routing, not TLS) |
-
-### Certificate Chain
-
-```
-ca.crt (self-signed CA)
-├── server0.crt (CN=server0, SAN: DNS:localhost, DNS:server0, IP:127.0.0.1, IP:127.0.1.1, IP:0.0.0.0)
-├── server1.crt (CN=server1, SAN: DNS:localhost, DNS:server1, IP:127.0.0.1, IP:127.0.1.2, IP:0.0.0.0)
-├── server2.crt (CN=server2, SAN: DNS:localhost, DNS:server2, IP:127.0.0.1, IP:127.0.1.3, IP:0.0.0.0)
-├── root_client.crt (mTLS client)
-├── u1_client.crt (mTLS user 1)
-└── u2_client.crt (mTLS user 2)
-```
-
-### SNI Routing Behavior
-
-The QUIC server uses SNI (Server Name Indication) to route connections to the correct virtual server. The SNI routing table is populated from:
-
-1. **Server name** (`--name server0`)
-2. **URL hosts** from listen URLs (`--client-listen-urls https://127.0.0.1:2379`)
-
-When multiple servers share the same IP (e.g., `127.0.0.1:2379`, `127.0.0.1:2381`, `127.0.0.1:2383`), only the **first** server to register that IP as an SNI alias succeeds. Subsequent registrations fail silently. Additionally, the `ServerAuther` validates that the SNI-matched server is bound to the specific interface that received the packet. This means IP-based SNI only works for one server per IP address.
-
-See §27 for full root cause analysis and behavior.
-
-### CA Certificate Behavior by Component
-
-| Component | No CA Cert Behavior | Code Location |
-|-----------|-------------------|---------------|
-| xlinectl (dev build) | Auto-discovers `fixtures/ca.crt` | `main.rs:300-304` |
-| xlinectl (release build) | Warning + empty root store → connection fails | `main.rs:306-310` |
-| xline-client | Warning + empty root store → connection fails | `lib.rs:334-336` |
-| xline server peer client | Warning + empty root store → connection fails | `xline_server.rs:714-718` |
-| CURP internal client | Empty root store (no warning) | `state.rs:85` |
-
-### Recommendations
-
-1. **Production**: Always specify `--ca_cert_pem_path` explicitly. Never rely on auto-discovery.
-2. **Development**: The `fixtures/ca.crt` auto-discovery is a convenience for developers running from source. It does NOT work in release builds.
-3. **mTLS**: Use `--peer-cert-path`, `--peer-key-path`, `--peer-ca-cert-path` for mutual TLS. The server verifies client certs against the peer CA.
-4. **IP endpoints**: Use DNS names (e.g., `server0`) instead of IP addresses for endpoints. IP endpoints fail at QUIC SNI routing level. See §27.
+**Key conclusion**: TLS is secure by default. Empty `RootCertStore` → all connections fail with `UnknownIssuer`. No `--insecure` flag. No `without_verifier()`.
 
 ---
 
 ## 27. IP Endpoint and SNI Routing Analysis
 
-### Root Cause
+See [Troubleshooting Guide §5](quic-troubleshooting.md#5-sni-routing-and-ip-endpoints) for full root cause analysis.
 
-QUIC SNI routing in dquic uses a `DashMap<String, Server>` keyed by server name. The `VirtualHosts::resolve()` method (rustls `ResolvesServerCert` impl) looks up the SNI from the TLS ClientHello to select the server certificate. The `ServerAuther::verify_client_name()` then validates that the matched server is bound to the interface that received the packet.
-
-**Why `https://127.0.0.1:2379` fails:**
-
-1. `ServerRegistry::register_sni_aliases()` registers URL hosts as SNI aliases via `dquic::QuicListeners::add_server(host, ...)`.
-2. `add_server()` returns `ServerError::ServerAlreadyExists` if the name is already in the `DashMap`. Only the **first** server to register an IP wins.
-3. For `127.0.0.1`: server0 registers first → `DashMap["127.0.0.1"]` = server0's cert + bind interfaces (`127.0.0.1:2379`, `127.0.0.1:2380`).
-4. server1 and server2's attempts to register `127.0.0.1` fail silently (non-fatal warning in logs).
-5. When a client connects to `127.0.0.1:2381` with SNI=`127.0.0.1`:
-   - TLS handshake: `VirtualHosts::resolve("127.0.0.1")` → server0's cert (has `IP:127.0.0.1` SAN) → handshake succeeds
-   - Auth: `ServerAuther` checks `servers["127.0.0.1"].bind_ifaces.contains_key(127.0.0.1:2381)` → **false** (server0 only has 2379, 2380)
-   - Result: `ClientNameVerifyResult::Refuse` → connection dropped → client sees "No viable network path"
-
-**Why `https://localhost:2379` fails:**
-
-1. `localhost` resolves via DNS to `127.0.0.1` (or `::1`).
-2. If `127.0.0.1`: same SNI routing issue as above.
-3. If `::1`: server binds to `127.0.0.1:2379` (IPv4), not `[::1]:2379` (IPv6) → UDP packet doesn't reach server → timeout.
-
-### What It Is NOT
-
-- **NOT a TLS SAN failure**: The cert includes `IP:127.0.0.1`, `DNS:localhost`, `DNS:server0`. TLS handshake succeeds.
-- **NOT a DNS failure**: IP addresses don't need DNS resolution.
-- **IS a QUIC SNI routing failure**: The SNI-to-server mapping is ambiguous when multiple servers share the same IP.
-
-### Behavior Summary
-
-| Endpoint | Result | Error Type | Root Cause |
-|----------|--------|-----------|------------|
-| `https://server0:2379` | ✅ OK | — | DNS name, unique SNI |
-| `https://127.0.0.1:2379` | ❌ Fail | No viable network path | SNI "127.0.0.1" → wrong server, interface check fails |
-| `https://127.0.0.1:2381` | ❌ Fail | No viable network path | Same: SNI "127.0.0.1" → server0 (port 2379), not server1 |
-| `https://localhost:2379` | ❌ Fail | Timeout | DNS resolves to `::1` (IPv6), server listens on IPv4 |
-| `https://server0:2381` | ❌ Fail | Port mismatch | SNI "server0" → correct server, but wrong port routing |
-
-### Mitigations Applied
-
-1. **xlinectl `validate_endpoints()`**: Detects IP/localhost/IPv6 endpoints and rejects them with actionable guidance: use DNS names + `/etc/hosts`.
-2. **h3_client.rs error hints**: When server_name is an IP address and connect/handshake fails, adds SNI routing explanation to the error message.
-
-### Why Not Support IP Endpoints
-
-Supporting IP endpoints would require one of:
-
-- **(A) `--server-name` CLI flag**: Override SNI separately from endpoint host. New public API, increases complexity.
-- **(B) Port-based SNI routing**: Register `127.0.0.1:2379` as SNI alias. Non-standard (SNI is hostname, not host:port), breaks TLS cert validation.
-- **(C) Remove interface validation**: Allow any server to handle any SNI on any port. Breaks multi-tenant isolation.
-
-None of these are low-risk. The recommended approach is DNS names via `/etc/hosts`.
-
-### Recommended Local Development Setup
-
-```bash
-# /etc/hosts
-127.0.0.1 server0 server1 server2
-
-# xline server args
---name server0 \
---client-listen-urls https://127.0.0.1:2379 \
---client-advertise-urls https://server0:2379
-
-# xlinectl
---endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt
-```
+**Key conclusion**: IP endpoints fail at QUIC SNI routing level (not TLS). Only DNS names work. Use `/etc/hosts` for local development.
 
 ---
 
 *Report generated by Sisyphus (AI Agent) on 2026-05-23.*
+*Full documentation index: [QUIC Docs Index](quic-docs-index.md)*
