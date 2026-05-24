@@ -462,3 +462,7 @@ RUST_LOG=curp::rpc::quic_transport::channel=debug xlinectl --endpoints ... put k
 ```
 
 The debug output goes to stderr and includes structured fields: `endpoint`, `server_name`, `addr`.
+
+## 12. Soak Test Results
+
+See [CURP Cache Soak Test](quic-curp-cache-soak.md) for stability verification under sustained load (120s long run, 5-round restart stress, fault injection).
