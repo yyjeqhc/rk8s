@@ -54,7 +54,12 @@ pub(crate) async fn execute(
 
     if check_connection {
         println!("── Connection Check ──");
-        check_connection_async(&endpoints, &ca_path, &mut critical).await;
+        if critical == 0 {
+            check_connection_async(&endpoints, &ca_path, &mut critical).await;
+        } else {
+            println!("  ⏭️  Skipped because critical static checks failed");
+            println!("     Fix the errors above, then rerun with --check_connection.");
+        }
         println!();
     }
 
