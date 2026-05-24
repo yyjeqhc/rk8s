@@ -62,12 +62,11 @@ impl ConnectionCache {
     fn get(&self, key: &str) -> Option<Connection> {
         let mut map = self.entries.lock();
         if let Some(entry) = map.get(key) {
-            if entry.created_at.elapsed() < CONN_CACHE_MAX_AGE
-                && entry.last_used.elapsed() < CONN_CACHE_MAX_IDLE
-            {
+            let now = Instant::now();
+            if is_cache_entry_fresh(entry.created_at, entry.last_used, now) {
                 let conn = entry.conn.clone();
                 if let Some(e) = map.get_mut(key) {
-                    e.last_used = Instant::now();
+                    e.last_used = now;
                 }
                 return Some(conn);
             }
@@ -104,10 +103,29 @@ impl ConnectionCache {
     }
 }
 
+/// Check whether the CURP connection cache env var is set to an enabled value.
+/// Accepts "1" or "true" (case-sensitive) as enabled; everything else is disabled.
+fn cache_enabled_from_env_value(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true"))
+}
+
 fn conn_cache_enabled() -> bool {
-    std::env::var("XLINE_CURP_CONN_CACHE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    cache_enabled_from_env_value(std::env::var("XLINE_CURP_CONN_CACHE").ok().as_deref())
+}
+
+/// Strip scheme prefix (quic://, https://, http://) from an address string.
+/// Returns the remainder (host:port or host).
+fn strip_scheme(addr: &str) -> &str {
+    addr.strip_prefix("quic://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr)
+}
+
+/// Check whether a cached entry is still fresh (not expired by age or idle time).
+fn is_cache_entry_fresh(created_at: Instant, last_used: Instant, now: Instant) -> bool {
+    now.duration_since(created_at) < CONN_CACHE_MAX_AGE
+        && now.duration_since(last_used) < CONN_CACHE_MAX_IDLE
 }
 
 /// QUIC channel for managing connections and RPC calls
@@ -229,11 +247,7 @@ impl QuicChannel {
         for i in 0..len {
             let idx = (start + i) % len;
             let addr = &snapshot[idx];
-            let addr_str = addr
-                .strip_prefix("quic://")
-                .or_else(|| addr.strip_prefix("https://"))
-                .or_else(|| addr.strip_prefix("http://"))
-                .unwrap_or(addr);
+            let addr_str = strip_scheme(addr);
 
             if let Some(ref cache) = self.cache {
                 if let Some(conn) = cache.get(addr_str) {
@@ -1056,5 +1070,114 @@ mod tests {
             wait.is_ok(),
             "stuck send task should be aborted after grace period"
         );
+    }
+
+    use super::{cache_enabled_from_env_value, is_cache_entry_fresh, strip_scheme};
+    use std::time::Instant;
+
+    // --- conn_cache_enabled_from_env_value ---
+
+    #[test]
+    fn conn_cache_disabled_when_env_unset() {
+        assert!(!cache_enabled_from_env_value(None));
+    }
+
+    #[test]
+    fn conn_cache_enabled_for_1() {
+        assert!(cache_enabled_from_env_value(Some("1")));
+    }
+
+    #[test]
+    fn conn_cache_enabled_for_true() {
+        assert!(cache_enabled_from_env_value(Some("true")));
+    }
+
+    #[test]
+    fn conn_cache_disabled_for_0() {
+        assert!(!cache_enabled_from_env_value(Some("0")));
+    }
+
+    #[test]
+    fn conn_cache_disabled_for_false() {
+        assert!(!cache_enabled_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn conn_cache_disabled_for_random() {
+        assert!(!cache_enabled_from_env_value(Some("yes")));
+        assert!(!cache_enabled_from_env_value(Some("on")));
+        assert!(!cache_enabled_from_env_value(Some("TRUE")));
+        assert!(!cache_enabled_from_env_value(Some("")));
+    }
+
+    // --- strip_scheme ---
+
+    #[test]
+    fn strip_scheme_removes_https() {
+        assert_eq!(strip_scheme("https://server0:2379"), "server0:2379");
+    }
+
+    #[test]
+    fn strip_scheme_removes_http() {
+        assert_eq!(strip_scheme("http://server0:2379"), "server0:2379");
+    }
+
+    #[test]
+    fn strip_scheme_removes_quic() {
+        assert_eq!(strip_scheme("quic://server0:2379"), "server0:2379");
+    }
+
+    #[test]
+    fn strip_scheme_no_scheme() {
+        assert_eq!(strip_scheme("server0:2379"), "server0:2379");
+    }
+
+    #[test]
+    fn strip_scheme_partial_match_not_stripped() {
+        assert_eq!(strip_scheme("httpsfoo:2379"), "httpsfoo:2379");
+    }
+
+    // --- is_cache_entry_fresh ---
+
+    #[test]
+    fn cache_freshness_accepts_recent_entry() {
+        let now = Instant::now();
+        assert!(is_cache_entry_fresh(now, now, now));
+    }
+
+    #[test]
+    fn cache_freshness_rejects_expired_by_age() {
+        let now = Instant::now();
+        let old = now - std::time::Duration::from_secs(301);
+        assert!(!is_cache_entry_fresh(old, now, now));
+    }
+
+    #[test]
+    fn cache_freshness_rejects_expired_by_idle() {
+        let now = Instant::now();
+        let old = now - std::time::Duration::from_secs(31);
+        assert!(!is_cache_entry_fresh(now, old, now));
+    }
+
+    #[test]
+    fn cache_freshness_accepts_at_age_boundary() {
+        let now = Instant::now();
+        let just_before = now - std::time::Duration::from_secs(299);
+        assert!(is_cache_entry_fresh(just_before, now, now));
+    }
+
+    #[test]
+    fn cache_freshness_accepts_at_idle_boundary() {
+        let now = Instant::now();
+        let just_before = now - std::time::Duration::from_secs(29);
+        assert!(is_cache_entry_fresh(now, just_before, now));
+    }
+
+    #[test]
+    fn cache_freshness_rejects_both_expired() {
+        let now = Instant::now();
+        let old_created = now - std::time::Duration::from_secs(400);
+        let old_used = now - std::time::Duration::from_secs(100);
+        assert!(!is_cache_entry_fresh(old_created, old_used, now));
     }
 }

@@ -70,7 +70,7 @@ impl std::fmt::Debug for StateMut {
 impl State {
     /// For test
     #[cfg(test)]
-    pub(super) fn new_arc(
+    pub(super) async fn new_arc(
         connects: HashMap<ServerId, Arc<dyn ConnectApi>>,
         local_server: Option<ServerId>,
         leader: Option<ServerId>,
@@ -85,6 +85,7 @@ impl State {
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .without_cert()
                 .bind(["inet://0.0.0.0:0"])
+                .await
                 .with_alpns(["h3"])
                 .build(),
         );
