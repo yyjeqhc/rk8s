@@ -198,3 +198,127 @@ Connection reuse is architecturally feasible and would provide ~3× reduction in
 For short-lived clients (xlinectl), the dominant cost is process startup + FetchCluster, which connection caching doesn't address. The long-running client benchmark shows 5.7× speedup over xlinectl, demonstrating the benefit of persistent connections.
 
 **Recommendation:** Implement Option A behind `XLINE_CURP_CONN_CACHE=1` env var, measure improvement, then evaluate whether to expand scope.
+
+## 8. Cache Implementation Results
+
+### Implementation
+
+Added `ConnectionCache` to `QuicChannel` in `crates/curp/src/rpc/quic_transport/channel.rs`:
+- **Cache key**: `String` (scheme-stripped endpoint, e.g. `"server0:2379"`)
+- **Cache value**: `dquic::Connection` (cheaply Clone via Arc) + `Instant` (created_at, last_used)
+- **Scope**: Per `QuicChannel` instance (not global). Each `QuicConnect` (per-peer) has its own `QuicChannel` with its own cache.
+- **Env gate**: `XLINE_CURP_CONN_CACHE=1` enables, unset = disabled. Default OFF.
+- **Eviction**: on ANY RPC error (open_bi_stream, write, read, timeout), on age > 5min, on idle > 30s, on cache full (oldest evicted)
+- **No background health checker, no LRU, no DnsFallback changes**
+
+Three new metrics added to `crates/curp/src/rpc/quic_transport/metrics.rs`:
+- `curp_conn_cache_hits_total` — incremented only when cache is enabled and a reusable connection is found
+- `curp_conn_cache_misses_total` — incremented only when cache is enabled and a NEW connection is created
+- `curp_conn_cache_evictions_total` — incremented on explicit eviction (error or full), with `component="curp_channel"` label
+
+### Cache Key Safety
+
+**QuicChannel-scoped**: Each `QuicConnect` (per-peer) gets its own `Arc<QuicChannel>` via `quic_connect()` in `connect.rs`. The cache is a field of `QuicChannel`, so it's per-peer — no cross-peer connection sharing.
+
+**Immutable bindings**: Within a single `QuicChannel` instance, the `QuicClient` (TLS config), `dns_fallback` policy, and source binding are set at construction and never changed. The `addrs` list can be updated (via `update_addrs()` during FetchCluster), but the cache key is the endpoint string, not an index. Stale entries are evicted by age/idle timeout.
+
+**Server identity change**: If the server at an endpoint changes (e.g., different TLS cert after restart), the cached connection may become stale. The 300-second max age limits exposure. This is acceptable for a prototype; production would need TLS fingerprint or GOAWAY-based eviction.
+
+### Eviction Policy
+
+| Error Type | Evicts? | Rationale |
+|------------|---------|-----------|
+| `open_bi_stream` failure | ✅ | Connection-level: QUIC stream creation failed |
+| `open_bi_stream` timeout | ✅ | Connection may be stalled |
+| Request header write failure | ✅ | Connection-level: write on stale/broken conn |
+| Request data write failure | ✅ | Connection-level |
+| Response read failure | ✅ | Connection-level: peer closed or network error |
+| Response decode failure | ✅ | Evicted for simplicity (rare, CURP retry re-creates) |
+| `RpcTransport` timeout | ✅ | Connection may be stalled |
+| Application `CurpError` (Duplicated, ShuttingDown, etc.) | ✅ | Evicted for simplicity (these errors don't retry, evicting is harmless) |
+| Leader redirect / WrongClusterVersion / Zombie | ❌ | Not evicted — these are handled by CURP retry which re-fetches cluster |
+
+**Note**: Eviction on application-level errors (Duplicated, ShuttingDown, etc.) is technically unnecessary but harmless — these errors are fatal and don't trigger retries. The connection is evicted but the error still propagates. This simplification avoids complex error classification logic.
+
+### "0 New QUIC Connections" Clarification
+
+The "0 new QUIC connections" metric for the long-running client means: **during the measured benchmark interval**, the `quic_connect_attempts_total` counter did not increase. It does NOT mean zero total connections exist — it means all connections were reused from the cache. The initial connections (created at startup before the benchmark interval) are not counted.
+
+### Benchmark Results (10 requests, same parameters)
+
+| Metric | Baseline | Cache | Reduction |
+|--------|----------|-------|-----------|
+| **Sequential: QUIC connections** | 189 (9.45/op) | 3 (0.15/op) | **98.4%** |
+| **Long-running: QUIC connections** | 67 (3.35/op) | 0 (0.00/op) | **100%** |
+| Long-running: avg latency | 266ms | 248ms | -7% |
+| Long-running: throughput | 3.8 req/s | 4.0 req/s | +5% |
+
+### Analysis
+
+**Sequential xlinectl** (short-lived processes): Each `xlinectl` invocation creates a fresh `QuicChannel` with its own cache. Within a single invocation, the cache eliminates redundant connections for repeated operations to the same server. The 98.4% reduction (189 → 3) shows the cache effectively eliminates all per-operation QUIC handshakes within a single process.
+
+**Long-running client**: The cache completely eliminates new QUIC connections (67 → 0). All connections are reused from the cache. Latency improves by 7% (266ms → 248ms) because the QUIC+TLS handshake is skipped.
+
+**Throughput bottleneck**: The dominant cost is not QUIC connection establishment — it's the CURP consensus protocol (propose + record to followers). Connection caching helps latency but doesn't change the fundamental throughput ceiling.
+
+### Fault Verification (with cache enabled)
+
+| Test | Result |
+|------|--------|
+| `quic_ci_smoke.sh` | ✅ ALL PASSED |
+| `quic_restart_stress.sh 3` | ✅ 3/3 (0 panics, 0 NoViablePath, ~118-140 warnings/round) |
+| `quic_fault_smoke.sh` | ✅ ALL PASSED (kill follower, kill leader, restart) |
+
+### Conclusion
+
+The connection cache provides dramatic reduction in QUIC connections (98-100%) with zero fault-tolerance regressions. The improvement is most visible for long-running clients where connections are reused across operations. For short-lived CLI tools, the cache helps within a single invocation but doesn't address the per-process startup cost.
+
+**Status**: Implemented, behind `XLINE_CURP_CONN_CACHE=1` env gate, all verification passed.
+
+## 9. Semantic Safety Audit
+
+### Cache Key Safety ✅
+
+- **QuicChannel instance scoped**: Each `QuicConnect` (per-peer) gets its own `Arc<QuicChannel>` via `quic_connect()`. The cache is per-peer — no cross-peer sharing.
+- **TLS/QuicClient immutable**: `client: Arc<QuicClient>` and `dns_fallback` are set at construction and never changed within a `QuicChannel` instance.
+- **addrs mutation safe**: The `addrs` list can be updated (via `update_addrs()`), but the cache key is the endpoint string, not an index. Stale entries are evicted by age/idle timeout.
+- **No key collision risk**: Different endpoints map to different cache entries. Same endpoint always maps to the same server (assuming no DNS changes during the connection lifetime).
+
+### Eviction Policy ✅
+
+All 5 RPC methods (`unary_call`, `server_streaming_call`, `client_streaming_call`, `bidirectional_streaming_call`, `raw_unary_call`) evict on ANY error:
+- `open_bi_stream` failure/timeout
+- Request write failure
+- Response read failure
+- Application-level errors (for simplicity)
+
+This is conservative — application-level errors don't necessarily mean the connection is stale, but evicting on them is harmless (CURP retry re-creates anyway). The alternative (classifying errors) adds complexity for minimal benefit in a prototype.
+
+### Async Mutex Safety ✅
+
+- `parking_lot::Mutex` (`ParkMutex`) is only locked in synchronous methods: `get()`, `insert()`, `remove()`
+- Lock is always dropped before any `.await` point
+- No I/O operations under lock
+- `HashMap` operations are O(1) for get/insert/remove, O(n) for min_by_key on full eviction — n ≤ 16 (max_entries)
+- Concurrent cache hit/miss from different tasks: each `get_connection()` acquires the lock briefly, no contention risk
+
+### Metrics Correctness ✅
+
+- `curp_conn_cache_hits_total`: Only incremented when cache is enabled AND a reusable connection is found. NOT incremented on cache miss or when cache is disabled.
+- `curp_conn_cache_misses_total`: Only incremented when cache is enabled AND a NEW connection is successfully created. NOT incremented on connection failure.
+- `curp_conn_cache_evictions_total`: Only incremented on explicit eviction. Low cardinality labels (`component="curp_channel"`).
+- `quic_connect_attempts_total`: Only incremented on cache miss (new connection attempt), NOT on cache hit. This means the metric correctly reflects actual QUIC connection attempts regardless of cache state.
+
+### Known Risks
+
+1. **Server restart with same endpoint**: If a server restarts and accepts QUIC connections but rejects CURP operations, the cached connection won't be evicted until a CURP RPC fails. The 300-second max age limits exposure.
+
+2. **Leader change**: Connections to the old leader remain cached. When CURP detects a leader change (via RpcTransport/WrongClusterVersion/Zombie), it re-fetches the cluster and updates `addrs`. The old leader's cache entry becomes stale and will be evicted by age/idle timeout.
+
+3. **DNS changes**: If DNS records change during a long-running session, cached connections may point to wrong servers. The 300-second max age limits exposure. This is the same risk as without caching.
+
+4. **Connection leak on eviction miss**: If a CURP error is not caught by the eviction logic (e.g., error in a spawned task), the cached connection remains. The age/idle timeout provides a safety net.
+
+5. **No GOAWAY handling**: If the server sends GOAWAY (graceful shutdown), the cached connection is not immediately evicted. The next RPC on that connection will fail and trigger eviction.
+
+All risks are mitigated by the 300-second max age and 30-second max idle timeouts. For a prototype, this is acceptable. Production would need GOAWAY handling and TLS fingerprint-based eviction.

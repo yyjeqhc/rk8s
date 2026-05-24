@@ -4,19 +4,21 @@
 //! and provides RPC call methods (unary, server-streaming, client-streaming).
 
 use std::{
+    collections::HashMap,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dquic::prelude::{Connection, QuicClient, StreamReader, StreamWriter};
 use dquic::qresolve::Source;
 use futures::{Stream, future::BoxFuture};
 use opentelemetry::KeyValue;
+use parking_lot::Mutex as ParkMutex;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, oneshot};
@@ -34,6 +36,80 @@ const SEND_TASK_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 pub(crate) use xlinerpc::endpoint::DnsFallback;
 
+const CONN_CACHE_MAX_AGE: Duration = Duration::from_secs(300);
+const CONN_CACHE_MAX_IDLE: Duration = Duration::from_secs(30);
+const CONN_CACHE_MAX_ENTRIES: usize = 16;
+
+struct CachedConnection {
+    conn: Connection,
+    created_at: Instant,
+    last_used: Instant,
+}
+
+struct ConnectionCache {
+    entries: ParkMutex<HashMap<String, CachedConnection>>,
+    max_entries: usize,
+}
+
+impl ConnectionCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: ParkMutex::new(HashMap::new()),
+            max_entries,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Connection> {
+        let mut map = self.entries.lock();
+        if let Some(entry) = map.get(key) {
+            if entry.created_at.elapsed() < CONN_CACHE_MAX_AGE
+                && entry.last_used.elapsed() < CONN_CACHE_MAX_IDLE
+            {
+                let conn = entry.conn.clone();
+                if let Some(e) = map.get_mut(key) {
+                    e.last_used = Instant::now();
+                }
+                return Some(conn);
+            }
+            let _ = map.remove(key);
+            tracing::debug!(endpoint = key, "curp_conn_cache_evict_stale");
+        }
+        None
+    }
+
+    fn insert(&self, key: String, conn: Connection) {
+        let mut map = self.entries.lock();
+        if map.len() >= self.max_entries {
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                let _ = map.remove(&oldest_key);
+                tracing::debug!(endpoint = %oldest_key, "curp_conn_cache_evict_full");
+            }
+        }
+        let _ = map.insert(
+            key,
+            CachedConnection {
+                conn,
+                created_at: Instant::now(),
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn remove(&self, key: &str) {
+        let _ = self.entries.lock().remove(key);
+    }
+}
+
+fn conn_cache_enabled() -> bool {
+    std::env::var("XLINE_CURP_CONN_CACHE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
 /// QUIC channel for managing connections and RPC calls
 pub struct QuicChannel {
     /// QUIC client for creating connections
@@ -44,6 +120,8 @@ pub struct QuicChannel {
     index: Arc<AtomicUsize>,
     /// DNS fallback policy
     dns_fallback: DnsFallback,
+    /// Optional connection cache (enabled via XLINE_CURP_CONN_CACHE=1)
+    cache: Option<ConnectionCache>,
 }
 
 impl std::fmt::Debug for QuicChannel {
@@ -63,6 +141,11 @@ impl QuicChannel {
             addrs: Arc::new(RwLock::new(Vec::new())),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback: DnsFallback::Disabled,
+            cache: if conn_cache_enabled() {
+                Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
+            } else {
+                None
+            },
         }
     }
 
@@ -78,6 +161,11 @@ impl QuicChannel {
             addrs: Arc::new(RwLock::new(addrs)),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback,
+            cache: if conn_cache_enabled() {
+                Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
+            } else {
+                None
+            },
         }
     }
 
@@ -92,6 +180,11 @@ impl QuicChannel {
             addrs: Arc::new(RwLock::new(Vec::new())),
             index: Arc::new(AtomicUsize::new(0)),
             dns_fallback: DnsFallback::LocalhostForTest,
+            cache: if conn_cache_enabled() {
+                Some(ConnectionCache::new(CONN_CACHE_MAX_ENTRIES))
+            } else {
+                None
+            },
         }
     }
 
@@ -119,8 +212,9 @@ impl QuicChannel {
         Ok(())
     }
 
-    /// Get a connection using round-robin selection
-    async fn get_connection(&self) -> Result<Connection, CurpError> {
+    /// Get a connection using round-robin selection.
+    /// Returns (connection, cache_key) where cache_key is Some(endpoint) if cache is enabled.
+    async fn get_connection(&self) -> Result<(Connection, Option<String>), CurpError> {
         let addrs = self.addrs.read().await;
         if addrs.is_empty() {
             return Err(CurpError::RpcTransport(()));
@@ -131,7 +225,6 @@ impl QuicChannel {
         let snapshot: Vec<String> = addrs.iter().cloned().collect();
         drop(addrs);
 
-        // Try all addresses starting from round-robin index before giving up
         let mut last_err = None;
         for i in 0..len {
             let idx = (start + i) % len;
@@ -142,24 +235,38 @@ impl QuicChannel {
                 .or_else(|| addr.strip_prefix("http://"))
                 .unwrap_or(addr);
 
+            if let Some(ref cache) = self.cache {
+                if let Some(conn) = cache.get(addr_str) {
+                    tracing::debug!(endpoint = addr_str, "curp_conn_cache_hit");
+                    super::metrics::get()
+                        .curp_conn_cache_hits_total
+                        .add(1, &[KeyValue::new("component", "curp_channel")]);
+                    return Ok((conn, Some(addr_str.to_owned())));
+                }
+            }
+
             super::metrics::get()
                 .quic_connect_attempts_total
                 .add(1, &[KeyValue::new("component", "curp_channel")]);
 
             match self.try_connect(addr_str).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    if let Some(ref cache) = self.cache {
+                        tracing::debug!(endpoint = addr_str, "curp_conn_cache_miss");
+                        super::metrics::get()
+                            .curp_conn_cache_misses_total
+                            .add(1, &[KeyValue::new("component", "curp_channel")]);
+                        cache.insert(addr_str.to_owned(), conn.clone());
+                    }
+                    return Ok((conn, Some(addr_str.to_owned())));
+                }
                 Err(e) => {
-                    tracing::debug!(
-                        endpoint = addr_str,
-                        error = ?e,
-                        "QUIC connect failed"
-                    );
+                    tracing::debug!(endpoint = addr_str, error = ?e, "QUIC connect failed");
                     last_err = Some(e);
                 }
             }
         }
 
-        // Record final failure only after all attempts exhausted
         super::metrics::get().quic_connect_failures_total.add(
             1,
             &[
@@ -169,6 +276,16 @@ impl QuicChannel {
         );
 
         Err(last_err.unwrap_or_else(|| CurpError::RpcTransport(())))
+    }
+
+    fn evict_cache_entry(&self, key: &Option<String>) {
+        if let (Some(cache), Some(endpoint)) = (&self.cache, key) {
+            cache.remove(endpoint);
+            tracing::debug!(endpoint = endpoint.as_str(), "curp_conn_cache_evict");
+            super::metrics::get()
+                .curp_conn_cache_evictions_total
+                .add(1, &[KeyValue::new("component", "curp_channel")]);
+        }
     }
 
     /// Try connecting to a single address.
@@ -272,16 +389,14 @@ impl QuicChannel {
         Req: Message,
         Resp: Message + Default,
     {
-        let conn = self.get_connection().await?;
+        let (conn, cache_key) = self.get_connection().await?;
 
         let call = async {
-            // Open bidirectional stream
             let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
 
             let mut writer = FrameWriter::new(send_stream);
             let mut reader = FrameReader::new_unary_response(StopOnDropReader::new(recv_stream));
 
-            // Write request header
             writer.write_request_header(method, &meta).await?;
 
             // Write request data
@@ -327,13 +442,20 @@ impl QuicChannel {
                 .map_err(|e| CurpError::internal(format!("decode response error: {e}")))
         };
 
-        if timeout.is_zero() {
-            return call.await;
+        // Evict on ANY error: connection-level errors (open_bi_stream, write, read)
+        // indicate a stale connection; application-level errors are rare and
+        // evicting on them is harmless (CURP retry re-creates anyway).
+        let result = if timeout.is_zero() {
+            call.await
+        } else {
+            tokio::time::timeout(timeout, call)
+                .await
+                .map_err(|_| CurpError::RpcTransport(()))?
+        };
+        if result.is_err() {
+            self.evict_cache_entry(&cache_key);
         }
-
-        tokio::time::timeout(timeout, call)
-            .await
-            .map_err(|_| CurpError::RpcTransport(()))?
+        result
     }
 
     /// Perform a server-streaming RPC call
@@ -348,28 +470,48 @@ impl QuicChannel {
         Req: Message,
         Resp: Message + Default + Send + Unpin + 'static,
     {
-        let conn = self.get_connection().await?;
+        let (conn, cache_key) = self.get_connection().await?;
 
-        let (recv_stream, send_stream): (StreamReader, StreamWriter) =
+        let (recv_stream, send_stream): (StreamReader, StreamWriter) = if timeout.is_zero() {
+            Self::open_bi_stream(&conn).await?
+        } else {
             tokio::time::timeout(timeout, Self::open_bi_stream(&conn))
                 .await
-                .map_err(|_| CurpError::RpcTransport(()))??;
+                .map_err(|_| CurpError::RpcTransport(()))??
+        };
 
         let mut writer = FrameWriter::new(send_stream);
 
-        // Write request header and data
-        writer.write_request_header(method, &meta).await?;
+        writer
+            .write_request_header(method, &meta)
+            .await
+            .map_err(|e| {
+                self.evict_cache_entry(&cache_key);
+                e
+            })?;
         let req_bytes = req.encode_to_vec();
-        writer.write_frame(&Frame::Data(req_bytes)).await?;
-        writer.write_frame(&Frame::End).await?;
-        writer.flush().await?;
+        writer
+            .write_frame(&Frame::Data(req_bytes))
+            .await
+            .map_err(|e| {
+                self.evict_cache_entry(&cache_key);
+                e
+            })?;
+        writer.write_frame(&Frame::End).await.map_err(|e| {
+            self.evict_cache_entry(&cache_key);
+            e
+        })?;
+        writer.flush().await.map_err(|e| {
+            self.evict_cache_entry(&cache_key);
+            e
+        })?;
 
         // Shutdown write side
         let mut send_stream: StreamWriter = writer.into_inner();
-        send_stream
-            .shutdown()
-            .await
-            .map_err(|e| CurpError::internal(format!("shutdown stream error: {e}")))?;
+        send_stream.shutdown().await.map_err(|e| {
+            self.evict_cache_entry(&cache_key);
+            CurpError::internal(format!("shutdown stream error: {e}"))
+        })?;
 
         // Return stream that reads responses
         let reader = FrameReader::new_server_streaming(StopOnDropReader::new(recv_stream));
@@ -399,7 +541,7 @@ impl QuicChannel {
         use futures::StreamExt;
         use tokio::sync::oneshot;
 
-        let conn = self.get_connection().await?;
+        let (conn, cache_key) = self.get_connection().await?;
 
         // These are set once the send task is spawned inside the timeout
         // block, and read in the unconditional cleanup that follows.
@@ -507,7 +649,10 @@ impl QuicChannel {
             }
         }
 
-        result.map_err(|_| CurpError::RpcTransport(()))?
+        result.map_err(|_| {
+            self.evict_cache_entry(&cache_key);
+            CurpError::RpcTransport(())
+        })?
     }
 
     /// Perform a bidirectional-streaming RPC call.
@@ -524,14 +669,25 @@ impl QuicChannel {
     {
         use futures::StreamExt;
 
-        let conn = self.get_connection().await?;
+        let (conn, cache_key) = self.get_connection().await?;
 
         let (recv_stream, send_stream): (StreamReader, StreamWriter) = if timeout.is_zero() {
-            Self::open_bi_stream(&conn).await?
+            Self::open_bi_stream(&conn).await.map_err(|e| {
+                self.evict_cache_entry(&cache_key);
+                e
+            })?
         } else {
-            tokio::time::timeout(timeout, Self::open_bi_stream(&conn))
-                .await
-                .map_err(|_| CurpError::RpcTransport(()))??
+            match tokio::time::timeout(timeout, Self::open_bi_stream(&conn)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    self.evict_cache_entry(&cache_key);
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.evict_cache_entry(&cache_key);
+                    return Err(CurpError::RpcTransport(()));
+                }
+            }
         };
 
         let mut writer = FrameWriter::new(send_stream);
@@ -623,7 +779,7 @@ impl QuicChannel {
     where
         Resp: Message + Default,
     {
-        let conn = self.get_connection().await?;
+        let (conn, cache_key) = self.get_connection().await?;
 
         tokio::time::timeout(timeout, async {
             let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
@@ -671,7 +827,10 @@ impl QuicChannel {
                 .map_err(|e| CurpError::internal(format!("decode response error: {e}")))
         })
         .await
-        .map_err(|_| CurpError::RpcTransport(()))?
+        .map_err(|_| {
+            self.evict_cache_entry(&cache_key);
+            CurpError::RpcTransport(())
+        })?
     }
 }
 
