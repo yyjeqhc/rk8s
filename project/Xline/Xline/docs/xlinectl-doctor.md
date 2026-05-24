@@ -161,6 +161,7 @@ Xline does **not** silently skip TLS verification:
 
 ## Related docs
 
+- [QUIC Troubleshooting Guide](quic-troubleshooting.md) — entry point for all QUIC/H3 issues
 - [QUIC refactor audit](quic-refactor-audit.md) — full QUIC/H3 architecture analysis
 - [H3 benchmark feasibility](quic-h3-benchmark.md) — H3 connection lifecycle benchmarks
 - [CURP benchmark](quic-curp-benchmark.md) — CURP connection cost and cache feasibility
