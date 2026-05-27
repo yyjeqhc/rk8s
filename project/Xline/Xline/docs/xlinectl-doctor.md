@@ -17,6 +17,9 @@ xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doc
 
 # Include a live connection test
 xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doctor --check_connection
+
+# Include cluster health checks (implies --check_connection)
+xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doctor --check_cluster
 ```
 
 ## What it checks
@@ -122,6 +125,50 @@ $ xlinectl --endpoints https://127.0.0.1:2379 --ca_cert_pem_path fixtures/ca.crt
 
 When static critical checks already failed, `--check_connection` is skipped to avoid
 attempting a connection on a clearly invalid configuration.
+
+## Cluster health checks
+
+`--check_cluster` extends doctor with live cluster health diagnostics. It implies
+`--check_connection` — a successful connection is required before cluster checks run.
+
+```bash
+xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doctor --check_cluster
+```
+
+### What it checks
+
+| Check | Critical? | Description |
+|-------|-----------|-------------|
+| Member list | Yes | Calls `member_list(true)` and verifies non-empty response |
+| Member count | Info | Reports the number of members in the cluster |
+| Leader detection | Warning | Calls `status()` and reports the leader member ID and term |
+| Member URL classification | Warning | Flags IP-based or localhost client URLs (SNI routing risk) |
+| Status API | Warning | Reports if the maintenance status API fails (non-critical) |
+
+### Flow
+
+1. Static checks (endpoint, TLS, SNI, experimental features)
+2. If static critical > 0 → skip connection and cluster checks
+3. Connection check via `Client::connect`
+4. If connection fails → skip cluster checks
+5. Cluster health checks (member list, status, URL classification)
+
+### Example output (healthy cluster)
+
+```
+── Cluster Health ──
+  ✅ Member list returned 3 member(s)
+  ✅ Leader: server0 (ID: 15397586489680409000, term: 4)
+```
+
+### Example output (unhealthy cluster)
+
+```
+── Cluster Health ──
+  ✅ Member list returned 3 member(s)
+  ⚠️  Member server1 (voter) has IP-based client URL: http://127.0.0.1:2379
+  ⚠️  Status check failed: rpc error: status: Internal error
+```
 
 ## Local 3-node setup
 

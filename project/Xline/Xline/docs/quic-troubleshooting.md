@@ -83,6 +83,9 @@ xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doc
 
 # Include live connection test (requires running cluster)
 xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doctor --check_connection
+
+# Include cluster health checks (implies --check_connection)
+xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doctor --check_cluster
 ```
 
 ### What doctor checks (14 checks)
@@ -110,7 +113,7 @@ xlinectl --endpoints https://server0:2379 --ca_cert_pem_path fixtures/ca.crt doc
 - Does **not** start or stop servers
 - Does **not** enable experimental features
 - Does **not** validate data directory contents
-- Does **not** check cluster membership or leader status
+- Does **not** check cluster membership or leader status (use `--check_cluster` for that)
 
 ### When to use `--check_connection`
 
@@ -119,6 +122,17 @@ It attempts a real QUIC handshake to verify TLS, SNI, and network connectivity.
 
 If static checks already have critical failures, `--check_connection` is skipped
 automatically — fix the static errors first.
+
+### When to use `--check_cluster`
+
+Use `--check_cluster` when you want to verify the cluster is healthy, not just reachable.
+It implies `--check_connection` and adds:
+
+- Member list verification (non-empty, correct count)
+- Leader detection via maintenance status API
+- Member URL classification (flags IP/localhost client URLs)
+
+If connection fails, cluster checks are skipped automatically.
 
 See [xlinectl doctor docs](xlinectl-doctor.md) for full details.
 

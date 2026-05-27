@@ -137,6 +137,11 @@ pub(crate) fn command() -> Command {
                 .required(false)
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            arg!(--check_cluster "Check cluster health: member list, leader, endpoints (implies --check_connection)")
+                .required(false)
+                .action(clap::ArgAction::SetTrue),
+        )
 }
 
 pub(crate) async fn execute(
@@ -145,7 +150,8 @@ pub(crate) async fn execute(
     ca_path: Option<PathBuf>,
     curp_cache_cli_flag: bool,
 ) -> Result<()> {
-    let check_connection = matches.get_flag("check_connection");
+    let check_cluster = matches.get_flag("check_cluster");
+    let check_connection = matches.get_flag("check_connection") || check_cluster;
 
     let mut critical = 0_u32;
     let mut warnings = 0_u32;
@@ -182,7 +188,14 @@ pub(crate) async fn execute(
     if check_connection {
         println!("── Connection Check ──");
         if critical == 0 {
-            check_connection_async(&endpoints, &ca_path, &mut critical).await;
+            let client = check_connection_async(&endpoints, &ca_path, &mut critical).await;
+            if check_cluster && critical == 0 {
+                if let Some(mut c) = client {
+                    println!();
+                    println!("── Cluster Health ──");
+                    check_cluster_health(&mut c, &endpoints, &mut critical, &mut warnings).await;
+                }
+            }
         } else {
             println!("  ⏭️  Skipped because critical static checks failed");
             println!("     Fix the errors above, then rerun with --check_connection.");
@@ -398,13 +411,13 @@ async fn check_connection_async(
     endpoints: &[String],
     ca_path: &Option<PathBuf>,
     critical: &mut u32,
-) {
+) -> Option<xline_client::Client> {
     use xline_client::{Client, ClientOptions};
     use xlinerpc::QuicTlsConfig;
 
     if endpoints.is_empty() {
         println!("  ⏭️  Skipped (no endpoints)");
-        return;
+        return None;
     }
 
     let quic_tls = match ca_path {
@@ -413,7 +426,7 @@ async fn check_connection_async(
             Err(e) => {
                 println!("  ❌ Cannot read CA file: {e}");
                 *critical += 1;
-                return;
+                return None;
             }
         },
         None => {
@@ -425,7 +438,7 @@ async fn check_connection_async(
                     Err(e) => {
                         println!("  ❌ Cannot read default CA: {e}");
                         *critical += 1;
-                        return;
+                        return None;
                     }
                 }
             } else {
@@ -439,8 +452,9 @@ async fn check_connection_async(
 
     println!("  Connecting to {:?}...", endpoints);
     match Client::connect(endpoints, options).await {
-        Ok(_client) => {
+        Ok(client) => {
             println!("  ✅ Connection successful");
+            Some(client)
         }
         Err(e) => {
             println!("  ❌ Connection failed: {e}");
@@ -453,7 +467,121 @@ async fn check_connection_async(
             );
             println!("     5. Enable debug logs: RUST_LOG=xlinerpc=debug xlinectl doctor ...");
             *critical += 1;
+            None
         }
+    }
+}
+
+fn classify_member_url(url: &str) -> MemberUrlStatus {
+    if url.is_empty() {
+        return MemberUrlStatus::Empty;
+    }
+    let stripped = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("quic://"));
+    let Some(host_port) = stripped else {
+        return MemberUrlStatus::UnknownScheme(url.to_string());
+    };
+    let host = host_port.rsplitn(2, ':').nth(1).unwrap_or(host_port);
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        MemberUrlStatus::IpAddress(url.to_string())
+    } else if host == "localhost" {
+        MemberUrlStatus::Localhost(url.to_string())
+    } else {
+        MemberUrlStatus::DnsName(url.to_string())
+    }
+}
+
+#[allow(dead_code)] // DnsName and UnknownScheme fields used in classify_member_url
+#[derive(Debug)]
+enum MemberUrlStatus {
+    Empty,
+    UnknownScheme(String),
+    IpAddress(String),
+    Localhost(String),
+    DnsName(String),
+}
+
+async fn check_cluster_health(
+    client: &mut xline_client::Client,
+    _endpoints: &[String],
+    critical: &mut u32,
+    warnings: &mut u32,
+) {
+    let resp = match client.cluster_client().member_list(true).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  ❌ Member list failed: {e}");
+            *critical += 1;
+            return;
+        }
+    };
+
+    let count = resp.members.len();
+    if count == 0 {
+        println!("  ❌ Member list returned 0 members");
+        *critical += 1;
+        return;
+    }
+    println!("  ✅ Member list returned {count} member(s)");
+
+    for m in &resp.members {
+        let name = if m.name.is_empty() {
+            format!("ID:{}", m.id)
+        } else {
+            m.name.clone()
+        };
+        let role = if m.is_learner { "learner" } else { "voter" };
+
+        for url in &m.client_ur_ls {
+            match classify_member_url(url) {
+                MemberUrlStatus::IpAddress(u) => {
+                    println!("  ⚠️  Member {name} ({role}) has IP-based client URL: {u}");
+                    *warnings += 1;
+                }
+                MemberUrlStatus::Localhost(u) => {
+                    println!("  ⚠️  Member {name} ({role}) has localhost client URL: {u}");
+                    *warnings += 1;
+                }
+                MemberUrlStatus::Empty => {
+                    println!("  ⚠️  Member {name} ({role}) has no client URLs (not started?)");
+                    *warnings += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let status = match client.maintenance_client().status().await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("  ⚠️  Status check failed: {e}");
+            *warnings += 1;
+            return;
+        }
+    };
+
+    if status.leader == 0 {
+        println!("  ⚠️  No leader detected (leader ID = 0)");
+        *warnings += 1;
+    } else {
+        let leader_name = resp
+            .members
+            .iter()
+            .find(|m| m.id == status.leader)
+            .map(|m| {
+                if m.name.is_empty() {
+                    format!("ID:{}", m.id)
+                } else {
+                    m.name.clone()
+                }
+            })
+            .unwrap_or_else(|| format!("ID:{}", status.leader));
+        println!(
+            "  ✅ Leader: {leader_name} (ID: {}, term: {})",
+            status.leader, status.raft_term
+        );
     }
 }
 
@@ -650,5 +778,42 @@ mod tests {
     #[test]
     fn experimental_rust_log_disabled() {
         assert!(!rust_log_enabled_from_env_value(None));
+    }
+
+    #[test]
+    fn classify_member_url_dns() {
+        match classify_member_url("https://server0:2379") {
+            MemberUrlStatus::DnsName(u) => assert_eq!(u, "https://server0:2379"),
+            other => panic!("expected DnsName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_member_url_ip() {
+        match classify_member_url("http://127.0.0.1:2379") {
+            MemberUrlStatus::IpAddress(u) => assert_eq!(u, "http://127.0.0.1:2379"),
+            other => panic!("expected IpAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_member_url_localhost() {
+        match classify_member_url("https://localhost:2379") {
+            MemberUrlStatus::Localhost(u) => assert_eq!(u, "https://localhost:2379"),
+            other => panic!("expected Localhost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_member_url_empty() {
+        assert!(matches!(classify_member_url(""), MemberUrlStatus::Empty));
+    }
+
+    #[test]
+    fn classify_member_url_unknown_scheme() {
+        match classify_member_url("ftp://server0:2379") {
+            MemberUrlStatus::UnknownScheme(u) => assert_eq!(u, "ftp://server0:2379"),
+            other => panic!("expected UnknownScheme, got {other:?}"),
+        }
     }
 }
